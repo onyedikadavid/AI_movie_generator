@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: story_video_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+      - ./storage:/app/storage
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_SERVER=db
+      - REDIS_HOST=redis
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+    depends_on:
+      - db
+      - redis
+
+  # NOTE: the "deploy.resources.reservations.devices" block below requires
+  # the NVIDIA Container Toolkit. Delete it if you're on a CPU-only machine.
+  celery_worker:
+    build: .
+    command: celery -A app.core.celery_app.celery_app worker --loglevel=info -c 1
+    volumes:
+      - .:/app
+      - ./storage:/app/storage
+    environment:
+      - POSTGRES_SERVER=db
+      - REDIS_HOST=redis
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    depends_on:
+      - db
+      - redis
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  postgres_data:
