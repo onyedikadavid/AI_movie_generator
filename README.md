@@ -130,6 +130,52 @@ With both set, `alembic upgrade head`, the Celery worker, and `uvicorn`
 all work exactly the same as with local/Dockerized services - nothing else
 in the setup changes.
 
+## Deploying to Render (or Railway/Fly/similar)
+
+Three things that are easy to miss and will make the deployed API
+completely unreachable or silently broken even though it "deployed
+successfully":
+
+1. **`.env` never reaches the server.** It's gitignored (correctly - it can
+   hold real secrets), which means if you deploy from a git repo, Render
+   never sees it at all. Every variable you want in production -
+   `DATABASE_URL_OVERRIDE`, `REDIS_URL_OVERRIDE`, `CORS_ORIGINS`,
+   `OLLAMA_URL`, `IMAGE_API_URL`, `WAN_API_URL` - has to be re-entered
+   directly in Render's dashboard under the service's **Environment**
+   tab, separately from your local `.env`.
+2. **`CORS_ORIGINS` must list your actual deployed frontend URL**, not just
+   `localhost`. If it doesn't, the browser blocks every response with a
+   CORS error that surfaces to the user as a generic "Failed to fetch" -
+   indistinguishable, from the frontend's point of view, from the backend
+   being down entirely. Set it to something like:
+   `CORS_ORIGINS=https://your-frontend.vercel.app`
+   (comma-separate multiple origins; no trailing slash on any of them).
+3. **The port Render routes traffic to is dynamic**, injected as the
+   `$PORT` env var - it is *not* 8000. The `Dockerfile` in this repo reads
+   it correctly (`--port ${PORT:-8000}`, falling back to 8000 only when
+   `$PORT` isn't set, e.g. local `docker run`). If you ever hardcode a
+   port in a Start Command instead of using this Dockerfile as-is, use
+   `--port $PORT`, not a fixed number - a hardcoded port is the single
+   most common reason a Render web service builds fine but is completely
+   unreachable from outside.
+
+You'll also need a **second** Render service (type: Background Worker, not
+Web Service) running the Celery worker command below, pointed at the same
+repo and given the *same* environment variables as the API service -
+otherwise projects get created but never actually process, since nothing
+is consuming the queue:
+```
+celery -A app.core.celery_app.celery_app worker --loglevel=info
+```
+
+This repo ships two requirements files:
+- `requirements-render.txt` - what the Dockerfile actually installs.
+  Lightweight; assumes Ollama/image/video generation happen remotely
+  (Colab/Kaggle notebooks) rather than in-process.
+- `requirements.txt` - the full list, including `torch`/`diffusers`/
+  `faster-whisper`, for running everything locally on your own GPU
+  machine instead (no Docker needed there - just `pip install` directly).
+
 ## Docker
 
 `docker-compose.yml` brings up Postgres, Redis, the API, and a Celery

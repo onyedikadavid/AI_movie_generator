@@ -24,4 +24,11 @@ os.makedirs(settings.STORAGE_DIR, exist_ok=True)
 app.mount("/storage", StaticFiles(directory=settings.STORAGE_DIR), name="storage")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Local dev only. On Render/any host that assigns a dynamic port via
+    # $PORT, set the service's Start Command to:
+    #   uvicorn main:app --host 0.0.0.0 --port $PORT
+    # rather than relying on this block - that's what actually reads the
+    # host-assigned port; this hardcoded fallback is just for `python main.py`
+    # on your own machine.
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

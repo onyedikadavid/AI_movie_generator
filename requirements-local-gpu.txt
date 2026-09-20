@@ -1,0 +1,21 @@
+# Optional, heavy dependencies - only install these if you're running image
+# generation (SDXL) and/or speech-to-text (Whisper) LOCALLY on a machine
+# with a real GPU, instead of pointing IMAGE_API_URL / using a remote
+# transcription setup. Do NOT install this on a free-tier web host (Render,
+# etc.) - torch alone is several GB and will blow past both the build size
+# and runtime memory limits.
+#
+# Install with: pip install -r requirements.txt -r requirements-local-gpu.txt
+
+# --- Speech to text (local, CPU or GPU) ---
+faster-whisper>=1.0.1
+
+# --- Image generation (local diffusion) ---
+torch>=2.6.0
+diffusers>=0.30.0
+transformers>=4.40.0
+accelerate>=0.28.0
+safetensors>=0.4.2
+
+# --- Optional: pose/depth guidance for character-consistent video motion ---
+# controlnet-aux>=0.4.0

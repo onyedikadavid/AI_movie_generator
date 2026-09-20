@@ -1,3 +1,13 @@
+# Lean requirements for the orchestrator (API + Celery worker) - safe to
+# deploy on a resource-limited host (Render free tier, etc). This assumes
+# LLM/image/video/generation all happen remotely (Ollama + the Colab/Kaggle
+# notebooks in ../notebooks/), which is the default now that IMAGE_API_URL,
+# WAN_API_URL and a remote OLLAMA_URL are all supported.
+#
+# Want to run SDXL/Whisper/etc. locally instead? Also install
+# requirements-local-gpu.txt - but that needs a real GPU-capable machine,
+# not a free-tier web host.
+
 # --- Core API ---
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
@@ -19,28 +29,9 @@ httpx>=0.27.0
 python-multipart>=0.0.9
 jinja2>=3.1.3
 
-# --- Media processing ---
+# --- Media processing (lightweight - just shells out to the ffmpeg binary) ---
 ffmpeg-python>=0.2.0
 Pillow>=10.3.0
 
-# --- Speech to text (local, CPU or GPU) ---
-faster-whisper>=1.0.1
-
-# --- Image generation (local diffusion) ---
-torch>=2.6.0
-diffusers>=0.30.0
-transformers>=4.40.0
-accelerate>=0.28.0
-safetensors>=0.4.2
-
-# --- Text to speech ---
-# Primary: piper-tts CLI binary (install separately - see README; apt/brew or
-# https://github.com/rhasspy/piper/releases). gTTS is kept as an optional
-# online fallback; ffmpeg silent-clip generation is the offline fallback used
-# automatically by TTSService if neither is available.
+# --- Text to speech (online fallback; local `piper` CLI is optional and separate) ---
 gTTS>=2.5.1
-
-# --- Optional: pose/depth guidance for character-consistent video motion ---
-# Heavy extra dependency, only needed if you want SpatialService's pose maps
-# to do more than gracefully no-op. Uncomment if you have the VRAM for it.
-# controlnet-aux>=0.4.0

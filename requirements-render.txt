@@ -1,0 +1,40 @@
+# Lightweight requirements for deploying the API + Celery worker to a
+# CPU-only host like Render, now that Ollama/image/video generation are
+# offloaded to the Colab/Kaggle notebooks (IMAGE_API_URL / WAN_API_URL /
+# OLLAMA_URL) rather than run in-process. Excludes torch/diffusers/
+# transformers/accelerate/faster-whisper - those are only needed for the
+# LOCAL fallback code paths (see image_service.py, stt_service.py), which
+# aren't reachable at all when those *_API_URL / *_URL env vars are set.
+#
+# Running everything locally on your own GPU machine instead? Use
+# requirements.txt (the full list) rather than this file.
+
+# --- Core API ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.4
+pydantic-settings>=2.2.1
+
+# --- Database ---
+sqlalchemy>=2.0.28
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+alembic>=1.13.1
+
+# --- Task queue ---
+celery>=5.3.6
+redis>=5.0.3
+
+# --- HTTP / misc ---
+httpx>=0.27.0
+python-multipart>=0.0.9
+jinja2>=3.1.3
+
+# --- Media processing (used to combine/concatenate clips - lightweight,
+#     just shells out to the ffmpeg CLI installed via apt in the Dockerfile) ---
+ffmpeg-python>=0.2.0
+Pillow>=10.3.0
+
+# --- Text to speech online fallback (used only if the `piper` CLI isn't
+#     found - see tts_service.py) ---
+gTTS>=2.5.1
