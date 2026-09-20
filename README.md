@@ -76,6 +76,11 @@ uvicorn main:app --reload
 
 # Terminal 2
 celery -A app.core.celery_app.celery_app worker --loglevel=info
+# On Windows, add --pool=solo: python -m celery -A app.core.celery_app.celery_app worker --loglevel=info --pool=solo
+# Celery's default "prefork" pool relies on Unix fork(), which Windows
+# doesn't have - it's officially Celery's own recommendation to use the
+# solo pool on Windows instead, and it also sidesteps some flaky
+# reconnect-after-idle behavior that shows up more on Windows.
 
 # Terminal 3 - local LLM
 ollama serve
