@@ -8,6 +8,7 @@ from typing import Optional, List
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.core.celery_app import celery_app
 from app.models.project import Project, ProjectStatus
 from app.models.character import Character
 from app.models.scene import Scene
@@ -23,6 +24,7 @@ _ASSET_GENERATION_ALLOWED_FROM = {
     ProjectStatus.SCRIPT_READY,
     ProjectStatus.FAILED,
     ProjectStatus.COMPLETED,
+    ProjectStatus.CANCELLED,
 }
 
 _IN_FLIGHT_STATUSES = {
@@ -83,7 +85,10 @@ async def create_project(
         new_project.audio_input_path = audio_path
         await db.commit()
 
-    run_script_breakdown.delay(new_project.id)
+    task = run_script_breakdown.delay(new_project.id)
+    new_project.celery_task_id = task.id
+    await db.commit()
+    await db.refresh(new_project)
 
     return new_project
 
@@ -151,9 +156,51 @@ async def run_pipeline(project_id: str, db: AsyncSession = Depends(get_db)):
         )
 
     project.error_message = None
+    project.cancel_requested = False
     await db.commit()
 
-    run_asset_pipeline.delay(project_id)
+    task = run_asset_pipeline.delay(project_id)
+    project.celery_task_id = task.id
+    await db.commit()
+    await db.refresh(project)
+    return project
+
+
+@router.post("/projects/{project_id}/cancel", response_model=ProjectResponse)
+async def cancel_project(project_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Stops an in-progress run. This is cooperative, not a hard kill: it sets
+    cancel_requested and the running task checks that flag between steps
+    (before each scene, and between each generation call within a scene)
+    and exits on its own - see run_script_breakdown/run_asset_pipeline in
+    pipeline_tasks.py. A true hard-kill via Celery's revoke(terminate=True)
+    needs the "prefork" worker pool, which isn't available with the
+    --pool=solo Celery recommends on Windows, so this works regardless of
+    which pool the worker is running under.
+
+    If the task hasn't started yet (still sitting in the queue), we also
+    revoke it outright so it never begins at all.
+    """
+    project = await _get_project_or_404(project_id, db)
+
+    if project.status not in _IN_FLIGHT_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Nothing to cancel - project isn't currently running (status: {project.status}).",
+        )
+
+    project.cancel_requested = True
+    await db.commit()
+
+    if project.celery_task_id:
+        try:
+            celery_app.control.revoke(project.celery_task_id)
+        except Exception:
+            # Best-effort only - the cancel_requested flag is what actually
+            # guarantees a running task stops; this just catches the case
+            # where it hadn't started yet.
+            pass
+
     await db.refresh(project)
     return project
 

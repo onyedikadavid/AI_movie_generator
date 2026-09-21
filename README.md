@@ -2,6 +2,18 @@
 
 FastAPI + Celery backend for the multi-character AI video production pipeline.
 
+## If you already have a live database (Neon or otherwise)
+
+Run `alembic upgrade head` again after pulling this update - it adds a new
+migration (`cancel_requested`/`celery_task_id` columns, a `CANCELLED`
+status) on top of your existing schema. It won't touch existing data.
+
+Also **critical, not optional**: `app/core/celery_app.py` was missing
+`include=["app.tasks.pipeline_tasks"]`, which meant the worker process
+never actually registered any tasks - every project created before this
+fix was silently discarded (`Received unregistered task ... KeyError`
+in the worker log). Restart your worker with the updated code.
+
 ## What changed in this pass (backend audit)
 
 The codebase was reviewed end-to-end against the two PRDs and the frontend

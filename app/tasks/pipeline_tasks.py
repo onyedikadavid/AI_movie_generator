@@ -31,6 +31,26 @@ engine = create_engine(sync_db_url)
 SessionLocal = sessionmaker(bind=engine)
 
 
+def _check_cancelled(db, project) -> bool:
+    """
+    Cooperative-cancellation check. Queries cancel_requested fresh from the
+    DB rather than trusting the in-memory `project` object, since the flag
+    is set by the API process over a separate connection - frequent commits
+    elsewhere in these tasks mean this session's transaction is short-lived
+    enough to see that update promptly under Postgres's READ COMMITTED
+    isolation. If cancelled, marks the project CANCELLED and returns True
+    so the caller can stop without treating this as a failure.
+    """
+    cancelled = db.query(Project.cancel_requested).filter(Project.id == project.id).scalar()
+    if cancelled:
+        project.status = ProjectStatus.CANCELLED
+        project.error_message = "Cancelled by user."
+        db.commit()
+        logger.info(f"Project {project.id} cancelled by user request.")
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Script breakdown (fast, text-only). Runs right after project
 # creation. Leaves the project in SCRIPT_READY so the user can review and
@@ -52,6 +72,9 @@ def run_script_breakdown(self, project_id: str):
             stt = STTService()
             project.raw_prompt = stt.transcribe(project.audio_input_path)
             db.commit()
+
+        if _check_cancelled(db, project):
+            return
 
         # Step 2: LLM Story & Multi-Agent Scene Generation
         project.status = ProjectStatus.GENERATING_SCRIPT
@@ -158,6 +181,9 @@ def run_asset_pipeline(self, project_id: str):
         scene_rendered_files = []
 
         for scene in db_scenes:
+            if _check_cancelled(db, project):
+                return
+
             scene_dir = os.path.join(project_dir, f"scene_{scene.scene_number}")
             os.makedirs(scene_dir, exist_ok=True)
 
@@ -175,6 +201,9 @@ def run_asset_pipeline(self, project_id: str):
             if dialogue_turns:
                 turn_clips = []
                 for idx, turn in enumerate(dialogue_turns):
+                    if _check_cancelled(db, project):
+                        return
+
                     speaker = turn.get("speaker", "Character")
                     text = turn.get("text", "")
                     expression = turn.get("expression", "neutral")
@@ -249,6 +278,9 @@ def run_asset_pipeline(self, project_id: str):
 
             scene_rendered_files.append(scene_final_path)
             db.commit()
+
+        if _check_cancelled(db, project):
+            return
 
         # Step 4: Stitch Final Master Video
         project.status = ProjectStatus.COMPOSITING

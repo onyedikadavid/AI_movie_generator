@@ -1,6 +1,6 @@
 import uuid
 import enum
-from sqlalchemy import Column, String, Text, Enum, DateTime, ForeignKey
+from sqlalchemy import Column, String, Text, Enum, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from app.core.database import Base
@@ -17,6 +17,7 @@ class ProjectStatus(str, enum.Enum):
     COMPOSITING = "COMPOSITING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 class Project(Base):
     __tablename__ = "projects"
@@ -36,6 +37,15 @@ class Project(Base):
     error_message = Column(Text, nullable=True)
     final_video_path = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    # Cooperative cancellation flag: the "Stop" button in the UI sets this
+    # rather than trying to hard-kill the Celery task. Hard termination
+    # (celery's revoke(terminate=True)) needs the "prefork" worker pool,
+    # which relies on Unix fork() and isn't available with the --pool=solo
+    # Celery recommends for Windows - so a task that's already running has
+    # to check this flag itself and exit voluntarily between steps instead.
+    cancel_requested = Column(Boolean, default=False, nullable=False)
+    celery_task_id = Column(String, nullable=True)
 
     script = relationship("Script", back_populates="project", uselist=False, cascade="all, delete-orphan")
     characters = relationship("Character", back_populates="project", cascade="all, delete-orphan")

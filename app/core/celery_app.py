@@ -30,6 +30,14 @@ celery_app = Celery(
     "worker",
     broker=REDIS_URL,
     backend=REDIS_URL,
+    # CRITICAL: without this, the worker process never imports
+    # pipeline_tasks.py at all, so its @celery_app.task-decorated functions
+    # never register with THIS process. The API process imports
+    # pipeline_tasks.py fine (via projects.py), but the worker is a
+    # completely separate Python process that only imports what's listed
+    # here - hence "Received unregistered task ... KeyError" even though
+    # the task is clearly defined and dispatched successfully.
+    include=["app.tasks.pipeline_tasks"],
 )
 
 celery_app.conf.update(
