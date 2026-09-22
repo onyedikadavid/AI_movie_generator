@@ -4,13 +4,14 @@ from typing import Dict, Any
 from app.core.config import settings
 from app.schemas.script import ScriptDecompositionSchema
 from app.services.agent_service import AgentService
+from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
 
 class LLMService:
     def __init__(self):
-        # Resolve Base URL dynamically and format trailing slashes.
-        # (settings.OLLAMA_URL always has a real default - see app/core/config.py -
-        # so this only matters if pointed at a tunnel like ngrok without a scheme.)
-        raw_url = settings.OLLAMA_URL
+        # Prefer the live URL published by the Ollama Colab/Kaggle notebook
+        # (see app/services/dynamic_config.py); falls back to the static
+        # OLLAMA_URL from .env if dynamic config isn't set up or unreachable.
+        raw_url = resolve_url(KEY_OLLAMA_URL, settings.OLLAMA_URL)
         if not raw_url.startswith(("http://", "https://")):
             raw_url = f"https://{raw_url}"
         self.ollama_url = raw_url.rstrip("/")

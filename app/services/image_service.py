@@ -2,6 +2,7 @@ import os
 import logging
 import httpx
 from app.core.config import settings
+from app.services.dynamic_config import resolve_url, KEY_IMAGE_API_URL
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +22,27 @@ class ImageGenerationService:
     """
 
     def __init__(self):
-        self.image_api_url = settings.IMAGE_API_URL
         self.pipeline = None  # only loaded lazily in local mode
 
     def _load_local_pipeline(self):
         if self.pipeline is None:
-            import torch
-            from diffusers import AutoPipelineForText2Image
+            try:
+                import torch
+                from diffusers import AutoPipelineForText2Image
+            except ImportError as e:
+                # Deliberately not caught as a generic exception - this is
+                # the expected situation on the lightweight Render deploy
+                # (requirements-render.txt excludes torch/diffusers on
+                # purpose), if IMAGE_API_URL/the dynamic Upstash lookup
+                # both come up empty. Fail with a clear, actionable message
+                # instead of a raw ModuleNotFoundError buried in a traceback.
+                raise RuntimeError(
+                    "No image generation backend is configured, and local SDXL isn't "
+                    "installed in this environment (torch/diffusers are excluded from "
+                    "requirements-render.txt on purpose). Set IMAGE_API_URL, or publish "
+                    "one via the Colab notebook + Upstash dynamic config, so image "
+                    "generation has somewhere to actually run."
+                ) from e
 
             self.pipeline = AutoPipelineForText2Image.from_pretrained(
                 "stabilityai/stable-diffusion-xl-base-1.0",
@@ -47,17 +62,22 @@ class ImageGenerationService:
         enhanced_prompt = f"{prompt}, highly detailed, cinematic lighting, photorealistic, 8k resolution"
         default_negative = "blurry, low quality, distorted features, extra limbs, bad anatomy"
 
-        if self.image_api_url:
+        # Resolved fresh on every call (not cached in __init__) so a Colab
+        # notebook restart mid-project is picked up on the very next scene,
+        # without needing this backend restarted. See dynamic_config.py.
+        image_api_url = resolve_url(KEY_IMAGE_API_URL, settings.IMAGE_API_URL)
+
+        if image_api_url:
             data = {
                 "prompt": enhanced_prompt,
                 "negative_prompt": negative_prompt or default_negative,
             }
             try:
                 with httpx.Client(timeout=300.0) as client:
-                    response = client.post(self.image_api_url, data=data)
+                    response = client.post(image_api_url, data=data)
             except httpx.ConnectError as e:
                 raise RuntimeError(
-                    f"Couldn't reach the image generation server at {self.image_api_url}. "
+                    f"Couldn't reach the image generation server at {image_api_url}. "
                     f"Check that the Colab/Kaggle notebook is still running and that "
                     f"IMAGE_API_URL in .env matches its current tunnel URL. Original error: {e}"
                 ) from e

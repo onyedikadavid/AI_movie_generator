@@ -59,6 +59,18 @@ class Settings(BaseSettings):
     IMAGE_API_URL: str = os.getenv("IMAGE_API_URL", "")
     WAN_API_URL: str = os.getenv("WAN_API_URL", "http://localhost:8188/v1/generate")
 
+    # Optional: instead of hand-editing OLLAMA_URL/IMAGE_API_URL/WAN_API_URL
+    # every time a Colab/Kaggle notebook restarts and gets a new ngrok URL,
+    # the notebooks can publish their current URL to a tiny key in your
+    # Upstash Redis's REST API, and this backend reads the live value from
+    # there instead - see app/services/dynamic_config.py. Get these two
+    # values from your Upstash console's "REST API" tab (NOT the same as
+    # the rediss:// connection string used for Celery). Leave both blank to
+    # disable this entirely and use only the static *_URL values above,
+    # exactly as before.
+    UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+
     STORAGE_DIR: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../storage"))
 
     # Frontend origin(s) allowed to call this API, comma-separated. "*" allows any origin (dev only).

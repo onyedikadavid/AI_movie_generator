@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.celery_app import celery_app
+from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
 
 router = APIRouter()
 
@@ -39,10 +40,13 @@ async def health_check(db: AsyncSession = Depends(get_db)):
     except Exception as e:
         status["redis"] = f"error: {e}"
 
-    # Ollama (local LLM)
+    # Ollama (local LLM) - check the live dynamic URL if one's been
+    # published by the Colab/Kaggle notebook, so this reflects what
+    # generation will actually use rather than a stale static value.
+    ollama_url = resolve_url(KEY_OLLAMA_URL, settings.OLLAMA_URL)
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{settings.OLLAMA_URL}/api/tags")
+            resp = await client.get(f"{ollama_url}/api/tags")
             status["ollama"] = "ok" if resp.status_code == 200 else f"error: HTTP {resp.status_code}"
     except Exception as e:
         status["ollama"] = f"error: {e}"

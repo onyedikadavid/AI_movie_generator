@@ -2,6 +2,27 @@
 
 FastAPI + Celery backend for the multi-character AI video production pipeline.
 
+## Never hand-edit a Colab URL into .env/Render again
+
+Every notebook (`ltx_video_server.ipynb`, `sdxl_image_server.ipynb`,
+`asset_generation_server.ipynb`, `ollama_server.ipynb`) now has an optional
+cell, right after it opens its ngrok tunnel, that publishes the current URL
+to your Upstash Redis via its REST API. Set `UPSTASH_REDIS_REST_URL` and
+`UPSTASH_REDIS_REST_TOKEN` in `.env` (from your Upstash console's **REST
+API** tab - a separate thing from the `rediss://` connection string Celery
+uses), and `LLMService`/`ImageGenerationService`/`VideoGenerationService`
+will look up the *live* URL on every single call instead of trusting a
+static env var. Restart a notebook, run its publish cell (paste the same
+two values when it prompts), and the backend picks up the new URL on its
+very next request - no `.env` edit, no Render redeploy, no backend restart.
+
+This is opt-in and fails soft: leave those two values blank and everything
+behaves exactly as before, reading only the static `OLLAMA_URL` /
+`IMAGE_API_URL` / `WAN_API_URL` values. If Upstash's REST API is ever
+unreachable, the lookup silently falls back to those same static values
+rather than failing the request - a flaky convenience lookup should never
+be why generation breaks.
+
 ## If you already have a live database (Neon or otherwise)
 
 Run `alembic upgrade head` again after pulling this update - it adds a new

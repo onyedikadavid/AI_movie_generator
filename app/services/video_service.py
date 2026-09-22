@@ -2,6 +2,7 @@ import os
 import logging
 import httpx
 from app.core.config import settings
+from app.services.dynamic_config import resolve_url, KEY_WAN_API_URL
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +20,6 @@ class VideoGenerationService:
     (e.g. a free Colab/Kaggle GPU reached over a tunnel) - the remote
     machine can't read your local disk.
     """
-
-    def __init__(self):
-        self.comfy_url = getattr(settings, "COMFYUI_URL", "http://localhost:8188")
-        self.wan_api_url = settings.WAN_API_URL
 
     def generate_video_from_image(
         self,
@@ -44,6 +41,11 @@ class VideoGenerationService:
         if not os.path.exists(image_path):
             raise RuntimeError(f"Keyframe image not found at {image_path}; cannot generate video.")
 
+        # Resolved fresh on every call (not cached in __init__) so a Colab
+        # notebook restart mid-project is picked up on the very next scene,
+        # without needing this backend restarted. See dynamic_config.py.
+        wan_api_url = resolve_url(KEY_WAN_API_URL, settings.WAN_API_URL)
+
         data = {
             "motion_prompt": motion_prompt,
             "text_cue": narration_text or "",
@@ -56,10 +58,10 @@ class VideoGenerationService:
 
         try:
             with httpx.Client(timeout=600.0) as client:
-                response = client.post(self.wan_api_url, data=data, files=files)
+                response = client.post(wan_api_url, data=data, files=files)
         except httpx.ConnectError as e:
             raise RuntimeError(
-                f"Couldn't reach the video generation server at {self.wan_api_url}. "
+                f"Couldn't reach the video generation server at {wan_api_url}. "
                 f"If you're using the Colab notebook, check that it's still running and that "
                 f"WAN_API_URL in .env matches its current public tunnel URL (these change every "
                 f"time you restart the notebook). Original error: {e}"
