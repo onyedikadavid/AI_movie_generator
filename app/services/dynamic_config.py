@@ -39,9 +39,30 @@ def resolve_url(key: str, fallback: str) -> str:
             )
         if response.status_code == 200:
             value = response.json().get("result")
-            if value:
+            if value and _looks_like_url(value):
                 return value
+            if value:
+                logger.warning(
+                    f"Dynamic config value for '{key}' doesn't look like a valid URL "
+                    f"({value!r}) - using static fallback instead. This usually means "
+                    f"something published a malformed value (e.g. an old notebook run "
+                    f"before a bugfix) - re-run the notebook's publish cell to overwrite it."
+                )
     except Exception as e:
         logger.info(f"Dynamic config lookup for '{key}' failed, using static fallback: {e}")
 
     return fallback
+
+
+def _looks_like_url(value: str) -> bool:
+    """Cheap sanity check so a malformed published value (stray whitespace,
+    an accidentally-stringified Python object, etc.) can't silently get
+    handed to httpx and fail with a confusing low-level parse error - we'd
+    rather fall back to the static URL and log a clear warning instead."""
+    value = value.strip()
+    return (
+        value.startswith(("http://", "https://"))
+        and " " not in value
+        and '"' not in value
+        and "'" not in value
+    )
