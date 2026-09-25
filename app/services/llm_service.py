@@ -76,14 +76,13 @@ class LLMService:
         headers = {
             "ngrok-skip-browser-warning": "true",
             "bypass-tunnel-reminder": "true",
-            "Accept": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Content-Type": "application/json"
         }
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
-                f"{self.ollama_url}/api/generate?ngrok-skip-browser-warning=true",
+                f"{self.ollama_url}/api/generate",
                 json={"model": self.model_name, "prompt": base_prompt, "stream": False, "format": "json"},
                 headers=headers
             )
