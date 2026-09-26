@@ -2,6 +2,7 @@ import logging
 from typing import List, Dict, Any
 import httpx
 from app.core.config import settings
+from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
 
 logger = logging.getLogger(__name__)
 
@@ -10,19 +11,44 @@ class AgentService:
     Orchestrates unscripted multi-agent character dialogue and action negotiation.
     """
     def __init__(self):
-        self.ollama_url = getattr(settings, "OLLAMA_URL", "http://localhost:11434")
         self.model_name = getattr(settings, "AGENT_MODEL", "llama3")
 
     async def _query_agent(self, system_prompt: str, prompt: str) -> str:
+        # Resolved fresh on every call (not cached in __init__), same as
+        # LLMService - picks up the live Colab/Kaggle URL from the Upstash
+        # dynamic-config lookup instead of trusting a static, likely-stale
+        # OLLAMA_URL (previously this fell straight through to the
+        # http://localhost:11434 default, which is why this specific call
+        # path - unlike the main script-breakdown call - kept failing with
+        # "All connection attempts failed").
+        raw_url = resolve_url(KEY_OLLAMA_URL, settings.OLLAMA_URL)
+        if not raw_url.startswith(("http://", "https://")):
+            raw_url = f"https://{raw_url}"
+        ollama_url = raw_url.rstrip("/")
+
+        # Same header strategy as LLMService, for consistency across every
+        # call path that hits the tunneled Ollama endpoint.
+        headers = {
+            "ngrok-skip-browser-warning": "true",
+            "bypass-tunnel-reminder": "true",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/json",
+        }
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                f"{self.ollama_url}/api/generate",
+                f"{ollama_url}/api/generate",
                 json={
                     "model": self.model_name,
                     "prompt": f"System: {system_prompt}\nUser: {prompt}",
                     "stream": False
-                }
+                },
+                headers=headers,
             )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Ollama API request failed with status {response.status_code}: {response.text[:300]}"
+                )
             data = response.json()
             return data.get("response", "").strip()
 
