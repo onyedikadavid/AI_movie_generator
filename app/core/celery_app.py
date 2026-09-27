@@ -24,6 +24,22 @@ def _ensure_ssl_cert_reqs(redis_url: str) -> str:
 
 
 REDIS_URL = _ensure_ssl_cert_reqs(settings.REDIS_URL)
+
+if not REDIS_URL.startswith(("redis://", "rediss://")):
+    # Fails here with a clear message instead of letting this reach Celery/
+    # kombu, which raises a cryptic "KeyError: No such transport: <scheme>"
+    # deep in its own internals with no indication of which setting is
+    # actually wrong. Seen in practice: REDIS_URL_OVERRIDE accidentally set
+    # to a Postgres/Neon connection string (copy-paste mix-up with
+    # DATABASE_URL_OVERRIDE) instead of an Upstash redis:// or rediss:// one.
+    raise RuntimeError(
+        f"REDIS_URL_OVERRIDE (or REDIS_HOST/REDIS_PORT) resolved to a URL that "
+        f"doesn't start with redis:// or rediss://: {REDIS_URL!r}\n"
+        f"Check your .env - REDIS_URL_OVERRIDE must be your Upstash (or other "
+        f"Redis) connection string, not your Postgres/Neon one. It's easy to "
+        f"mix these two up since both live in the same .env file."
+    )
+
 _is_tls = REDIS_URL.startswith("rediss://")
 
 celery_app = Celery(

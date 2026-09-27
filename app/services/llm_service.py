@@ -5,6 +5,7 @@ from app.core.config import settings
 from app.schemas.script import ScriptDecompositionSchema
 from app.services.agent_service import AgentService
 from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
+from app.services.http_retry import post_with_retry
 
 class LLMService:
     def __init__(self):
@@ -81,7 +82,8 @@ class LLMService:
         }
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
+            response = await post_with_retry(
+                client,
                 f"{self.ollama_url}/api/generate",
                 json={"model": self.model_name, "prompt": base_prompt, "stream": False, "format": "json"},
                 headers=headers

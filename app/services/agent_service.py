@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 import httpx
 from app.core.config import settings
 from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
+from app.services.http_retry import post_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,8 @@ class AgentService:
         }
 
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
+            response = await post_with_retry(
+                client,
                 f"{ollama_url}/api/generate",
                 json={
                     "model": self.model_name,

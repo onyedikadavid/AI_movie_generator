@@ -18,15 +18,35 @@ def _require_ffmpeg():
             "CLI to combine audio/video and stitch scenes together - it's a "
             "separate program, not something 'pip install' can provide.\n"
             "- Windows: download a build from https://www.gyan.dev/ffmpeg/builds/ "
-            "(the 'essentials' or 'full' release build), extract it, and add its "
-            "bin\\ folder (the one containing ffmpeg.exe) to your PATH environment "
-            "variable, then open a NEW terminal (PATH changes don't apply to "
-            "already-open terminals) and confirm with: ffmpeg -version\n"
-            "- Or via a package manager: choco install ffmpeg (Chocolatey) or "
-            "winget install ffmpeg\n"
+            "(the 'essentials' or 'full' release build - a plain .zip, not a "
+            "package-manager install) and manually add its bin\\ folder (the one "
+            "containing ffmpeg.exe) to your PATH environment variable, then open a "
+            "NEW terminal and confirm with: ffmpeg -version. Prefer this direct-zip "
+            "method over winget/choco on Windows - package managers can install CLI "
+            "tools as 'App Execution Alias' stubs that behave inconsistently when "
+            "launched from Python's subprocess module (low-level CreateProcess) "
+            "rather than an interactive shell.\n"
             "- macOS: brew install ffmpeg\n"
             "- Linux: sudo apt-get install ffmpeg"
         )
+
+
+def _run(cmd: List[str]) -> subprocess.CompletedProcess:
+    """
+    Runs an ffmpeg/ffprobe command and, on failure, raises a RuntimeError
+    that actually includes the captured stderr - previously this was
+    captured (stderr=subprocess.PIPE) but never surfaced anywhere, so every
+    failure showed only a bare exit code with zero indication of what
+    ffmpeg itself was complaining about.
+    """
+    try:
+        return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError as e:
+        stderr_tail = (e.stderr or "").strip()[-2000:]  # ffmpeg's actual error is usually at the end
+        raise RuntimeError(
+            f"Command failed (exit code {e.returncode}): {' '.join(cmd)}\n"
+            f"--- ffmpeg/ffprobe stderr ---\n{stderr_tail or '(no stderr captured)'}"
+        ) from e
 
 
 class FFmpegService:
@@ -42,7 +62,7 @@ class FFmpegService:
             '-shortest',
             output_path
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _run(cmd)
         return output_path
 
     def concatenate_videos(self, video_paths: List[str], output_path: str) -> str:
@@ -52,7 +72,14 @@ class FFmpegService:
 
         with open(list_file_path, "w") as f:
             for path in video_paths:
-                f.write(f"file '{os.path.abspath(path)}'\n")
+                # ffmpeg's concat demuxer parses this file with its own
+                # mini-language where backslash is an escape character -
+                # a raw Windows path like C:\Users\...\scene_1\clip.mp4
+                # can get misparsed. Forward slashes work fine on Windows
+                # too (ffmpeg normalizes them), so always use those here
+                # regardless of platform.
+                safe_path = os.path.abspath(path).replace(os.sep, "/")
+                f.write(f"file '{safe_path}'\n")
 
         cmd = [
             'ffmpeg', '-y',
@@ -62,7 +89,7 @@ class FFmpegService:
             '-c', 'copy',
             output_path
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _run(cmd)
 
         if os.path.exists(list_file_path):
             os.remove(list_file_path)
@@ -89,5 +116,5 @@ class FFmpegService:
             '-of', 'default=noprint_wrappers=1:nokey=1',
             audio_path,
         ]
-        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = _run(cmd)
         return float(result.stdout.strip())
