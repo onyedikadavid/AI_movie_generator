@@ -16,6 +16,7 @@ pydantic-settings>=2.2.1
 
 # --- Database ---
 sqlalchemy>=2.0.28
+greenlet>=3.0.3  # required by sqlalchemy.ext.asyncio - not pulled in automatically unless you install sqlalchemy[asyncio]
 asyncpg>=0.29.0
 psycopg2-binary>=2.9.9
 alembic>=1.13.1
