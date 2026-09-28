@@ -71,6 +71,21 @@ class Settings(BaseSettings):
     UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
     UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
+    # Optional: S3-compatible object storage (e.g. Cloudflare R2, which has a
+    # free tier) for generated keyframes and the final video. Needed whenever
+    # the Celery worker and the API run on DIFFERENT machines (e.g. worker on
+    # your PC, API on Render): the worker writes files to its own disk, but the
+    # browser fetches media from the API - which doesn't have those files.
+    # Leave these blank to keep files on local disk only (fine if the API and
+    # worker share a filesystem, e.g. both running on your own machine).
+    S3_ENDPOINT_URL: str = os.getenv("S3_ENDPOINT_URL", "")
+    S3_BUCKET: str = os.getenv("S3_BUCKET", "")
+    S3_ACCESS_KEY_ID: str = os.getenv("S3_ACCESS_KEY_ID", "")
+    S3_SECRET_ACCESS_KEY: str = os.getenv("S3_SECRET_ACCESS_KEY", "")
+    S3_REGION: str = os.getenv("S3_REGION", "auto")
+    # Public base URL files are served from, e.g. https://pub-xxxx.r2.dev
+    S3_PUBLIC_BASE_URL: str = os.getenv("S3_PUBLIC_BASE_URL", "")
+
     STORAGE_DIR: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../storage"))
 
     # Frontend origin(s) allowed to call this API, comma-separated. "*" allows any origin (dev only).

@@ -23,6 +23,15 @@ class AgentService:
         # path - unlike the main script-breakdown call - kept failing with
         # "All connection attempts failed").
         raw_url = resolve_url(KEY_OLLAMA_URL, settings.OLLAMA_URL)
+        if not raw_url.strip():
+            # Same guard as LLMService - fails clearly instead of silently
+            # building a broken "https:/api/generate" URL from an empty string.
+            raise RuntimeError(
+                "OLLAMA_URL is not configured and the dynamic Upstash lookup "
+                "for 'dynamic:ollama_url' also failed or returned nothing. "
+                "Set OLLAMA_URL in .env to a real value, or make sure your "
+                "Ollama notebook has published its current URL to Upstash."
+            )
         if not raw_url.startswith(("http://", "https://")):
             raw_url = f"https://{raw_url}"
         ollama_url = raw_url.rstrip("/")

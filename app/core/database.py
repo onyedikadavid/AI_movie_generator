@@ -12,7 +12,18 @@ connect_args = {}
 if "+asyncpg" in settings.DATABASE_URL:
     connect_args["statement_cache_size"] = 0
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True, connect_args=connect_args)
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    future=True,
+    connect_args=connect_args,
+    # Tests each pooled connection with a lightweight ping before handing it
+    # out, transparently reconnecting if it's gone stale. Hosted Postgres
+    # (Neon included) can close idle connections server-side; without this,
+    # the next query after any idle period fails with a raw
+    # "server closed the connection unexpectedly" instead of just working.
+    pool_pre_ping=True,
+)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 class Base(DeclarativeBase):

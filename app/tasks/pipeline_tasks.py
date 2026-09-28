@@ -18,6 +18,7 @@ from app.services.video_service import VideoGenerationService
 from app.services.tts_service import TTSService
 from app.services.ffmpeg_service import FFmpegService
 from app.services.spatial_service import SpatialService
+from app.services.media_storage import publish_file
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,13 @@ logger = logging.getLogger(__name__)
 # requires TLS via "?ssl=require".
 sync_db_url = settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 sync_db_url = sync_db_url.replace("ssl=require", "sslmode=require")
-engine = create_engine(sync_db_url)
+# pool_pre_ping=True: this is the engine actually used by the worker while
+# it waits minutes at a time on Colab video generation - without it, the
+# connection can go stale during that wait and the next db.commit()/
+# db.rollback() fails with "server closed the connection unexpectedly"
+# instead of transparently reconnecting (this is exactly what happened in
+# production - the rollback inside the exception handler itself failed).
+engine = create_engine(sync_db_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
 
@@ -192,7 +199,7 @@ def run_asset_pipeline(self, project_id: str):
             db.commit()
             img_path = os.path.join(scene_dir, "keyframe.png")
             image_service.generate_image(scene.image_prompt, img_path)
-            scene.image_path = img_path
+            scene.image_path = publish_file(img_path, f"projects/{project.id}/scene_{scene.scene_number}/keyframe.png")
             db.commit()
 
             dialogue_turns = scene.dialogue_turns or []
@@ -252,10 +259,18 @@ def run_asset_pipeline(self, project_id: str):
                 aud_path = os.path.join(scene_dir, "narration.mp3")
                 aud_duration = float(scene.duration_seconds or 5.0)
 
-                if scene.narration_text:
-                    tts_service.generate_speech(scene.narration_text, aud_path)
-                    if hasattr(ffmpeg_service, "get_audio_duration"):
-                        aud_duration = ffmpeg_service.get_audio_duration(aud_path)
+                # Always generate SOME audio file, even when the scene has no
+                # narration text - TTSService.generate_speech already handles
+                # empty text by producing a silent placeholder clip. Skipping
+                # this call entirely when narration_text was empty meant
+                # narration.mp3 never got created on disk, while
+                # combine_scene_assets() below was still called with that
+                # (nonexistent) path regardless - exactly what was causing
+                # every single-scene, no-dialogue project to fail at the
+                # final ffmpeg step with "No such file or directory".
+                tts_service.generate_speech(scene.narration_text or "", aud_path)
+                if hasattr(ffmpeg_service, "get_audio_duration"):
+                    aud_duration = ffmpeg_service.get_audio_duration(aud_path)
                 scene.audio_path = aud_path
 
                 pose_map_path = os.path.join(scene_dir, "pose_narrator.png")
@@ -288,7 +303,7 @@ def run_asset_pipeline(self, project_id: str):
         master_output_path = os.path.join(project_dir, "final_master_video.mp4")
         ffmpeg_service.concatenate_videos(scene_rendered_files, master_output_path)
 
-        project.final_video_path = master_output_path
+        project.final_video_path = publish_file(master_output_path, f"projects/{project.id}/final_master_video.mp4")
         project.status = ProjectStatus.COMPLETED
         db.commit()
 

@@ -13,6 +13,20 @@ class LLMService:
         # (see app/services/dynamic_config.py); falls back to the static
         # OLLAMA_URL from .env if dynamic config isn't set up or unreachable.
         raw_url = resolve_url(KEY_OLLAMA_URL, settings.OLLAMA_URL)
+        if not raw_url.strip():
+            # Both the dynamic Upstash lookup AND the static OLLAMA_URL
+            # fallback came up empty (e.g. Upstash unreachable and .env has
+            # OLLAMA_URL= with nothing after it). Without this check, the
+            # code below would silently build "https:/api/generate" (missing
+            # the "//") from an empty string, which fails deep inside httpx
+            # with the confusing "Request URL is missing an 'http://' or
+            # 'https://' protocol" - this fails clearly instead, right here.
+            raise RuntimeError(
+                "OLLAMA_URL is not configured and the dynamic Upstash lookup "
+                "for 'dynamic:ollama_url' also failed or returned nothing. "
+                "Set OLLAMA_URL in .env to a real value, or make sure your "
+                "Ollama notebook has published its current URL to Upstash."
+            )
         if not raw_url.startswith(("http://", "https://")):
             raw_url = f"https://{raw_url}"
         self.ollama_url = raw_url.rstrip("/")
