@@ -39,3 +39,4 @@ gTTS>=2.5.1
 
 # --- Optional: upload generated media to S3-compatible storage (e.g. Cloudflare R2) ---
 boto3>=1.34.0
+cloudinary>=1.41.0

@@ -7,10 +7,7 @@ FastAPI + Celery backend for the multi-character AI video production pipeline.
 If your Celery worker runs on your PC but your API is on Render, generated
 keyframes and the final video are written to the *worker's* disk, while the
 browser fetches media from the *API* - which doesn't have those files, so
-images show as broken and the finished video won't play. Fix: set the
-`S3_*` variables in `.env` (see `.env.example`) to any S3-compatible bucket
-with public read access (Cloudflare R2 has a free tier; `S3_PUBLIC_BASE_URL`
-is the bucket's public URL). After each keyframe and the final video are
+images show as broken and the finished video won't play. Fix: set either the `S3_*` variables in `.env` (see `.env.example`) to any S3-compatible bucket with public read access (Cloudflare R2 has a free tier; `S3_PUBLIC_BASE_URL` is the bucket's public URL), or the three `CLOUDINARY_*` variables instead (also free, simpler setup - just an account, no bucket/public-access configuration). If both are set, Cloudinary takes priority. After each keyframe and the final video are
 produced, the worker uploads them and stores the public URL in the database;
 the frontend uses full URLs as-is. Leave the `S3_*` values blank if the API
 and worker share a filesystem (e.g. both run on your own machine). Uploads

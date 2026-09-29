@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     # Public base URL files are served from, e.g. https://pub-xxxx.r2.dev
     S3_PUBLIC_BASE_URL: str = os.getenv("S3_PUBLIC_BASE_URL", "")
 
+    # Alternative to S3-compatible storage: Cloudinary (also has a free tier,
+    # no card required). Uses a different upload API, not S3, so these are
+    # separate settings - if both are set, Cloudinary takes priority.
+    CLOUDINARY_CLOUD_NAME: str = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    CLOUDINARY_API_KEY: str = os.getenv("CLOUDINARY_API_KEY", "")
+    CLOUDINARY_API_SECRET: str = os.getenv("CLOUDINARY_API_SECRET", "")
+
     STORAGE_DIR: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../storage"))
 
     # Frontend origin(s) allowed to call this API, comma-separated. "*" allows any origin (dev only).
