@@ -58,8 +58,29 @@ class LLMService:
                 style_constraints += f"        - Visual style: {visual_style_hint}\n"
 
         # Step A: Generate Base Characters & High-Level Scene Outlines
+        #
+        # IMPORTANT: every field below is actually used downstream - leaving
+        # one out of this prompt means the LLM never generates it, and it
+        # silently defaults to empty/null:
+        #   - image_prompt: this is EXACTLY what gets sent to the image
+        #     generator (see pipeline_tasks.py). An empty image_prompt means
+        #     SDXL generates from an essentially blank prompt (just the
+        #     visual style tacked on), producing generic, unrelated images.
+        #   - narration_text: if this is null, no speech gets generated for
+        #     that scene at all (a silent placeholder clip is used instead)
+        #     - it's the difference between a scene having audio or not.
+        # And the scene-count instruction below matters because without it,
+        # the model can (and did, in practice) compress an entire short
+        # story into a single scene instead of breaking it into the several
+        # scenes/shots a real short film would actually have.
         base_prompt = f"""
-        Analyze this raw story prompt and output a valid JSON matching this structure:
+        Analyze this raw story prompt and break it into a short film's worth
+        of scenes - typically 4 to 8 scenes for a short story, one scene per
+        distinct narrative beat (e.g. arrival, confrontation, turning point,
+        resolution). Do NOT compress the entire story into a single scene
+        unless the prompt is genuinely a single-moment vignette.
+
+        Output valid JSON matching this structure exactly:
         {{
             "title": "...",
             "genre": "...",
@@ -77,8 +98,11 @@ class LLMService:
                     "scene_number": 1,
                     "location": "...",
                     "visual_description": "...",
+                    "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - describe the subject(s), action, setting and composition in full; this is sent directly to the image generator, so it must not depend on any other field to make sense.",
+                    "narration_text": "A line or two of narrator voiceover describing what's happening in this scene, written to be spoken aloud. Always provide this, even for scenes with dialogue - it drives whether the scene has any audio at all. Only use null/empty if the scene is dialogue-only AND narration would be genuinely redundant.",
+                    "characters_present": ["Name1", "Name2"],
                     "motion_prompt": "...",
-                    "duration_seconds": 10.0
+                    "duration_seconds": 5
                 }}
             ]
         }}
