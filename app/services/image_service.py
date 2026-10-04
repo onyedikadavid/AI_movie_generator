@@ -1,24 +1,23 @@
 import os
+import time
 import logging
 import httpx
 from app.core.config import settings
 from app.services.dynamic_config import resolve_url, KEY_IMAGE_API_URL
+from app.services.media_client import GPU_HEADERS, TRANSIENT, TRANSIENT_STATUS, atomic_write, explain
 
 logger = logging.getLogger(__name__)
 
 
 class ImageGenerationService:
     """
-    Generates scene keyframe images from a text prompt.
+    Generates keyframe images from a text prompt.
 
-    Two modes, chosen automatically by whether IMAGE_API_URL is set:
-      - Remote (IMAGE_API_URL set): POSTs the prompt to a server implementing
-        the same contract as ../notebooks/asset_generation_server.ipynb (an
-        SDXL server you can run for free on Colab/Kaggle) and saves back
-        whatever image bytes it returns. Nothing downloads to this machine.
-      - Local (IMAGE_API_URL unset): loads SDXL directly via `diffusers`,
-        the original behavior. Downloads ~7GB of weights to this machine
-        the first time it runs, and needs a real GPU to be practical.
+    Two modes, chosen automatically by whether IMAGE_API_URL is set (directly,
+    or published by the notebook through Upstash):
+      - Remote: POSTs the prompt to the SDXL notebook server and saves back
+        the PNG it returns. Nothing downloads to this machine.
+      - Local: loads SDXL directly via `diffusers` (needs a real GPU).
     """
 
     def __init__(self):
@@ -30,17 +29,10 @@ class ImageGenerationService:
                 import torch
                 from diffusers import AutoPipelineForText2Image
             except ImportError as e:
-                # Deliberately not caught as a generic exception - this is
-                # the expected situation on the lightweight Render deploy
-                # (requirements-render.txt excludes torch/diffusers on
-                # purpose), if IMAGE_API_URL/the dynamic Upstash lookup
-                # both come up empty. Fail with a clear, actionable message
-                # instead of a raw ModuleNotFoundError buried in a traceback.
                 raise RuntimeError(
                     "No image generation backend is configured, and local SDXL isn't "
-                    "installed in this environment (torch/diffusers are excluded from "
-                    "requirements-render.txt on purpose). Set IMAGE_API_URL, or publish "
-                    "one via the Colab notebook + Upstash dynamic config, so image "
+                    "installed in this environment. Set IMAGE_API_URL, or publish "
+                    "one via the Colab/Kaggle notebook + Upstash dynamic config, so image "
                     "generation has somewhere to actually run."
                 ) from e
 
@@ -52,52 +44,81 @@ class ImageGenerationService:
             )
             if torch.cuda.is_available():
                 self.pipeline.to("cuda")
-                try:
-                    self.pipeline.enable_xformers_memory_efficient_attention()
-                except Exception as e:
-                    logger.info(f"xformers not available, continuing without it: {e}")
 
-    def generate_image(self, prompt: str, output_path: str, negative_prompt: str = "") -> str:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        enhanced_prompt = f"{prompt}, highly detailed, cinematic lighting, photorealistic, 8k resolution"
-        default_negative = "blurry, low quality, distorted features, extra limbs, bad anatomy"
+    def generate_image(
+        self,
+        prompt: str,
+        output_path: str,
+        negative_prompt: str = "",
+        width: int = None,
+        height: int = None,
+        seed: int = None,
+    ) -> str:
+        """`prompt` is used exactly as given - build it with prompt_builder."""
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        width = int(width or settings.IMAGE_WIDTH)
+        height = int(height or settings.IMAGE_HEIGHT)
+        negative = negative_prompt or "blurry, low quality, distorted face, extra limbs, bad anatomy"
 
-        # Resolved fresh on every call (not cached in __init__) so a Colab
-        # notebook restart mid-project is picked up on the very next scene,
-        # without needing this backend restarted. See dynamic_config.py.
+        # Resolved fresh on every call so a notebook restart is picked up on
+        # the very next image without restarting this backend.
         image_api_url = resolve_url(KEY_IMAGE_API_URL, settings.IMAGE_API_URL)
 
         if image_api_url:
             data = {
-                "prompt": enhanced_prompt,
-                "negative_prompt": negative_prompt or default_negative,
+                "prompt": prompt,
+                "negative_prompt": negative,
+                "width": str(width),
+                "height": str(height),
+                "steps": "35",
+                "guidance_scale": "6.5",
             }
-            try:
-                with httpx.Client(timeout=300.0) as client:
-                    response = client.post(image_api_url, data=data)
-            except httpx.ConnectError as e:
-                raise RuntimeError(
-                    f"Couldn't reach the image generation server at {image_api_url}. "
-                    f"Check that the Colab/Kaggle notebook is still running and that "
-                    f"IMAGE_API_URL in .env matches its current tunnel URL. Original error: {e}"
-                ) from e
+            if seed is not None:
+                data["seed"] = str(int(seed))
+
+            response = None
+            for attempt in (1, 2, 3):
+                try:
+                    with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0), headers=GPU_HEADERS) as client:
+                        response = client.post(image_api_url, data=data)
+                except httpx.ConnectError as e:
+                    if attempt < 3:
+                        time.sleep(3 * attempt)
+                        continue
+                    raise RuntimeError(
+                        f"Couldn't reach the image generation server at {image_api_url}. "
+                        f"Check that the SDXL notebook is still running (and that it published its "
+                        f"URL / IMAGE_API_URL matches). Original error: {e}"
+                    ) from e
+                except TRANSIENT as e:
+                    if attempt < 3:
+                        time.sleep(3 * attempt)
+                        continue
+                    raise RuntimeError(f"Image request failed repeatedly: {e!r}") from e
+                if response.status_code in TRANSIENT_STATUS and attempt < 3:
+                    time.sleep(4 * attempt)
+                    continue
+                break
 
             if response.status_code != 200:
-                raise RuntimeError(
-                    f"Image generation server returned {response.status_code}: {response.text[:300]}"
-                )
-
-            with open(output_path, "wb") as f:
-                f.write(response.content)
+                raise RuntimeError(explain(response, "Image generation"))
+            if len(response.content) < 2000 or not response.content.startswith(b"\x89PNG"):
+                raise RuntimeError(explain(response, "Image generation (did not return a PNG)"))
+            atomic_write(output_path, response.content)
             return output_path
 
         # Local fallback
         self._load_local_pipeline()
+        import torch
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(int(seed))
         image = self.pipeline(
-            prompt=enhanced_prompt,
-            negative_prompt=negative_prompt or default_negative,
-            num_inference_steps=30,
-            guidance_scale=7.5,
+            prompt=prompt, negative_prompt=negative, width=width, height=height,
+            num_inference_steps=35, guidance_scale=6.5, generator=generator,
         ).images[0]
-        image.save(output_path)
+        tmp = f"{output_path}.part.png"
+        image.save(tmp)
+        os.replace(tmp, output_path)
         return output_path

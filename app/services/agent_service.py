@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import List, Dict, Any
 import httpx
 from app.core.config import settings
@@ -64,50 +65,75 @@ class AgentService:
             return data.get("response", "").strip()
 
     async def simulate_interaction(
-        self, 
-        character_a: Dict[str, str], 
-        character_b: Dict[str, str], 
-        scene_goal: str, 
-        turns: int = 4
+        self,
+        character_a: Dict[str, str],
+        character_b: Dict[str, str],
+        scene_goal: str,
+        turns: int = 4,
     ) -> List[Dict[str, str]]:
         """
-        Runs an autonomous dialogue exchange between two character agents.
+        Runs a short back-and-forth between two character agents. Each turn
+        returns the spoken line, a physical action AND an emotion - the emotion
+        later shapes how the line is delivered (rate / pitch / volume).
         """
-        history = []
+        history: List[Dict[str, str]] = []
         scene_context = f"Setting: {scene_goal}. Characters present: {character_a['name']}, {character_b['name']}."
 
         for i in range(turns):
-            # Select active speaker
             active = character_a if i % 2 == 0 else character_b
             other = character_b if i % 2 == 0 else character_a
-            
+            is_last = i == turns - 1
+
             system_prompt = (
                 f"You are {active['name']}. Persona: {active.get('description', '')}. "
-                f"Your goal in this scene: {scene_goal}. Adapt to what {other['name']} says or does."
+                f"You are in this scene: {scene_goal}. React naturally to what {other['name']} says or does. "
+                "Speak the way a real person speaks out loud - short, direct, emotional, in natural "
+                "conversational English. One to two sentences, under 25 words. Never describe actions inside "
+                "the spoken line, never say your own name, never narrate."
             )
-            
-            recent_dialogue = "\n".join([f"{h['speaker']}: {h['text']} [Action: {h['action']}]" for h in history[-3:]])
-            user_prompt = f"Context:\n{scene_context}\n\nRecent History:\n{recent_dialogue}\n\nRespond with your spoken line and physical action in format:\nAction: <action>\nText: <dialogue>"
+            recent = "\n".join(
+                f"{h['speaker']} ({h['expression']}): {h['text']}" for h in history[-3:]
+            ) or "(you speak first)"
+            ending = " This is the last line of the exchange - bring it to a natural close." if is_last else ""
+            user_prompt = (
+                f"Context:\n{scene_context}\n\nConversation so far:\n{recent}\n\n"
+                f"Reply with EXACTLY these three lines and nothing else:{ending}\n"
+                "Emotion: <one or two words, e.g. angry, pleading, sad, joyful, stern, afraid>\n"
+                "Action: <a short physical action, e.g. kneels, turns away, clenches fists>\n"
+                "Text: <what you say out loud>"
+            )
 
-            raw_response = await self._query_agent(system_prompt, user_prompt)
-            
-            # Basic parsing of action and text
-            action = "stands attentively"
-            text = raw_response
-            if "Action:" in raw_response and "Text:" in raw_response:
-                try:
-                    parts = raw_response.split("Text:")
-                    action = parts[0].replace("Action:", "").strip()
-                    text = parts[1].strip()
-                except Exception:
-                    pass
-
-            turn_data = {
-                "speaker": active["name"],
-                "text": text,
-                "action": action,
-                "expression": "dynamic expression"
-            }
-            history.append(turn_data)
+            raw = await self._query_agent(system_prompt, user_prompt)
+            emotion, action, text = self._parse_turn(raw, active["name"])
+            if not text:
+                continue
+            history.append({"speaker": active["name"], "text": text, "action": action, "expression": emotion})
 
         return history
+
+    @staticmethod
+    def _parse_turn(raw: str, speaker: str):
+        """Pull Emotion / Action / Text out of the model's reply, tolerating the
+        formatting slips small models make."""
+        emotion, action = "neutral", "stands attentively"
+        text = ""
+        found_text = False
+        for line in (raw or "").splitlines():
+            m = re.match(r"^\s*[*_#>\-\s]*(emotion|expression|action|text|says?|dialogue|line)\s*[:\-]\s*(.*)$", line, re.IGNORECASE)
+            if not m:
+                if found_text and line.strip():
+                    text += " " + line.strip()  # a spoken line wrapped onto a second line
+                continue
+            key, value = m.group(1).lower(), m.group(2).strip()
+            if key in ("emotion", "expression"):
+                emotion = value.strip("*_ ").lower() or emotion
+            elif key == "action":
+                action = value.strip("*_ ") or action
+            else:
+                text, found_text = value, True
+        if not found_text:  # the model ignored the format: use the whole reply
+            text = re.sub(r"^\s*" + re.escape(speaker) + r"\s*:\s*", "", (raw or "").strip(), flags=re.IGNORECASE)
+        text = re.sub(r"^\s*" + re.escape(speaker) + r"\s*:\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\*[^*]*\*|\([^)]*\)|\[[^\]]*\]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip().strip('"\u201c\u201d').strip()
+        return emotion[:40], action[:80], text

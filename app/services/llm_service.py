@@ -1,4 +1,6 @@
 import json
+import logging
+import re
 import httpx
 from typing import Dict, Any
 from app.core.config import settings
@@ -7,7 +9,27 @@ from app.services.agent_service import AgentService
 from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
 from app.services.http_retry import post_with_retry
 
+logger = logging.getLogger(__name__)
+
+
 class LLMService:
+    @staticmethod
+    def _parse_json(raw: str) -> dict:
+        """Parse the model's JSON, tolerating code fences / stray text around it."""
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw or "", re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+        raise RuntimeError(
+            "The language model didn't return valid JSON for the script. This usually fixes itself "
+            "if you press Retry/Resume; if it keeps happening, try a larger model in LLM_MODEL."
+        )
+
     def __init__(self):
         # Prefer the live URL published by the Ollama Colab/Kaggle notebook
         # (see app/services/dynamic_config.py); falls back to the static
@@ -89,8 +111,10 @@ class LLMService:
             "characters": [
                 {{
                     "name": "...",
-                    "description": "...",
-                    "appearance_prompt": "..."
+                    "description": "Role and personality in one or two sentences.",
+                    "appearance_prompt": "Concrete, visual and reusable in every scene: age, build, skin tone, hair, face, clothing. Never mention the story here.",
+                    "gender": "male or female (always provide - it chooses the character's voice)",
+                    "age_group": "child, teen, adult or elder"
                 }}
             ],
             "scenes": [
@@ -98,10 +122,10 @@ class LLMService:
                     "scene_number": 1,
                     "location": "...",
                     "visual_description": "...",
-                    "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - describe the subject(s), action, setting and composition in full; this is sent directly to the image generator, so it must not depend on any other field to make sense.",
-                    "narration_text": "A line or two of narrator voiceover describing what's happening in this scene, written to be spoken aloud. Always provide this, even for scenes with dialogue - it drives whether the scene has any audio at all. Only use null/empty if the scene is dialogue-only AND narration would be genuinely redundant.",
+                    "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - subject(s), action, setting, time of day, lighting and camera framing (e.g. wide shot / medium shot). Sent directly to the image generator, so it must make sense on its own.",
+                    "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here.",
                     "characters_present": ["Name1", "Name2"],
-                    "motion_prompt": "...",
+                    "motion_prompt": "Gentle, concrete camera and subject movement for a few seconds, e.g. 'slow push-in while the boy lowers his head'. Avoid fast or dramatic motion.",
                     "duration_seconds": 5
                 }}
             ]
@@ -136,16 +160,44 @@ class LLMService:
             payload = response.json()
             raw_json = payload.get("response", "{}")
 
-        parsed_data = json.loads(raw_json)
+        parsed_data = self._parse_json(raw_json)
 
-        # Step B: Run Autonomous Multi-Agent Loop for Scenes with Multiple Characters
-        characters = parsed_data.get("characters", [])
-        if len(characters) >= 2:
-            char_a, char_b = characters[0], characters[1]
-            for scene in parsed_data.get("scenes", []):
-                goal = f"{scene['location']} - {scene['visual_description']}"
-                # Generate dynamic turns using AgentService
-                turns = await self.agent_service.simulate_interaction(char_a, char_b, goal, turns=4)
-                scene["dialogue_turns"] = turns
+        # Step B: character-to-character dialogue for scenes with 2+ people.
+        # Speakers are the characters actually present in each scene (not
+        # always the first two). One failed call never loses the whole script.
+        characters = parsed_data.get("characters", []) or []
+        by_name = {str(c.get("name", "")).strip().lower(): c for c in characters}
+        for scene in parsed_data.get("scenes", []) or []:
+            present = [by_name[n.strip().lower()] for n in (scene.get("characters_present") or [])
+                       if isinstance(n, str) and n.strip().lower() in by_name]
+            if len(present) >= 2:
+                char_a, char_b = present[0], present[1]
+            elif not present and len(characters) >= 2:
+                char_a, char_b = characters[0], characters[1]
+            else:
+                continue  # a single person on screen: the narrator carries the scene
+            goal = f"{scene.get('location', '')} - {scene.get('visual_description', '')}"
+            try:
+                scene["dialogue_turns"] = await self.agent_service.simulate_interaction(char_a, char_b, goal, turns=4)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)
+                scene["dialogue_turns"] = []
+
+        # Small models sometimes emit null / wrong types; normalise before validating.
+        for sc in parsed_data.get("scenes", []) or []:
+            for key in ("location", "motion_prompt", "image_prompt", "narration_text"):
+                if sc.get(key) is None:
+                    sc[key] = "" if key != "narration_text" else None
+            if not sc.get("visual_description"):
+                sc["visual_description"] = sc.get("image_prompt") or sc.get("location") or "A scene from the story."
+            try:
+                sc["duration_seconds"] = max(2, min(int(float(sc.get("duration_seconds") or 5)), 20))
+            except (TypeError, ValueError):
+                sc["duration_seconds"] = 5
+            if not isinstance(sc.get("characters_present"), list):
+                sc["characters_present"] = []
+        for ch in parsed_data.get("characters", []) or []:
+            ch["appearance_prompt"] = ch.get("appearance_prompt") or ch.get("description") or ""
+            ch["description"] = ch.get("description") or ch["appearance_prompt"]
 
         return ScriptDecompositionSchema(**parsed_data)

@@ -1,49 +1,57 @@
+import asyncio
+import logging
 import os
 import shutil
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
+from typing import Callable, List, Optional
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from typing import Optional, List
 
-from app.core.database import get_db
 from app.core.config import settings
-from app.core.celery_app import celery_app
-from app.models.project import Project, ProjectStatus
+from app.core.database import get_db
+from app.core.sync_db import SessionLocal
 from app.models.character import Character
+from app.models.project import BUSY_STATUSES, Project
 from app.models.scene import Scene
-from app.schemas.project import ProjectResponse, ProjectListItem, ProjectDetailResponse
-from app.schemas.character import CharacterUpdate, CharacterResponse
-from app.schemas.scene import SceneUpdate, SceneResponse
-from app.tasks.pipeline_tasks import run_script_breakdown, run_asset_pipeline
+from app.schemas.character import CharacterResponse, CharacterUpdate
+from app.schemas.project import (
+    DeleteResult, ProjectDetailResponse, ProjectListItem, ProjectResponse, QueueSnapshot,
+)
+from app.schemas.scene import SceneResponse, SceneUpdate
+from app.services import run_control as rc
+from app.services.voice_service import normalize_age_group, normalize_gender
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Statuses from which asset generation is allowed to start (or restart).
-_ASSET_GENERATION_ALLOWED_FROM = {
-    ProjectStatus.SCRIPT_READY,
-    ProjectStatus.FAILED,
-    ProjectStatus.COMPLETED,
-    ProjectStatus.CANCELLED,
-}
 
-_IN_FLIGHT_STATUSES = {
-    ProjectStatus.TRANSCRIBING,
-    ProjectStatus.GENERATING_SCRIPT,
-    ProjectStatus.GENERATING_ASSETS,
-    ProjectStatus.GENERATING_IMAGES,
-    ProjectStatus.GENERATING_VIDEOS,
-    ProjectStatus.GENERATING_AUDIO,
-    ProjectStatus.COMPOSITING,
-}
+# ---------------------------------------------------------------------------
+# Helpers: run-control functions are synchronous (they share code with the
+# Celery worker), so the API runs them in a thread.
+# ---------------------------------------------------------------------------
+async def _in_session(fn: Callable):
+    """Run `fn(db)` in a worker thread with a sync DB session. `fn` must return
+    plain data (pydantic models / dicts), never ORM objects."""
+
+    def inner():
+        with SessionLocal() as db:
+            return fn(db)
+
+    try:
+        return await asyncio.to_thread(inner)
+    except rc.ActionError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
 
 
-async def _get_project_or_404(project_id: str, db: AsyncSession) -> Project:
-    result = await db.execute(select(Project).filter(Project.id == project_id))
-    project = result.scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found.")
-    return project
+def _project_out(db, p: Project, model=ProjectResponse):
+    item = model.model_validate(p)
+    if p.status.value in ("QUEUED", "CREATED"):
+        order = rc.queued_ids_in_order(db)
+        if p.id in order:
+            item.queue_position = order.index(p.id) + 1
+    return item
 
 
 @router.post("/projects", response_model=ProjectResponse)
@@ -58,167 +66,179 @@ async def create_project(
     """
     View 2 (Project Creation Form): kicks off Phase 1 only (STT + script
     breakdown). The heavy asset-generation phase is a separate, explicit
-    step triggered from the review screen via /projects/{id}/run-pipeline.
+    step triggered from the review screen.
     """
-    if not prompt and not audio_file:
+    if not (prompt and prompt.strip()) and not audio_file:
         raise HTTPException(status_code=400, detail="Must provide either a text prompt or an audio recording.")
 
     new_project = Project(
-        raw_prompt=prompt,
-        requested_genre=genre,
-        requested_tone=tone,
-        requested_visual_style=visual_style,
+        raw_prompt=(prompt or "").strip() or None,
+        requested_genre=genre or None,
+        requested_tone=tone or None,
+        requested_visual_style=visual_style or None,
     )
     db.add(new_project)
     await db.commit()
     await db.refresh(new_project)
+    project_id = new_project.id
 
     if audio_file:
-        project_dir = os.path.join(settings.STORAGE_DIR, "projects", new_project.id)
+        project_dir = os.path.join(settings.STORAGE_DIR, "projects", project_id)
         os.makedirs(project_dir, exist_ok=True)
         safe_name = os.path.basename(audio_file.filename or "input_audio")
         audio_path = os.path.join(project_dir, f"input_audio_{safe_name}")
-
         with open(audio_path, "wb") as buffer:
             shutil.copyfileobj(audio_file.file, buffer)
-
         new_project.audio_input_path = audio_path
         await db.commit()
 
-    task = run_script_breakdown.delay(new_project.id)
-    new_project.celery_task_id = task.id
-    await db.commit()
-    await db.refresh(new_project)
+    def start(sdb):
+        p = sdb.get(Project, project_id)
+        rc.start_new_script(sdb, p)
+        sdb.refresh(p)
+        return _project_out(sdb, p)
 
-    return new_project
+    return await _in_session(start)
+
+
+@router.get("/queue", response_model=QueueSnapshot)
+async def get_queue():
+    """What is running right now, and what is waiting (in order)."""
+
+    def inner(db):
+        rc.reconcile_stale(db)
+        return rc.queue_snapshot(db)
+
+    return await _in_session(inner)
 
 
 @router.get("/projects", response_model=List[ProjectListItem])
-async def list_projects(db: AsyncSession = Depends(get_db)):
+async def list_projects():
     """View 1 (Project Dashboard): grid of all projects, newest first."""
-    result = await db.execute(select(Project).order_by(Project.created_at.desc()))
-    return result.scalars().all()
+
+    def inner(db):
+        rc.reconcile_stale(db)
+        order = rc.queued_ids_in_order(db)
+        position = {pid: i + 1 for i, pid in enumerate(order)}
+        rows = db.execute(select(Project).order_by(Project.created_at.desc())).scalars().all()
+        out = []
+        for p in rows:
+            item = ProjectListItem.model_validate(p)
+            item.queue_position = position.get(p.id)
+            out.append(item)
+        return out
+
+    return await _in_session(inner)
 
 
 @router.get("/projects/{project_id}", response_model=ProjectDetailResponse)
-async def get_project(project_id: str, db: AsyncSession = Depends(get_db)):
-    """
-    View 3 & 4 (Review Editor / Player): full project detail including the
-    parsed script, character registry, and scene timeline.
-    """
-    result = await db.execute(
-        select(Project)
-        .options(
-            selectinload(Project.script),
-            selectinload(Project.characters),
-            selectinload(Project.scenes),
-        )
-        .filter(Project.id == project_id)
-    )
+async def get_project(project_id: str):
+    """View 3 & 4 (Review Editor / Player): full project detail."""
+
+    def inner(db):
+        rc.reconcile_stale(db)
+        p = db.execute(
+            select(Project)
+            .options(selectinload(Project.script), selectinload(Project.characters), selectinload(Project.scenes))
+            .where(Project.id == project_id)
+        ).scalars().first()
+        if not p:
+            raise rc.ActionError(404, "Project not found.")
+        return _project_out(db, p, ProjectDetailResponse)
+
+    return await _in_session(inner)
+
+
+# ---------------------------------------------------------------------------
+# Run control
+# ---------------------------------------------------------------------------
+@router.post("/projects/{project_id}/run-pipeline", response_model=ProjectResponse, status_code=202)
+async def run_pipeline(
+    project_id: str,
+    fresh: bool = Query(False, description="true = redo every scene from scratch; false = only what's missing or edited"),
+):
+    """View 3 'Start generation' / 'Regenerate'. Matches PRD POST /projects/{id}/run-pipeline (202 Accepted)."""
+
+    def inner(db):
+        p = rc.start_generation(db, project_id, fresh=fresh)
+        return _project_out(db, p)
+
+    return await _in_session(inner)
+
+
+@router.post("/projects/{project_id}/resume", response_model=ProjectResponse, status_code=202)
+async def resume_project(project_id: str):
+    """Continue a paused / failed / cancelled project from where it stopped."""
+
+    def inner(db):
+        return _project_out(db, rc.resume(db, project_id))
+
+    return await _in_session(inner)
+
+
+@router.post("/projects/{project_id}/pause", response_model=ProjectResponse)
+async def pause_project(project_id: str):
+    """Pause. Everything finished so far is kept. Takes effect within a few
+    seconds (the project shows 'Pausing...' until the worker has stopped)."""
+
+    def inner(db):
+        return _project_out(db, rc.pause(db, project_id))
+
+    return await _in_session(inner)
+
+
+@router.post("/projects/{project_id}/cancel", response_model=ProjectResponse)
+async def cancel_project(project_id: str):
+    """Stop for good (finished work is still kept on disk and can be picked up
+    again with Resume)."""
+
+    def inner(db):
+        return _project_out(db, rc.cancel(db, project_id))
+
+    return await _in_session(inner)
+
+
+@router.delete("/projects/{project_id}", response_model=DeleteResult)
+async def delete_project(project_id: str):
+    """Delete. An idle project is removed immediately; a running one is stopped
+    first and then removes itself (the UI shows 'Deleting...')."""
+
+    def inner(db):
+        return rc.delete(db, project_id)
+
+    return await _in_session(inner)
+
+
+# ---------------------------------------------------------------------------
+# Human control: edit before / between runs
+# ---------------------------------------------------------------------------
+async def _get_project_or_404(project_id: str, db: AsyncSession) -> Project:
+    result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found.")
     return project
 
 
-@router.delete("/projects/{project_id}", status_code=204)
-async def delete_project(project_id: str, db: AsyncSession = Depends(get_db)):
-    project = await _get_project_or_404(project_id, db)
-    if project.status in _IN_FLIGHT_STATUSES:
-        raise HTTPException(status_code=409, detail="Cannot delete a project while it is generating.")
-
-    project_dir = os.path.join(settings.STORAGE_DIR, "projects", project_id)
-    await db.delete(project)
-    await db.commit()
-
-    if os.path.isdir(project_dir):
-        shutil.rmtree(project_dir, ignore_errors=True)
-    return None
-
-
-@router.post("/projects/{project_id}/run-pipeline", response_model=ProjectResponse)
-async def run_pipeline(project_id: str, db: AsyncSession = Depends(get_db)):
-    """
-    View 3 ("Start Generation" button): dispatches Phase 2 (asset/video
-    rendering) now that the user has reviewed - and possibly edited - the
-    script, characters and scenes. Matches PRD endpoint
-    POST /api/projects/{id}/run-pipeline (202 Accepted).
-    """
-    project = await _get_project_or_404(project_id, db)
-
-    if project.status in _IN_FLIGHT_STATUSES:
-        raise HTTPException(status_code=409, detail=f"Project is already processing (status: {project.status}).")
-    if project.status not in _ASSET_GENERATION_ALLOWED_FROM:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Project is not ready for generation yet (status: {project.status}). "
-                   f"Wait for the script breakdown to finish.",
-        )
-
-    project.error_message = None
-    project.cancel_requested = False
-    await db.commit()
-
-    task = run_asset_pipeline.delay(project_id)
-    project.celery_task_id = task.id
-    await db.commit()
-    await db.refresh(project)
-    return project
-
-
-@router.post("/projects/{project_id}/cancel", response_model=ProjectResponse)
-async def cancel_project(project_id: str, db: AsyncSession = Depends(get_db)):
-    """
-    Stops an in-progress run. This is cooperative, not a hard kill: it sets
-    cancel_requested and the running task checks that flag between steps
-    (before each scene, and between each generation call within a scene)
-    and exits on its own - see run_script_breakdown/run_asset_pipeline in
-    pipeline_tasks.py. A true hard-kill via Celery's revoke(terminate=True)
-    needs the "prefork" worker pool, which isn't available with the
-    --pool=solo Celery recommends on Windows, so this works regardless of
-    which pool the worker is running under.
-
-    If the task hasn't started yet (still sitting in the queue), we also
-    revoke it outright so it never begins at all.
-    """
-    project = await _get_project_or_404(project_id, db)
-
-    if project.status not in _IN_FLIGHT_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Nothing to cancel - project isn't currently running (status: {project.status}).",
-        )
-
-    project.cancel_requested = True
-    await db.commit()
-
-    if project.celery_task_id:
-        try:
-            celery_app.control.revoke(project.celery_task_id)
-        except Exception:
-            # Best-effort only - the cancel_requested flag is what actually
-            # guarantees a running task stops; this just catches the case
-            # where it hadn't started yet.
-            pass
-
-    await db.refresh(project)
-    return project
-
-
 @router.patch("/projects/{project_id}/scenes/{scene_id}", response_model=SceneResponse)
 async def update_scene(project_id: str, scene_id: str, payload: SceneUpdate, db: AsyncSession = Depends(get_db)):
-    """View 3 (Human Control): edit a scene's prompts/text before generation runs."""
+    """Edit a scene's prompts / narration / dialogue. The scene is re-rendered next run; others are kept."""
     project = await _get_project_or_404(project_id, db)
-    if project.status in _IN_FLIGHT_STATUSES:
-        raise HTTPException(status_code=409, detail="Cannot edit scenes while generation is in progress.")
+    if project.status in BUSY_STATUSES:
+        raise HTTPException(status_code=409, detail="Pause the project (or wait for it to finish) before editing scenes.")
 
-    result = await db.execute(select(Scene).filter(Scene.id == scene_id, Scene.project_id == project_id))
+    result = await db.execute(select(Scene).where(Scene.id == scene_id, Scene.project_id == project_id))
     scene = result.scalars().first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found.")
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    if "dialogue_turns" in changes and changes["dialogue_turns"] is not None:
+        changes["dialogue_turns"] = [t for t in changes["dialogue_turns"] if (t.get("text") or "").strip()] or None
+    for field, value in changes.items():
         setattr(scene, field, value)
+    if changes:
+        scene.render_status = "PENDING"
 
     await db.commit()
     await db.refresh(scene)
@@ -229,20 +249,34 @@ async def update_scene(project_id: str, scene_id: str, payload: SceneUpdate, db:
 async def update_character(
     project_id: str, character_id: str, payload: CharacterUpdate, db: AsyncSession = Depends(get_db)
 ):
-    """View 3 (Human Control): edit a character's description/appearance prompt before generation runs."""
+    """Edit a character's look / gender / age. Their voice is re-chosen next run if gender or age changed."""
     project = await _get_project_or_404(project_id, db)
-    if project.status in _IN_FLIGHT_STATUSES:
-        raise HTTPException(status_code=409, detail="Cannot edit characters while generation is in progress.")
+    if project.status in BUSY_STATUSES:
+        raise HTTPException(status_code=409, detail="Pause the project (or wait for it to finish) before editing characters.")
 
     result = await db.execute(
-        select(Character).filter(Character.id == character_id, Character.project_id == project_id)
+        select(Character).where(Character.id == character_id, Character.project_id == project_id)
     )
     character = result.scalars().first()
     if not character:
         raise HTTPException(status_code=404, detail="Character not found.")
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    if "gender" in changes:
+        g = normalize_gender(changes["gender"])
+        if g != character.gender:
+            character.voice_id = None  # pick a new voice that matches
+        changes["gender"] = g
+    if "age_group" in changes:
+        changes["age_group"] = normalize_age_group(changes["age_group"])
+    for field, value in changes.items():
         setattr(character, field, value)
+
+    if changes:
+        scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id))).scalars().all()
+        for sc in scenes:
+            if sc.render_status == "DONE":
+                sc.render_status = "PENDING"
 
     await db.commit()
     await db.refresh(character)

@@ -1,12 +1,29 @@
+import asyncio
+import logging
 import os
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
 from app.core.config import settings
+from app.core.schema_upgrade import ensure_schema
+from app.core.sync_db import engine as sync_engine
 from app.api.v1.router import api_router
 
-app = FastAPI(title=settings.PROJECT_NAME, version="1.0.0")
+logger = logging.getLogger("uvicorn.error")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Bring the database schema up to date automatically (idempotent, never raises).
+    await asyncio.to_thread(ensure_schema, sync_engine)
+    yield
+
+
+app = FastAPI(title=settings.PROJECT_NAME, version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,8 +44,5 @@ if __name__ == "__main__":
     # Local dev only. On Render/any host that assigns a dynamic port via
     # $PORT, set the service's Start Command to:
     #   uvicorn main:app --host 0.0.0.0 --port $PORT
-    # rather than relying on this block - that's what actually reads the
-    # host-assigned port; this hardcoded fallback is just for `python main.py`
-    # on your own machine.
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

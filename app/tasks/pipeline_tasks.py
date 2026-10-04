@@ -1,321 +1,330 @@
 import os
 import asyncio
 import logging
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+import shutil
+import time
+import uuid
+
+from celery.signals import worker_ready
+from sqlalchemy import delete, select
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
+from app.core.schema_upgrade import ensure_schema
+from app.core.sync_db import SessionLocal, engine  # noqa: F401  (engine re-exported for older scripts)
 from app.models.project import Project, ProjectStatus
 from app.models.script import Script
 from app.models.character import Character
 from app.models.scene import Scene
 
+from app.services import run_control as rc
+from app.services.run_control import RunControl, RunStopped
 from app.services.stt_service import STTService
 from app.services.llm_service import LLMService
 from app.services.image_service import ImageGenerationService
 from app.services.video_service import VideoGenerationService
 from app.services.tts_service import TTSService
 from app.services.ffmpeg_service import FFmpegService
-from app.services.spatial_service import SpatialService
+from app.services.scene_renderer import SceneRenderer
+from app.services.voice_service import VoiceCast, normalize_age_group, normalize_gender
 from app.services.media_storage import publish_file
 
 logger = logging.getLogger(__name__)
 
-# Synchronous DB session wrapper for Celery Workers.
-# Same asyncpg-vs-psycopg2 SSL param translation as alembic/env.py - needed
-# if DATABASE_URL_OVERRIDE points at a hosted Postgres (e.g. Neon) that
-# requires TLS via "?ssl=require".
-sync_db_url = settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
-sync_db_url = sync_db_url.replace("ssl=require", "sslmode=require")
-# pool_pre_ping=True: this is the engine actually used by the worker while
-# it waits minutes at a time on Colab video generation - without it, the
-# connection can go stale during that wait and the next db.commit()/
-# db.rollback() fails with "server closed the connection unexpectedly"
-# instead of transparently reconnecting (this is exactly what happened in
-# production - the rollback inside the exception handler itself failed).
-engine = create_engine(sync_db_url, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine)
-
-
-def _check_cancelled(db, project) -> bool:
-    """
-    Cooperative-cancellation check. Queries cancel_requested fresh from the
-    DB rather than trusting the in-memory `project` object, since the flag
-    is set by the API process over a separate connection - frequent commits
-    elsewhere in these tasks mean this session's transaction is short-lived
-    enough to see that update promptly under Postgres's READ COMMITTED
-    isolation. If cancelled, marks the project CANCELLED and returns True
-    so the caller can stop without treating this as a failure.
-    """
-    cancelled = db.query(Project.cancel_requested).filter(Project.id == project.id).scalar()
-    if cancelled:
-        project.status = ProjectStatus.CANCELLED
-        project.error_message = "Cancelled by user."
-        db.commit()
-        logger.info(f"Project {project.id} cancelled by user request.")
-        return True
-    return False
-
 
 # ---------------------------------------------------------------------------
-# Phase 1: Script breakdown (fast, text-only). Runs right after project
-# creation. Leaves the project in SCRIPT_READY so the user can review and
-# edit characters/scenes in the frontend before any heavy GPU work happens.
+# Worker start-up: bring the schema up to date and clean up after a crash.
 # ---------------------------------------------------------------------------
-@celery_app.task(bind=True)
-def run_script_breakdown(self, project_id: str):
-    db = SessionLocal()
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        logger.error(f"Project ID {project_id} not found.")
-        return
-
+@worker_ready.connect
+def _on_worker_ready(**_kwargs):
     try:
-        # Step 1: Speech to Text (if audio provided instead of a text prompt)
-        if project.audio_input_path and not project.raw_prompt:
-            project.status = ProjectStatus.TRANSCRIBING
-            db.commit()
-            stt = STTService()
-            project.raw_prompt = stt.transcribe(project.audio_input_path)
-            db.commit()
+        ensure_schema(engine)
+        with SessionLocal() as db:
+            rc.ensure_lease_row(db)
+            rc.recover_orphans_on_worker_start(db)
+            rc.reconcile_stale(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("Worker start-up cleanup failed (continuing).")
 
-        if _check_cancelled(db, project):
+
+# ---------------------------------------------------------------------------
+# The common shell around every run: wait for the single slot, claim the
+# project, keep a heartbeat going, and always settle the project's state.
+# ---------------------------------------------------------------------------
+def _wait_for_slot(db, project_id: str, token: str) -> bool:
+    """Block (politely) until this project may run. Returns False if it no
+    longer needs to (paused / cancelled / deleted / superseded while waiting)."""
+    rc.ensure_lease_row(db)
+    while True:
+        if rc.acquire_lease(db, project_id):
+            return True
+        row = db.execute(
+            select(Project.status, Project.run_token, Project.delete_requested).where(Project.id == project_id)
+        ).first()
+        db.commit()
+        if row is None or row.run_token != token or row.status != ProjectStatus.QUEUED or row.delete_requested:
+            return False
+        time.sleep(4)
+
+
+def _execute(project_id: str, token, first_status: ProjectStatus, body) -> None:
+    db = SessionLocal()
+    ctl = None
+    leased = False
+    try:
+        project = db.get(Project, project_id)
+        if project is None:
+            logger.info("Project %s no longer exists - nothing to do.", project_id)
             return
 
-        # Step 2: LLM Story & Multi-Agent Scene Generation
-        project.status = ProjectStatus.GENERATING_SCRIPT
-        db.commit()
-
-        llm = LLMService()
-        # Safe asyncio execution for synchronous Celery worker threads
-        script_schema = asyncio.run(
-            llm.generate_script_structure(
-                project.raw_prompt,
-                genre_hint=project.requested_genre,
-                tone_hint=project.requested_tone,
-                visual_style_hint=project.requested_visual_style,
-            )
-        )
-
-        project.title = script_schema.title
-        script = Script(
-            project_id=project.id,
-            genre=script_schema.genre,
-            tone=script_schema.tone,
-            visual_style=script_schema.visual_style,
-            full_text=project.raw_prompt,
-        )
-        db.add(script)
-
-        # Store Characters
-        for char in script_schema.characters:
-            db_char = Character(
-                project_id=project.id,
-                name=char.name,
-                description=char.description,
-                appearance_prompt=char.appearance_prompt,
-            )
-            db.add(db_char)
-
-        # Store Scenes, including any generated dialogue turns, so the
-        # asset-generation phase can run later without recomputing anything.
-        for sc in script_schema.scenes:
-            raw_turns = sc.dialogue_turns or []
-            dialogue_turns = [t.model_dump() if hasattr(t, "model_dump") else t for t in raw_turns]
-            db_scene = Scene(
-                project_id=project.id,
-                scene_number=sc.scene_number,
-                duration_seconds=sc.duration_seconds,
-                location=sc.location,
-                visual_description=sc.visual_description,
-                narration_text=sc.narration_text,
-                image_prompt=f"{sc.image_prompt}, visual style: {script_schema.visual_style}",
-                motion_prompt=sc.motion_prompt,
-                dialogue_turns=dialogue_turns or None,
-            )
-            db.add(db_scene)
-
-        project.status = ProjectStatus.SCRIPT_READY
-        db.commit()
-
-    except Exception as e:
-        db.rollback()
-        project.status = ProjectStatus.FAILED
-        project.error_message = str(e)
-        db.commit()
-        logger.error(f"Script breakdown failed for project {project_id}: {e}", exc_info=True)
-        raise e
-    finally:
-        db.close()
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: Asset generation (images -> pose maps -> audio -> video -> composite).
-# Triggered explicitly by the user from the review/edit screen, once they are
-# happy with the parsed script, characters and scenes (which they may have edited).
-# Reads scenes straight from the database, not from the original LLM output,
-# so any edits the user made are respected.
-# ---------------------------------------------------------------------------
-@celery_app.task(bind=True)
-def run_asset_pipeline(self, project_id: str):
-    db = SessionLocal()
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        logger.error(f"Project ID {project_id} not found.")
-        return
-
-    try:
-        db_scenes = (
-            db.query(Scene)
-            .filter(Scene.project_id == project_id)
-            .order_by(Scene.scene_number)
-            .all()
-        )
-        if not db_scenes:
-            raise RuntimeError("No scenes found for this project. Run script breakdown first.")
-
-        image_service = ImageGenerationService()
-        video_service = VideoGenerationService()
-        tts_service = TTSService()
-        ffmpeg_service = FFmpegService()
-        spatial_service = SpatialService()
-
-        project.status = ProjectStatus.GENERATING_ASSETS
-        db.commit()
-
-        project_dir = os.path.join(settings.STORAGE_DIR, "projects", project.id)
-        scene_rendered_files = []
-
-        for scene in db_scenes:
-            if _check_cancelled(db, project):
-                return
-
-            scene_dir = os.path.join(project_dir, f"scene_{scene.scene_number}")
-            os.makedirs(scene_dir, exist_ok=True)
-
-            # 3a. Generate Keyframe Image
-            project.status = ProjectStatus.GENERATING_IMAGES
-            db.commit()
-            img_path = os.path.join(scene_dir, "keyframe.png")
-            image_service.generate_image(scene.image_prompt, img_path)
-            scene.image_path = publish_file(img_path, f"projects/{project.id}/scene_{scene.scene_number}/keyframe.png")
+        if token is None:
+            # Called without a token (older callers / scripts/test_pipeline.py):
+            # mint one and enter the queue the normal way.
+            token = uuid.uuid4().hex
+            project.run_token, project.status, project.queued_at = token, ProjectStatus.QUEUED, rc.now()
             db.commit()
 
-            dialogue_turns = scene.dialogue_turns or []
-            scene_final_path = os.path.join(scene_dir, "scene_final.mp4")
+        if not _wait_for_slot(db, project_id, token):
+            logger.info("Project %s left the queue before its turn (superseded / paused / deleted).", project_id)
+            return
+        leased = True
 
-            if dialogue_turns:
-                turn_clips = []
-                for idx, turn in enumerate(dialogue_turns):
-                    if _check_cancelled(db, project):
-                        return
+        if not rc.claim(db, project_id, token, first_status):
+            logger.info("Project %s: this task's run token is no longer current - ignoring it.", project_id)
+            return
 
-                    speaker = turn.get("speaker", "Character")
-                    text = turn.get("text", "")
-                    expression = turn.get("expression", "neutral")
-                    action = turn.get("action", "gesturing while speaking")
+        ctl = RunControl(project_id, token)
+        ctl.start()
+        db.expire_all()
+        project = db.get(Project, project_id)
 
-                    turn_aud_path = os.path.join(scene_dir, f"dialogue_{idx}_{speaker}.mp3")
-                    turn_vid_path = os.path.join(scene_dir, f"clip_{idx}_{speaker}.mp4")
-                    turn_merged_path = os.path.join(scene_dir, f"shot_{idx}_{speaker}.mp4")
-
-                    project.status = ProjectStatus.GENERATING_AUDIO
-                    db.commit()
-                    tts_service.generate_speech(text, turn_aud_path)
-
-                    aud_duration = 3.5
-                    if hasattr(ffmpeg_service, "get_audio_duration"):
-                        aud_duration = ffmpeg_service.get_audio_duration(turn_aud_path)
-
-                    pose_map_path = os.path.join(scene_dir, f"pose_{idx}_{speaker}.png")
-                    spatial_service.extract_pose_map(img_path, pose_map_path)
-
-                    project.status = ProjectStatus.GENERATING_VIDEOS
-                    db.commit()
-
-                    dynamic_motion = (
-                        f"Close-up of {speaker} performing action '{action}' with {expression} expression. "
-                        f"{scene.motion_prompt or 'cinematic facial movement'}"
-                    )
-
-                    video_service.generate_video_from_image(
-                        image_path=img_path,
-                        output_path=turn_vid_path,
-                        motion_prompt=dynamic_motion,
-                        narration_text=f"{speaker}: {text}",
-                        audio_duration=aud_duration,
-                        pose_map_path=pose_map_path,
-                    )
-
-                    ffmpeg_service.combine_scene_assets(turn_vid_path, turn_aud_path, turn_merged_path)
-                    turn_clips.append(turn_merged_path)
-
-                ffmpeg_service.concatenate_videos(turn_clips, scene_final_path)
-
+        try:
+            ctl.checkpoint()  # the user may have hit Pause/Delete within the first second
+            body(db, project, ctl)
+        except RunStopped as stop:
+            logger.info("Project %s stopped: %s", project_id, stop.reason)
+            rc.finish_stopped(db, project_id, token, stop.reason)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Run failed for project %s: %s", project_id, e, exc_info=True)
+            # If the failure was caused by the user's stop request, honour the
+            # stop rather than reporting it as an error.
+            if ctl.stopping and ctl.stop_reason:
+                rc.finish_stopped(db, project_id, token, ctl.stop_reason)
             else:
-                project.status = ProjectStatus.GENERATING_AUDIO
-                db.commit()
-                aud_path = os.path.join(scene_dir, "narration.mp3")
-                aud_duration = float(scene.duration_seconds or 5.0)
+                rc.finish_failed(db, project_id, token, str(e))
+        except BaseException:
+            # Ctrl+C / worker shutdown: park the project so it can be resumed.
+            try:
+                rc.finish_interrupted(db, project_id, token)
+            finally:
+                raise
+    finally:
+        if ctl is not None:
+            ctl.end()
+        if leased:
+            rc.release_lease(db)
+        db.close()
 
-                # Always generate SOME audio file, even when the scene has no
-                # narration text - TTSService.generate_speech already handles
-                # empty text by producing a silent placeholder clip. Skipping
-                # this call entirely when narration_text was empty meant
-                # narration.mp3 never got created on disk, while
-                # combine_scene_assets() below was still called with that
-                # (nonexistent) path regardless - exactly what was causing
-                # every single-scene, no-dialogue project to fail at the
-                # final ffmpeg step with "No such file or directory".
-                tts_service.generate_speech(scene.narration_text or "", aud_path)
-                if hasattr(ffmpeg_service, "get_audio_duration"):
-                    aud_duration = ffmpeg_service.get_audio_duration(aud_path)
-                scene.audio_path = aud_path
 
-                pose_map_path = os.path.join(scene_dir, "pose_narrator.png")
-                spatial_service.extract_pose_map(img_path, pose_map_path)
+def _set(db, project, **fields) -> None:
+    for k, v in fields.items():
+        setattr(project, k, v)
+    db.commit()
 
-                project.status = ProjectStatus.GENERATING_VIDEOS
-                db.commit()
-                vid_path = os.path.join(scene_dir, "raw_clip.mp4")
-                video_service.generate_video_from_image(
-                    image_path=img_path,
-                    output_path=vid_path,
-                    motion_prompt=scene.motion_prompt or "dynamic movement, cinematic camera shift",
-                    narration_text=scene.narration_text or "",
-                    audio_duration=aud_duration,
-                    pose_map_path=pose_map_path,
-                )
-                scene.video_path = vid_path
 
-                ffmpeg_service.combine_scene_assets(vid_path, aud_path, scene_final_path)
+# ---------------------------------------------------------------------------
+# Phase 1: script breakdown (text only). Leaves the project in SCRIPT_READY
+# so the user can review/edit before any heavy GPU work happens.
+# ---------------------------------------------------------------------------
+def _script_body(db, project: Project, ctl: RunControl) -> None:
+    pid = project.id
 
-            scene_rendered_files.append(scene_final_path)
+    if project.audio_input_path and not project.raw_prompt:
+        _set(db, project, status=ProjectStatus.TRANSCRIBING, stage_detail="Listening to your recording")
+        stt = STTService()
+        text = ctl.call(stt.transcribe, project.audio_input_path)
+        _set(db, project, raw_prompt=text)
+
+    ctl.checkpoint()
+    _set(db, project, status=ProjectStatus.GENERATING_SCRIPT, stage_detail="Writing the script")
+
+    llm = LLMService()
+    prompt, genre, tone, vstyle = project.raw_prompt, project.requested_genre, project.requested_tone, project.requested_visual_style
+    script_schema = ctl.call(
+        lambda: asyncio.run(
+            llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle)
+        )
+    )
+    ctl.checkpoint()
+
+    # Re-running (Retry / Resume after a failed breakdown) replaces earlier output.
+    db.execute(delete(Scene).where(Scene.project_id == pid))
+    db.execute(delete(Character).where(Character.project_id == pid))
+    db.execute(delete(Script).where(Script.project_id == pid))
+    db.flush()
+
+    project.title = script_schema.title
+    db.add(Script(
+        project_id=pid, genre=script_schema.genre, tone=script_schema.tone,
+        visual_style=script_schema.visual_style, full_text=project.raw_prompt,
+    ))
+
+    for ch in script_schema.characters:
+        db.add(Character(
+            project_id=pid, name=ch.name, description=ch.description, appearance_prompt=ch.appearance_prompt,
+            gender=normalize_gender(getattr(ch, "gender", None)),
+            age_group=normalize_age_group(getattr(ch, "age_group", None)),
+        ))
+
+    for sc in script_schema.scenes:
+        turns = [t.model_dump() if hasattr(t, "model_dump") else t for t in (sc.dialogue_turns or [])]
+        db.add(Scene(
+            project_id=pid,
+            scene_number=sc.scene_number,
+            duration_seconds=sc.duration_seconds,
+            location=sc.location,
+            visual_description=sc.visual_description,
+            narration_text=sc.narration_text,
+            image_prompt=(sc.image_prompt or "").strip() or sc.visual_description,
+            motion_prompt=sc.motion_prompt,
+            dialogue_turns=turns or None,
+            characters_present=list(sc.characters_present or []) or None,
+            render_status="PENDING",
+        ))
+
+    project.status = ProjectStatus.SCRIPT_READY
+    project.stage_detail = None
+    project.progress_pct = 0
+    project.total_scenes = len(script_schema.scenes)
+    db.commit()
+
+
+@celery_app.task(bind=True)
+def run_script_breakdown(self, project_id: str, run_token: str = None):
+    _execute(project_id, run_token, ProjectStatus.GENERATING_SCRIPT, _script_body)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: assets. Renders scene by scene; every finished scene is saved, so
+# Pause / a crash / a failure never loses work - Resume continues from there.
+# ---------------------------------------------------------------------------
+class _SceneCtx:
+    """Adapts RunControl + DB progress reporting to what SceneRenderer expects."""
+
+    def __init__(self, db, project, scene, ctl, index, total):
+        self.db, self.project, self.scene, self.ctl = db, project, scene, ctl
+        self.index, self.total = index, total
+
+    def checkpoint(self):
+        self.ctl.checkpoint()
+
+    def call(self, fn, *a, **kw):
+        return self.ctl.call(fn, *a, **kw)
+
+    def stage(self, status_name: str, frac: float, detail: str):
+        # Scene work accounts for 0-92% of the bar; the final cut is the rest.
+        pct = int(((self.index + max(0.0, min(1.0, frac))) / self.total) * 92)
+        self.project.status = ProjectStatus[status_name]
+        self.project.progress_pct = max(self.project.progress_pct or 0, pct)
+        self.project.stage_detail = f"Scene {self.scene.scene_number}/{self.total}: {detail}"
+        self.project.current_scene = self.scene.scene_number
+        self.db.commit()
+
+    def set_scene_image(self, path: str):
+        # Publish the keyframe as soon as it exists so the gallery fills in live.
+        # (Scenes that are already finished and unchanged never reach this.)
+        url = self.ctl.call(publish_file, path, f"projects/{self.project.id}/scene_{self.scene.scene_number}/keyframe.png")
+        self.scene.image_path = url
+        self.db.commit()
+
+
+def _asset_body(db, project: Project, ctl: RunControl) -> None:
+    pid = project.id
+    scenes = db.execute(select(Scene).where(Scene.project_id == pid).order_by(Scene.scene_number)).scalars().all()
+    if not scenes:
+        raise RuntimeError("This project has no scenes yet. Press Resume/Retry to write the script first.")
+    characters = db.execute(select(Character).where(Character.project_id == pid)).scalars().all()
+    script = db.execute(select(Script).where(Script.project_id == pid)).scalars().first()
+    style = (script.visual_style if script else None) or project.requested_visual_style or ""
+
+    # Voices: each character gets (and keeps) their own male/female voice.
+    cast = VoiceCast(
+        characters, settings.TTS_REGION, settings.TTS_NARRATOR_VOICE,
+        texts=[project.raw_prompt, script.full_text if script else "", style, project.title]
+              + [c.description for c in characters],
+    )
+    if cast.write_back(characters):
+        db.commit()
+    logger.info("Voice cast (%s): %s | narrator=%s", cast.region, [(m.name, m.voice_id) for m in cast.members], cast.narrator_voice)
+
+    tts, ff = TTSService(), FFmpegService()
+    renderer = SceneRenderer(ImageGenerationService(), VideoGenerationService(), tts, ff)
+
+    total = len(scenes)
+    _set(db, project, status=ProjectStatus.GENERATING_ASSETS, total_scenes=total, stage_detail="Starting")
+    project_root = os.path.join(settings.STORAGE_DIR, "projects", pid)
+    finals = []
+
+    for i, scene in enumerate(scenes):
+        ctl.checkpoint()
+        scene_dir = os.path.join(project_root, f"scene_{scene.scene_number}")
+
+        if scene.render_status == "REDO":  # the user asked to regenerate everything
+            shutil.rmtree(scene_dir, ignore_errors=True)
+            scene.render_status = "PENDING"
+            scene.image_path = scene.video_path = scene.audio_path = None
             db.commit()
 
-        if _check_cancelled(db, project):
-            return
+        if scene.render_status != "DONE":
+            scene.render_status = "RENDERING"
+            db.commit()
 
-        # Step 4: Stitch Final Master Video
-        project.status = ProjectStatus.COMPOSITING
-        db.commit()
-        master_output_path = os.path.join(project_dir, "final_master_video.mp4")
-        ffmpeg_service.concatenate_videos(scene_rendered_files, master_output_path)
+        sctx = _SceneCtx(db, project, scene, ctl, i, total)
+        try:
+            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx)
+        except RunStopped:
+            db.rollback()
+            if scene.render_status == "RENDERING":
+                scene.render_status = "PENDING"
+                db.commit()
+            raise
+        except Exception:
+            db.rollback()
+            scene.render_status = "FAILED"
+            db.commit()
+            raise
 
-        project.final_video_path = publish_file(master_output_path, f"projects/{project.id}/final_master_video.mp4")
-        project.status = ProjectStatus.COMPLETED
+        scene.video_path = result.final_path
+        scene.audio_path = os.path.join(scene_dir, "voices.wav")
+        scene.render_status = "DONE"
+        project.progress_pct = int(((i + 1) / total) * 92)
         db.commit()
+        finals.append(result.final_path)
+        logger.info("Scene %s done: %.1fs, %d shots, %d cached steps reused.",
+                    scene.scene_number, result.duration, result.shots, result.reused)
 
-    except Exception as e:
-        db.rollback()
-        project.status = ProjectStatus.FAILED
-        project.error_message = str(e)
-        db.commit()
-        logger.error(f"Asset pipeline failed for project {project_id}: {e}", exc_info=True)
-        raise e
-    finally:
-        db.close()
+    # ------------------------------------------------------------ final cut
+    ctl.checkpoint()
+    _set(db, project, status=ProjectStatus.COMPOSITING, progress_pct=94,
+         stage_detail="Joining scenes into the final cut", current_scene=None)
+    master = os.path.join(project_root, "final_master_video.mp4")
+    ctl.call(ff.concatenate_videos, finals, master, "aac")
+    _set(db, project, progress_pct=97, stage_detail="Uploading the final video")
+    url = ctl.call(publish_file, master, f"projects/{pid}/final_master_video.mp4")
+
+    warnings = list(dict.fromkeys(tts.warnings))
+    project.final_video_path = url
+    project.warning_message = " ".join(warnings)[:2000] or None
+    project.status = ProjectStatus.COMPLETED
+    project.progress_pct = 100
+    project.stage_detail = "Done"
+    project.current_scene = None
+    db.commit()
+
+
+@celery_app.task(bind=True)
+def run_asset_pipeline(self, project_id: str, run_token: str = None):
+    _execute(project_id, run_token, ProjectStatus.GENERATING_ASSETS, _asset_body)
 
 
 # ---------------------------------------------------------------------------

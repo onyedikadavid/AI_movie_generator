@@ -1,43 +1,48 @@
-# Reference blueprint for deploying on Render. If you set this service up
-# manually via Render's dashboard instead, make sure your dashboard settings
-# match what's below - the buildCommand/startCommand are what actually fix
-# the "backend unreachable" issue (heavy local-ML deps not installed, and
-# the server binding to Render's dynamically-assigned $PORT).
-services:
-  - type: web
-    name: movie-pipeline-backend
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
-    envVars:
-      - key: CORS_ORIGINS
-        sync: false   # set this in the dashboard to your real frontend URL(s), comma-separated
-      - key: DATABASE_URL_OVERRIDE
-        sync: false
-      - key: REDIS_URL_OVERRIDE
-        sync: false
-      - key: OLLAMA_URL
-        sync: false
-      - key: IMAGE_API_URL
-        sync: false
-      - key: WAN_API_URL
-        sync: false
+# # Reference blueprint for deploying on Render. If you set this service up
+# # manually via Render's dashboard instead, make sure your dashboard settings
+# # match what's below - the buildCommand/startCommand are what actually fix
+# # the "backend unreachable" issue (heavy local-ML deps not installed, and
+# # the server binding to Render's dynamically-assigned $PORT).
+# services:
+#   - type: web
+#     name: movie-pipeline-backend
+#     env: python
+#     plan: free
+#     buildCommand: "pip install -r requirements.txt"
+#     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+#     envVars:
+#       - key: CORS_ORIGINS
+#         sync: false   # set this in the dashboard to your real frontend URL(s), comma-separated
+#       - key: DATABASE_URL_OVERRIDE
+#         sync: false
+#       - key: REDIS_URL_OVERRIDE
+#         sync: false
+#       - key: OLLAMA_URL
+#         sync: false
+#       - key: IMAGE_API_URL
+#         sync: false
+#       - key: WAN_API_URL
+#         sync: false
 
-  - type: worker
-    name: movie-pipeline-worker
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "celery -A app.core.celery_app.celery_app worker --loglevel=info"
-    envVars:
-      - key: DATABASE_URL_OVERRIDE
-        sync: false
-      - key: REDIS_URL_OVERRIDE
-        sync: false
-      - key: OLLAMA_URL
-        sync: false
-      - key: IMAGE_API_URL
-        sync: false
-      - key: WAN_API_URL
-        sync: false
+#   # IMPORTANT: run exactly ONE kind of worker. The video pipeline needs ffmpeg and a
+#   # disk it can write to, which a Render free worker doesn't give you - if you run your
+#   # worker on your own PC, DELETE this worker service (a second worker that picks a job
+#   # up will fail it). The database lease prevents two jobs running at once, but it can't
+#   # know which worker is the capable one.
+#   - type: worker
+#     name: movie-pipeline-worker
+#     env: python
+#     plan: free
+#     buildCommand: "pip install -r requirements.txt"
+#     startCommand: "celery -A app.core.celery_app.celery_app worker --loglevel=info"
+#     envVars:
+#       - key: DATABASE_URL_OVERRIDE
+#         sync: false
+#       - key: REDIS_URL_OVERRIDE
+#         sync: false
+#       - key: OLLAMA_URL
+#         sync: false
+#       - key: IMAGE_API_URL
+#         sync: false
+#       - key: WAN_API_URL
+#         sync: false

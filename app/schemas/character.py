@@ -8,6 +8,9 @@ class CharacterBase(BaseModel):
     description: str
     appearance_prompt: str
     reference_image_path: Optional[str] = None
+    gender: Optional[str] = None      # "male" | "female"
+    age_group: Optional[str] = None   # "child" | "teen" | "adult" | "elder"
+    voice_id: Optional[str] = None
 
 
 class CharacterCreate(CharacterBase):
@@ -19,6 +22,8 @@ class CharacterUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     appearance_prompt: Optional[str] = None
+    gender: Optional[str] = None
+    age_group: Optional[str] = None
 
 
 class CharacterResponse(CharacterBase):

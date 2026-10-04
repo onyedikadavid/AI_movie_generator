@@ -1,3 +1,32 @@
+# v2 - what changed, and how to run it
+
+See `CHANGES.md` (one level up, next to this folder) for the full explanation. Short version:
+
+**Start order (every time)**
+1. Run the notebooks you need (Ollama -> script; SDXL + LTX -> pictures/video). Re-run them from the top: they were updated.
+2. `pip install -r requirements.txt` (adds `edge-tts`, the natural-voice engine).
+3. Start the API (`uvicorn main:app ...`). On start it upgrades the database schema by itself.
+4. Start **one** worker (Windows: add `--pool=solo`):
+   `celery -A app.core.celery_app.celery_app worker --loglevel=info --pool=solo`
+   Never run a second worker on another machine at the same time.
+
+**Optional `.env` settings** (all have sensible defaults)
+```
+TTS_REGION=auto            # auto | ng | us | gb  - accent family for the voices
+TTS_NARRATOR_VOICE=        # e.g. en-GB-RyanNeural
+TTS_ALLOW_FALLBACK=false   # true = use the old robotic voice instead of failing when neural voices are unreachable
+SHOT_COVERAGE=true         # close-up keyframe per speaker (sharper faces, slower)
+VIDEO_SHOT_SECONDS=4.5
+VIDEO_MAX_SHOTS_PER_SCENE=5
+OUTPUT_WIDTH=1280
+OUTPUT_HEIGHT=720
+STALE_RUN_SECONDS=90       # how long a silent worker is trusted before its project is marked dead
+```
+
+**Self-test (no GPU, no network needed):** `python scripts/selftest_renderer.py`
+
+---
+
 # AI Story-to-Video Engine — Backend
 
 FastAPI + Celery backend for the multi-character AI video production pipeline.

@@ -32,6 +32,7 @@ class SceneUpdate(BaseModel):
     narration_text: Optional[str] = None
     image_prompt: Optional[str] = None
     motion_prompt: Optional[str] = None
+    dialogue_turns: Optional[List[DialogueTurnOut]] = None
 
 
 class SceneResponse(SceneBase):
@@ -41,6 +42,8 @@ class SceneResponse(SceneBase):
     video_path: Optional[str] = None
     audio_path: Optional[str] = None
     dialogue_turns: Optional[List[Dict[str, Any]]] = None
+    characters_present: Optional[List[str]] = None
+    render_status: Optional[str] = "PENDING"
 
     class Config:
         from_attributes = True

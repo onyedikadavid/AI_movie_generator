@@ -26,12 +26,14 @@ class CharacterSchema(BaseModel):
     name: str = Field(..., description="Unique name of the character.")
     description: str = Field(..., description="Role and personality traits of the character.")
     appearance_prompt: str = Field(..., description="Detailed visual features for image consistency (clothing, hair, skin, age).")
+    gender: Optional[str] = Field(default=None, description="'male' or 'female' - used to choose the character's voice.")
+    age_group: Optional[str] = Field(default=None, description="'child', 'teen', 'adult' or 'elder' - used to shape the character's voice.")
 
 
 class SceneSchema(BaseModel):
     scene_number: int = Field(..., description="Sequential index of the scene starting at 1.")
-    duration_seconds: int = Field(..., description="Estimated duration of the scene in seconds.")
-    location: str = Field(..., description="Setting or background environment for the scene.")
+    duration_seconds: int = Field(default=5, description="Estimated duration of the scene in seconds.")
+    location: str = Field(default="", description="Setting or background environment for the scene.")
     visual_description: str = Field(..., description="Detailed visual action and layout of the scene.")
     narration_text: Optional[str] = Field(
         default=None,
@@ -45,7 +47,7 @@ class SceneSchema(BaseModel):
         default="",
         description="High-fidelity realistic text-to-image prompt for the scene keyframe."
     )
-    motion_prompt: str = Field(..., description="Camera movement and motion direction for video generation.")
+    motion_prompt: str = Field(default="", description="Camera movement and motion direction for video generation.")
     dialogue_turns: List[DialogueTurn] = Field(
         default_factory=list,
         description="Ordered list of back-and-forth dialogue turns spoken by characters in this scene."

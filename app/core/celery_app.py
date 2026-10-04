@@ -62,7 +62,22 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    # We never read Celery results (all state lives in Postgres), so don't
+    # write them to Redis - saves hosted-Redis (Upstash) command quota too.
+    task_ignore_result=True,
     task_track_started=True,
+    # ONE project at a time per worker. A GPU notebook can only render one
+    # thing at once anyway; running several in parallel just made them all
+    # slow and made it impossible to tell which one was actually working.
+    worker_concurrency=1,
+    # Don't let a worker pre-reserve extra queued projects.
+    worker_prefetch_multiplier=1,
+    # With a Redis broker, a message that stays un-acked longer than this is
+    # re-delivered to another worker. The default is 1 hour - shorter than a
+    # long render - which silently started duplicate runs of the same project.
+    # (Duplicates are also blocked by the run_token check; this stops them
+    # from being produced in the first place.)
+    task_acks_late=False,
     # Explicit SSL options for the broker side too (the query-param fix above
     # covers the result backend; the broker connection needs this separately).
     # If this ever fails with a certificate verification error against a
@@ -80,6 +95,7 @@ celery_app.conf.update(
     broker_connection_retry=True,
     broker_connection_max_retries=0,  # retry forever rather than giving up
     broker_transport_options={
+        "visibility_timeout": 60 * 60 * 24,  # 24h, see note above
         "socket_keepalive": True,
         "socket_timeout": 30,
         "socket_connect_timeout": 30,

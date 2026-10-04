@@ -1,7 +1,8 @@
 import uuid
-from sqlalchemy import Column, String, Text, ForeignKey, JSON
+from sqlalchemy import Column, String, Text, ForeignKey
 from sqlalchemy.orm import relationship
 from app.core.database import Base
+
 
 class Character(Base):
     __tablename__ = "characters"
@@ -12,5 +13,10 @@ class Character(Base):
     description = Column(Text, nullable=False)
     appearance_prompt = Column(Text, nullable=False)
     reference_image_path = Column(String, nullable=True)
+
+    # Used to give every character their own, gender-appropriate voice.
+    gender = Column(String, nullable=True)      # "male" | "female" | null (= work it out automatically)
+    age_group = Column(String, nullable=True)   # "child" | "teen" | "adult" | "elder"
+    voice_id = Column(String, nullable=True)    # assigned automatically on first render, then kept stable
 
     project = relationship("Project", back_populates="characters")

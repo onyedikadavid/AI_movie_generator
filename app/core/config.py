@@ -93,6 +93,60 @@ class Settings(BaseSettings):
     CLOUDINARY_API_KEY: str = os.getenv("CLOUDINARY_API_KEY", "")
     CLOUDINARY_API_SECRET: str = os.getenv("CLOUDINARY_API_SECRET", "")
 
+    # ------------------------------------------------------------------
+    # Run control
+    # ------------------------------------------------------------------
+    # The worker refreshes a heartbeat every HEARTBEAT_SECONDS while it is
+    # really running. An "active" project whose heartbeat is older than
+    # STALE_RUN_SECONDS is treated as a dead run (worker crashed / was killed)
+    # instead of being shown as "Generating..." forever.
+    HEARTBEAT_SECONDS: int = 5
+    STALE_RUN_SECONDS: int = 90
+
+    # ------------------------------------------------------------------
+    # Voices (text-to-speech)
+    # ------------------------------------------------------------------
+    # "edge" = Microsoft neural voices via the free `edge-tts` package (needs
+    # outbound internet, no API key, no cost) - the natural-sounding option.
+    # Falls back to Piper (if configured), then gTTS, then silence.
+    TTS_ENGINE: str = "edge"
+    # auto = pick Nigerian-accented voices when the story is Nigerian, else US/UK.
+    # Or force one of: ng | us | gb
+    TTS_REGION: str = "auto"
+    # Optional override of the narrator's voice (any edge-tts voice short name).
+    TTS_NARRATOR_VOICE: str = ""
+    # By default the run FAILS (and can be resumed) if the neural voice engine
+    # can't be reached, rather than quietly producing a video in the old robotic
+    # voice. Set to true to allow falling back to Piper/gTTS/silence instead.
+    TTS_ALLOW_FALLBACK: bool = False
+    # Optional local Piper voice models (.onnx paths) used only as a fallback.
+    PIPER_MODEL_MALE: str = ""
+    PIPER_MODEL_FEMALE: str = ""
+
+    # ------------------------------------------------------------------
+    # Picture / video quality
+    # ------------------------------------------------------------------
+    # SDXL keyframe size (landscape, an SDXL-native bucket - never square, so
+    # the video model doesn't have to squash it).
+    IMAGE_WIDTH: int = 1216
+    IMAGE_HEIGHT: int = 832
+    # Each scene is cut into shots no longer than this many seconds (the video
+    # model is much sharper on short clips than on stretched-out long ones).
+    VIDEO_SHOT_SECONDS: float = 4.5
+    VIDEO_MAX_SHOTS_PER_SCENE: int = 5
+    # Longest clip the video server can produce in one call (121 frames @ 24fps).
+    VIDEO_MAX_CLIP_SECONDS: float = 5.0
+    VIDEO_FPS: int = 24
+    VIDEO_SERVER_TIMEOUT: int = 900
+    # Generate a dedicated close-up keyframe for each speaking character
+    # (bigger, sharper faces -> far less "melting"). Turn off to render every
+    # shot from the scene's wide keyframe instead (faster, lower quality).
+    SHOT_COVERAGE: bool = True
+    # Final export size and sharpening (0 disables sharpening).
+    OUTPUT_WIDTH: int = 1280
+    OUTPUT_HEIGHT: int = 720
+    OUTPUT_SHARPEN: float = 0.5
+
     STORAGE_DIR: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../storage"))
 
     # Frontend origin(s) allowed to call this API, comma-separated. "*" allows any origin (dev only).
