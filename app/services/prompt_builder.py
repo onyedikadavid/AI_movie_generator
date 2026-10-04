@@ -89,13 +89,12 @@ def closeup_prompt(character, expression: str, location: Optional[str], style: O
     return ", ".join(p for p in parts if p)
 
 
-_CAMERA = [
-    "slow gentle push-in toward the subject",
-    "slow lateral camera drift to the right",
-    "subtle handheld camera sway",
-    "slow gentle pull-back",
+_CAMERA_GENTLE = [
+    "very slow gentle push-in toward the subject",
+    "very slow lateral camera drift",
     "nearly static camera with a very slight drift",
 ]
+_CAMERA_STATIC = "static locked-off camera, tripod shot, the background stays perfectly stable"
 
 _QUALITY_TAIL = "Smooth natural motion, sharp focus, detailed face, consistent character appearance, stable details."
 
@@ -108,28 +107,39 @@ def video_prompt(
     scene_motion: Optional[str],
     visual_description: Optional[str],
     shot_index: int,
+    camera_mode: str = "static",
 ) -> str:
     """
-    One flowing paragraph describing the MOTION for LTX-Video. Gentle,
-    concrete motion descriptions give far more stable results than
-    dramatic ones, and the model reads only the first ~100 tokens.
+    One flowing paragraph describing the MOTION for LTX-Video.
+
+    camera_mode="static" (default): the camera never moves - only the subject
+    does. Camera moves (push-ins, drifts, handheld sway) are what make this
+    class of video model bend and smear the whole frame, so they are off unless
+    you ask for "gentle".
     """
-    camera = _CAMERA[shot_index % len(_CAMERA)]
-    motion = clip_words(scene_motion, 22)
+    static = (camera_mode or "static").lower() != "gentle"
+    camera = _CAMERA_STATIC if static else _CAMERA_GENTLE[shot_index % len(_CAMERA_GENTLE)]
+    # The scene's motion prompt usually describes camera work; ignore it in static mode.
+    motion = "" if static else clip_words(scene_motion, 22)
+    setting = clip_words(visual_description, 24)
+
     if kind == "dialogue":
         mood = (expression or "").strip()
         mood = "" if mood.lower() in ("neutral", "dynamic expression") else f"{mood} expression, "
         act = clip_words(action, 14)
         bits = [
-            f"{speaker} is speaking, mouth moving naturally as they talk, {mood}{act}".rstrip(", "),
-            "subtle head and shoulder movement, natural blinking",
+            f"Close shot of {speaker} speaking, mouth moving naturally as they talk, {mood}{act}".rstrip(", "),
+            "subtle head and shoulder movement, natural blinking, only small gentle motion",
+            f"setting: {setting}" if setting else "",
             camera,
+            motion,
         ]
-        if motion:
-            bits.append(motion)
     else:
-        bits = [clip_words(visual_description, 28)]
-        bits.append(motion or "gentle natural movement in the environment")
-        bits.append(camera)
+        bits = [
+            setting or "the scene",
+            "gentle natural movement in the environment such as light, leaves or fabric, people move slowly",
+            camera,
+            motion,
+        ]
     paragraph = ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip())
     return f"{paragraph}. {_QUALITY_TAIL}"

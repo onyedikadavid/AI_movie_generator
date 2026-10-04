@@ -90,7 +90,7 @@ class SceneRenderer:
     def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast) -> str:
         blob = json.dumps(
             {
-                "v": 3,
+                "v": 4,
                 "img": scene.image_prompt,
                 "motion": scene.motion_prompt,
                 "vis": scene.visual_description,
@@ -104,6 +104,7 @@ class SceneRenderer:
                 "size": [settings.IMAGE_WIDTH, settings.IMAGE_HEIGHT, settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT],
                 "shots": [settings.VIDEO_SHOT_SECONDS, settings.VIDEO_MAX_SHOTS_PER_SCENE, settings.SHOT_COVERAGE],
                 "sharp": settings.OUTPUT_SHARPEN,
+                "camera": settings.VIDEO_CAMERA_MOTION,
             },
             sort_keys=True,
             default=str,
@@ -268,6 +269,7 @@ class SceneRenderer:
                 prompt = pb.video_prompt(
                     sh.kind, sh.speaker, sh.expression, sh.action,
                     scene.motion_prompt, scene.visual_description, sh.index,
+                    settings.VIDEO_CAMERA_MOTION,
                 )
                 request_len = min(sh.duration + 0.4, settings.VIDEO_MAX_CLIP_SECONDS)
                 ctx.call(

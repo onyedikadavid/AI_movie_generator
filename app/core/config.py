@@ -141,6 +141,8 @@ class Settings(BaseSettings):
     # Generate a dedicated close-up keyframe for each speaking character
     # (bigger, sharper faces -> far less "melting"). Turn off to render every
     # shot from the scene's wide keyframe instead (faster, lower quality).
+    # "static" = the camera never moves (most stable, recommended); "gentle" = slow, small camera moves.
+    VIDEO_CAMERA_MOTION: str = "static"
     SHOT_COVERAGE: bool = True
     # Final export size and sharpening (0 disables sharpening).
     OUTPUT_WIDTH: int = 1280
