@@ -26,10 +26,20 @@ def atomic_write(path: str, data: bytes) -> None:
 
 
 def explain(resp: httpx.Response, what: str) -> str:
-    body = (resp.text or "")[:300].replace("\n", " ")
+    """Turn a failed GPU-server response into a message that says what went wrong."""
+    detail = (resp.text or "")[:300].replace("\n", " ")
+    try:
+        data = resp.json()
+        if isinstance(data, dict) and data.get("error"):
+            detail = str(data["error"])
+            if data.get("trace"):
+                detail += " | server traceback (end): " + str(data["trace"])[-900:].replace("\n", " / ")
+    except Exception:  # noqa: BLE001 - body wasn't JSON; keep the raw text
+        pass
     hint = ""
-    if "ngrok" in body.lower() or "ERR_NGROK" in body:
+    low = detail.lower()
+    if "ngrok" in low:
         hint = " (the ngrok tunnel is offline - the notebook has probably stopped or restarted)"
-    elif "out of memory" in body.lower():
+    elif "out of memory" in low:
         hint = " (the GPU ran out of memory - restart the notebook runtime, then press Resume)"
-    return f"{what} server returned HTTP {resp.status_code}{hint}: {body}"
+    return f"{what} server returned HTTP {resp.status_code}{hint}: {detail}"
