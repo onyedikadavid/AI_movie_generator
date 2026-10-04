@@ -137,6 +137,9 @@ class Settings(BaseSettings):
     # Longest clip the video server can produce in one call (121 frames @ 24fps).
     VIDEO_MAX_CLIP_SECONDS: float = 5.0
     VIDEO_FPS: int = 24
+    # Turn on when the video model outputs fewer than 24 fps (e.g. CogVideoX = 8 fps):
+    # the missing frames are interpolated instead of repeated.
+    VIDEO_INTERPOLATE: bool = False
     VIDEO_SERVER_TIMEOUT: int = 900
     # Generate a dedicated close-up keyframe for each speaking character
     # (bigger, sharper faces -> far less "melting"). Turn off to render every

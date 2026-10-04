@@ -148,6 +148,7 @@ class FFmpegService:
         height: int,
         fps: int = 24,
         sharpen: float = 0.0,
+        interpolate: bool = False,
     ) -> str:
         """
         Normalises one generated clip so every shot has identical codec / size /
@@ -170,7 +171,12 @@ class FFmpegService:
             stretch = min(1.3, target / src_len)
         hold = max(0.0, target - src_len * stretch)
 
-        vf = [
+        vf = []
+        if interpolate:
+            # Low-frame-rate models (CogVideoX makes 8 fps) look choppy if frames are merely
+            # repeated; this synthesises the in-between frames (motion-compensated).
+            vf.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+        vf += [
             f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos",
             f"crop={width}:{height}",
             "setsar=1",

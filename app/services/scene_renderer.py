@@ -105,6 +105,7 @@ class SceneRenderer:
                 "shots": [settings.VIDEO_SHOT_SECONDS, settings.VIDEO_MAX_SHOTS_PER_SCENE, settings.SHOT_COVERAGE],
                 "sharp": settings.OUTPUT_SHARPEN,
                 "camera": settings.VIDEO_CAMERA_MOTION,
+                "interp": settings.VIDEO_INTERPOLATE,
             },
             sort_keys=True,
             default=str,
@@ -276,7 +277,7 @@ class SceneRenderer:
                     self.video.generate_clip, source, raw, prompt, request_len,
                     _seed(project_id, scene.scene_number, sh.index, "clip"),
                 )
-            ctx.call(self.ff.fit_clip, raw, fit, sh.duration, W, H, FPS, settings.OUTPUT_SHARPEN)
+            ctx.call(self.ff.fit_clip, raw, fit, sh.duration, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
             fitted.append(fit)
 
         # ---------------------------------------------------------- 6. mix
