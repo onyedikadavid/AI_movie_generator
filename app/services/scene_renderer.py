@@ -50,6 +50,7 @@ STAGE_IMAGES = "GENERATING_IMAGES"
 STAGE_AUDIO = "GENERATING_AUDIO"
 STAGE_VIDEOS = "GENERATING_VIDEOS"
 STAGE_ASSEMBLE = "GENERATING_VIDEOS"
+AMBIENCE_CROSSFADE = 0.12   # seconds of overlap when joining the background sound of consecutive shots
 
 
 def _seed(*parts: Any) -> int:
@@ -106,6 +107,9 @@ class SceneRenderer:
                 "sharp": settings.OUTPUT_SHARPEN,
                 "camera": settings.VIDEO_CAMERA_MOTION,
                 "interp": settings.VIDEO_INTERPOLATE,
+                "mode": settings.VIDEO_MODE,
+                "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None)],
+                "t2vres": settings.VIDEO_T2V_RESOLUTION,
             },
             sort_keys=True,
             default=str,
@@ -156,6 +160,15 @@ class SceneRenderer:
         if not segments:
             segments.append(Segment(index=0, speaker=NARRATOR_NAME, kind="ambient"))
         return segments
+
+    @staticmethod
+    def _character_for(name: str, cast: VoiceCast, characters: Sequence):
+        n = (name or "").strip().lower()
+        member = next((c for c in characters if c.name.strip().lower() == n), None)
+        if member is None and n and not is_narrator(name):
+            m = cast.member_for(name)
+            member = next((c for c in characters if c.name.strip().lower() == m.name.strip().lower()), None)
+        return member
 
     # ------------------------------------------------------------------ main
     def render(
@@ -210,47 +223,59 @@ class SceneRenderer:
             hard_max_len=settings.VIDEO_MAX_CLIP_SECONDS + 1.2,
         )
 
-        # ---------------------------------------------------------- 4. keyframes
-        ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
+        t2v = (settings.VIDEO_MODE or "i2v").lower() == "t2v"
+        # Hybrid sound = the video model's own background sound mixed under the pipeline's voices.
+        hybrid = t2v and (settings.AUDIO_MODE or "voices").lower() == "hybrid"
+        ambience_parts: List[str] = []
         wide_path = os.path.join(scene_dir, "keyframe.png")
-        if may_reuse and _nonempty(wide_path):
-            reused += 1
-        else:
-            ctx.checkpoint()
-            ctx.call(
-                self.image.generate_image,
-                pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
-                wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"),
-            )
-        ctx.set_scene_image(wide_path)
-
         keyframe_for_speaker: Dict[str, str] = {}
-        if settings.SHOT_COVERAGE:
-            speakers = []
-            for sh in shots:
-                if sh.kind == "dialogue" and sh.speaker not in speakers:
-                    speakers.append(sh.speaker)
-            for n, name in enumerate(speakers):
-                ctx.stage(STAGE_IMAGES, 0.20 + 0.15 * n / max(1, len(speakers)), f"Drawing close-up of {name}")
-                member = next((c for c in characters if c.name.strip().lower() == name.strip().lower()), None)
-                if member is None:  # fuzzy: "Obinna (V.O.)" -> Obinna
-                    m = cast.member_for(name)
-                    member = next((c for c in characters if c.name.strip().lower() == m.name.strip().lower()), None)
-                if member is None:
-                    continue  # an extra with no appearance description: use the wide shot
-                path = os.path.join(scene_dir, f"closeup_{_slug(member.name)}.png")
-                if may_reuse and _nonempty(path):
-                    reused += 1
-                else:
-                    expression = next((s.expression for s in shots if s.speaker == name and s.expression), "")
-                    ctx.checkpoint()
-                    ctx.call(
-                        self.image.generate_image,
-                        pb.closeup_prompt(member, expression, scene.location, style),
-                        path, pb.image_negative(style), None, None, _seed(project_id, member.name, "face"),
-                    )
-                keyframe_for_speaker[name] = path
-        ctx.stage(STAGE_IMAGES, 0.35, "Keyframes ready")
+
+        if t2v:
+            # Text-to-video: no keyframes at all. (A thumbnail is cut from the first clip below.)
+            ctx.stage(STAGE_IMAGES, 0.35, "Text-to-video: no keyframes needed")
+        else:
+            # ---------------------------------------------------------- 4. keyframes
+            ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
+            wide_path = os.path.join(scene_dir, "keyframe.png")
+            if may_reuse and _nonempty(wide_path):
+                reused += 1
+            else:
+                ctx.checkpoint()
+                ctx.call(
+                    self.image.generate_image,
+                    pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
+                    wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"),
+                )
+            ctx.set_scene_image(wide_path)
+
+            keyframe_for_speaker: Dict[str, str] = {}
+            if settings.SHOT_COVERAGE:
+                speakers = []
+                for sh in shots:
+                    if sh.kind == "dialogue" and sh.speaker not in speakers:
+                        speakers.append(sh.speaker)
+                for n, name in enumerate(speakers):
+                    ctx.stage(STAGE_IMAGES, 0.20 + 0.15 * n / max(1, len(speakers)), f"Drawing close-up of {name}")
+                    member = next((c for c in characters if c.name.strip().lower() == name.strip().lower()), None)
+                    if member is None:  # fuzzy: "Obinna (V.O.)" -> Obinna
+                        m = cast.member_for(name)
+                        member = next((c for c in characters if c.name.strip().lower() == m.name.strip().lower()), None)
+                    if member is None:
+                        continue  # an extra with no appearance description: use the wide shot
+                    path = os.path.join(scene_dir, f"closeup_{_slug(member.name)}.png")
+                    if may_reuse and _nonempty(path):
+                        reused += 1
+                    else:
+                        expression = next((s.expression for s in shots if s.speaker == name and s.expression), "")
+                        ctx.checkpoint()
+                        ctx.call(
+                            self.image.generate_image,
+                            pb.closeup_prompt(member, expression, scene.location, style),
+                            path, pb.image_negative(style), None, None, _seed(project_id, member.name, "face"),
+                        )
+                    keyframe_for_speaker[name] = path
+            ctx.stage(STAGE_IMAGES, 0.35, "Keyframes ready")
+
 
         # ---------------------------------------------------------- 5. motion
         fitted: List[str] = []
@@ -265,6 +290,18 @@ class SceneRenderer:
             fit = os.path.join(scene_dir, f"shot_{sh.index}.mp4")
             if may_reuse and _nonempty(raw):
                 reused += 1
+            elif t2v:
+                member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
+                prompt = pb.text_video_prompt(
+                    sh.kind, sh.speaker, sh.expression, sh.action,
+                    getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
+                    on_screen, scene.location, scene.visual_description, style, sh.index,
+                    settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
+                )
+                request_len = min(sh.duration + 0.4, settings.VIDEO_MAX_CLIP_SECONDS)
+                # Same seed for the same character = the best-effort way to keep a similar face between shots.
+                seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
+                ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed)
             else:
                 source = keyframe_for_speaker.get(sh.speaker) or wide_path
                 prompt = pb.video_prompt(
@@ -277,8 +314,18 @@ class SceneRenderer:
                     self.video.generate_clip, source, raw, prompt, request_len,
                     _seed(project_id, scene.scene_number, sh.index, "clip"),
                 )
+            if t2v and sh.index == 0 and not _nonempty(wide_path):
+                # Thumbnail for the gallery: a frame from the first generated clip.
+                ctx.call(self.ff.extract_frame, raw, wide_path)
+                ctx.set_scene_image(wide_path)
             ctx.call(self.ff.fit_clip, raw, fit, sh.duration, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
             fitted.append(fit)
+            if hybrid:
+                # Every shot except the last also carries a short tail, so shots can be crossfaded together.
+                tail = 0.0 if sh.index == len(shots) - 1 else AMBIENCE_CROSSFADE
+                amb = os.path.join(scene_dir, f"shot_{sh.index}_amb.wav")
+                ctx.call(self.ff.extract_ambience, raw, amb, sh.duration + tail)
+                ambience_parts.append(amb)
 
         # ---------------------------------------------------------- 6. mix
         ctx.checkpoint()
@@ -287,7 +334,13 @@ class SceneRenderer:
         self.ff.build_audio_track(
             [s.audio_path for s in segments], [s.gap_after for s in segments], wav, lead_in=LEAD_IN,
         )
-        self.ff.assemble_scene(fitted, wav, final_path)
+        mixed_wav = wav
+        if hybrid and ambience_parts:
+            amb_all = os.path.join(scene_dir, "ambience.wav")
+            self.ff.join_ambience(ambience_parts, AMBIENCE_CROSSFADE, amb_all)
+            mixed_wav = os.path.join(scene_dir, "voices_and_ambience.wav")
+            self.ff.mix_voices_with_ambience(wav, amb_all, mixed_wav, settings.AMBIENCE_VOLUME)
+        self.ff.assemble_scene(fitted, mixed_wav, final_path)
         ctx.stage(STAGE_ASSEMBLE, 1.0, "Scene done")
 
         return SceneResult(final_path, wide_path, total, len(shots), reused)

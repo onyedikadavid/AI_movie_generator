@@ -143,3 +143,69 @@ def video_prompt(
         ]
     paragraph = ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip())
     return f"{paragraph}. {_QUALITY_TAIL}"
+
+
+# ---------------------------------------------------------------------------
+# Text-to-video prompts (LTX-2 style): ONE flowing, present-tense paragraph that
+# carries everything the model needs - there is no start image, so the
+# character's look, the place, the light and the camera must all be in the text.
+# Repeating each character's exact appearance in every shot is what keeps them
+# recognisable from clip to clip.
+# ---------------------------------------------------------------------------
+def _t2v_style(style: Optional[str]) -> str:
+    if style_kind(style) == "animated":
+        return "stylized 3D animated film look, clean shapes, expressive faces, rich colors, soft cinematic lighting"
+    return "cinematic live-action film look, natural lighting, shallow depth of field, realistic skin texture, 35mm"
+
+
+def text_video_prompt(
+    kind: str,
+    speaker: str,
+    expression: str,
+    action: str,
+    speaker_look: Optional[str],
+    on_screen: Sequence,
+    location: Optional[str],
+    visual_description: Optional[str],
+    style: Optional[str],
+    shot_index: int,
+    camera_mode: str = "static",
+    sound_design: Optional[str] = None,
+    audio_hybrid: bool = False,
+) -> str:
+    static = (camera_mode or "static").lower() != "gentle"
+    camera = _CAMERA_STATIC if static else _CAMERA_GENTLE[shot_index % len(_CAMERA_GENTLE)]
+    place = clip_words(location, 10)
+    setting = clip_words(visual_description, 26)
+
+    if kind == "dialogue":
+        mood = (expression or "").strip()
+        mood = "" if mood.lower() in ("neutral", "dynamic expression") else f"with a {mood} expression, "
+        act = clip_words(action, 12)
+        look = clip_words(speaker_look, 40)
+        bits = [
+            f"Medium close-up of {speaker}, {look}".rstrip(", ") if look else f"Medium close-up of {speaker}",
+            f"{speaker} is speaking, mouth moving naturally as they talk, {mood}{act}".rstrip(", "),
+            "subtle head and shoulder movement, natural blinking, only small gentle motion",
+            f"in {place}" if place else "",
+            setting,
+        ]
+    else:
+        looks = []
+        for c in list(on_screen)[:2]:
+            a = clip_words(getattr(c, "appearance_prompt", ""), 24)
+            if a:
+                looks.append(f"{c.name}, {a}")
+        bits = [
+            "Wide establishing shot" + (f" in {place}" if place else ""),
+            setting,
+            ("showing " + "; ".join(looks)) if looks else "",
+            "gentle natural movement in the environment such as light, leaves or fabric, people move slowly",
+        ]
+    bits += [camera, _t2v_style(style), "Smooth natural motion, sharp focus, stable details, consistent character appearance"]
+    if audio_hybrid:
+        # The characters' voices are recorded separately by the pipeline, so ask the video model for
+        # ONLY the background sound: no speech of its own (it would clash), no music.
+        cue = clip_words(sound_design, 22) or "natural ambient sound of the location"
+        bits.append(f"Audio: {cue}, no spoken dialogue, no speech, no background music")
+    return ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip()) + "."

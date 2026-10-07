@@ -1,3 +1,34 @@
+## Text-to-video mode (LTX-2.3 via WanGP)
+
+Set `VIDEO_MODE=t2v` in `.env` (default is `i2v`). In this mode no keyframes are drawn (the SDXL notebook is not needed);
+each shot is generated from a text prompt that repeats every character's appearance, and a thumbnail is cut from the first
+clip for the gallery. Voices (edge-tts) are still added by the pipeline.
+
+```
+VIDEO_MODE=t2v
+VIDEO_T2V_RESOLUTION=960x544   # both numbers divisible by 32
+VIDEO_SERVER_TIMEOUT=3600
+VIDEO_SHOT_SECONDS=4.5
+VIDEO_MAX_CLIP_SECONDS=5.0
+```
+
+**Sound (hybrid):** `AUDIO_MODE=hybrid` (default) keeps the pipeline's character/narrator voices and also mixes in the video
+model's own background sound and effects (wind, crowds, gunfire, footsteps...), automatically lowered by ~11 dB while someone speaks
+and crossfaded between shots. Each scene has an editable "Background sound & effects" field (the script writer fills it in). Prompts tell the
+model "no spoken dialogue, no music" so it never adds voices of its own. `AUDIO_MODE=voices` turns the model's sound off.
+Only text-to-video with an audio-capable model (LTX-2.x) produces background sound; otherwise the clip is silent and only the voices play.
+
+```
+AUDIO_MODE=hybrid        # hybrid | voices
+AMBIENCE_VOLUME=0.55     # background loudness before ducking
+```
+
+**Credit / terms:** video generation in this mode uses [WanGP (Wan2GP)](https://github.com/deepbeepmeep/Wan2GP). Its terms require
+that products integrating its API say so clearly in their interface and documentation - the web app footer does, and so does this note.
+Check the WanGP and LTX-2 license terms before any commercial use.
+
+---
+
 # v2 - what changed, and how to run it
 
 See `CHANGES.md` (one level up, next to this folder) for the full explanation. Short version:

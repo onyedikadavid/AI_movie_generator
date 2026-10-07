@@ -16,6 +16,8 @@ class Scene(Base):
     narration_text = Column(Text, nullable=True)
     image_prompt = Column(Text, nullable=False)
     motion_prompt = Column(Text, nullable=True)
+    # Background sound / effects for the scene ("distant gunfire, helicopter, crowd panic") - used in hybrid audio mode.
+    sound_design = Column(Text, nullable=True)
 
     image_path = Column(String, nullable=True)
     video_path = Column(String, nullable=True)   # the finished scene clip (picture + voices)

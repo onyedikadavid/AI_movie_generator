@@ -48,6 +48,10 @@ class SceneSchema(BaseModel):
         description="High-fidelity realistic text-to-image prompt for the scene keyframe."
     )
     motion_prompt: str = Field(default="", description="Camera movement and motion direction for video generation.")
+    sound_design: Optional[str] = Field(
+        default=None,
+        description="Background sounds and effects heard in this scene (no speech, no music), e.g. 'distant gunfire, helicopter overhead, panicked crowd'.",
+    )
     dialogue_turns: List[DialogueTurn] = Field(
         default_factory=list,
         description="Ordered list of back-and-forth dialogue turns spoken by characters in this scene."

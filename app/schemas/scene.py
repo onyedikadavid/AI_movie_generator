@@ -18,6 +18,7 @@ class SceneBase(BaseModel):
     narration_text: Optional[str] = None
     image_prompt: str
     motion_prompt: Optional[str] = None
+    sound_design: Optional[str] = None
 
 
 class SceneCreate(SceneBase):
@@ -32,6 +33,7 @@ class SceneUpdate(BaseModel):
     narration_text: Optional[str] = None
     image_prompt: Optional[str] = None
     motion_prompt: Optional[str] = None
+    sound_design: Optional[str] = None
     dialogue_turns: Optional[List[DialogueTurnOut]] = None
 
 

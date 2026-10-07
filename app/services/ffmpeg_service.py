@@ -202,6 +202,74 @@ class FFmpegService:
         ])
         return dst_path
 
+    # ------------------------------------------------------------------ hybrid audio
+    def has_audio(self, media_path: str) -> bool:
+        """True if the file has a usable audio stream."""
+        if shutil.which("ffprobe") is None:
+            return False
+        try:
+            out = _run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type",
+                        "-of", "csv=p=0", media_path]).stdout
+            return "audio" in out
+        except Exception:  # noqa: BLE001
+            return False
+
+    def extract_ambience(self, video_path: str, out_wav: str, seconds: float) -> str:
+        """Takes the video model's own background sound from a clip: exactly `seconds` long
+        (padded with silence if the clip's audio is shorter), 48 kHz stereo."""
+        _require_ffmpeg()
+        if self.has_audio(video_path):
+            _run([
+                "ffmpeg", "-y", "-i", video_path, "-vn",
+                "-af", f"aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{seconds:.3f}",
+                "-c:a", "pcm_s16le", out_wav,
+            ])
+        else:
+            _run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{seconds:.3f}",
+                  "-c:a", "pcm_s16le", out_wav])
+        return out_wav
+
+    def join_ambience(self, wavs: Sequence[str], crossfade: float, out_wav: str) -> str:
+        """Joins per-shot ambience tracks with a short crossfade, so the background does not
+        jump at every cut. Each input except the last is expected to be (shot length + crossfade)
+        long, which makes the result exactly as long as the sum of the shot lengths."""
+        _require_ffmpeg()
+        if len(wavs) == 1:
+            shutil.copyfile(wavs[0], out_wav)
+            return out_wav
+        cmd: List[str] = ["ffmpeg", "-y"]
+        for w in wavs:
+            cmd += ["-i", w]
+        parts, prev = [], "[0:a]"
+        for i in range(1, len(wavs)):
+            label = f"[x{i}]" if i < len(wavs) - 1 else "[out]"
+            parts.append(f"{prev}[{i}:a]acrossfade=d={crossfade:.3f}:c1=tri:c2=tri{label}")
+            prev = label
+        cmd += ["-filter_complex", ";".join(parts), "-map", "[out]", "-c:a", "pcm_s16le", out_wav]
+        _run(cmd)
+        return out_wav
+
+    def mix_voices_with_ambience(self, voices_wav: str, ambience_wav: str, out_wav: str, ambience_volume: float = 0.55) -> str:
+        """Voices stay at full level; the background sound is mixed underneath and is automatically
+        lowered ('ducked') whenever someone is speaking, then raised again in the pauses."""
+        _require_ffmpeg()
+        fc = (
+            f"[1:a]volume={ambience_volume:.3f}[amb];"
+            "[0:a]asplit=2[v_main][v_side];"
+            "[amb][v_side]sidechaincompress=threshold=0.03:ratio=3:attack=20:release=450:makeup=1[ducked];"
+            # amix scales every input by 1/n, so volume=2 restores the voices' level.
+            "[v_main][ducked]amix=inputs=2:duration=first:dropout_transition=0,volume=2,alimiter=limit=0.95[out]"
+        )
+        _run(["ffmpeg", "-y", "-i", voices_wav, "-i", ambience_wav, "-filter_complex", fc,
+              "-map", "[out]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", out_wav])
+        return out_wav
+
+    def extract_frame(self, video_path: str, output_png: str, at_seconds: float = 0.4) -> str:
+        """Saves one still frame from a video (used as the scene thumbnail in text-to-video mode)."""
+        _require_ffmpeg()
+        _run(["ffmpeg", "-y", "-ss", f"{max(0.0, at_seconds):.2f}", "-i", video_path, "-frames:v", "1", "-q:v", "2", output_png])
+        return output_png
+
     def concatenate_videos(
         self,
         video_paths: List[str],

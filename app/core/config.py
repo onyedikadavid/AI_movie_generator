@@ -140,6 +140,19 @@ class Settings(BaseSettings):
     # Turn on when the video model outputs fewer than 24 fps (e.g. CogVideoX = 8 fps):
     # the missing frames are interpolated instead of repeated.
     VIDEO_INTERPOLATE: bool = False
+
+    # "i2v" = draw a keyframe with SDXL, then animate it (best identity consistency).
+    # "t2v" = text-to-video only: no keyframes, the video model draws everything from the prompt.
+    # Sound: "voices" = only the pipeline's character/narrator voices;
+    #        "hybrid" = voices + the video model's own background sound/effects (text-to-video LTX-2.x only),
+    #        mixed underneath and automatically lowered while someone speaks.
+    AUDIO_MODE: str = "hybrid"
+    # Loudness of the model's background sound before ducking (1.0 = as generated).
+    AMBIENCE_VOLUME: float = 0.55
+    # "i2v" / "t2v" - see below
+    VIDEO_MODE: str = "i2v"
+    # Resolution requested from a text-to-video server (WxH, both divisible by 32).
+    VIDEO_T2V_RESOLUTION: str = "960x544"
     VIDEO_SERVER_TIMEOUT: int = 900
     # Generate a dedicated close-up keyframe for each speaking character
     # (bigger, sharper faces -> far less "melting"). Turn off to render every

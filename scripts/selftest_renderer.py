@@ -79,12 +79,30 @@ class FakeVideo:
         return path
 
 
+class FakeVideoT2V(FakeVideo):
+    def __init__(self, with_audio=False):
+        super().__init__()
+        self.text_requests = []
+        self.with_audio = with_audio
+
+    def generate_text_clip(self, prompt, path, duration, seed=None):
+        self.text_requests.append((prompt, duration, seed))
+        frames = 8 * int(min(duration * 24, 121) // 8) + 1
+        secs = frames / 24
+        cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc2=s=960x544:r=24:d={secs}"]
+        if self.with_audio:   # steady "wind" background, like the model's own sound
+            cmd += ["-f", "lavfi", "-i", f"anoisesrc=d={secs}:c=pink:a=0.2:r=48000", "-c:a", "aac", "-shortest"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", path]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return path
+
+
 def make_scene():
     return NS(
         scene_number=1, duration_seconds=5, location="Village compound",
         visual_description="A boy kneels before his father in a dusty compound",
         image_prompt="A Nigerian boy kneeling before an elderly man in a dusty compound",
-        motion_prompt="slow push-in, dust drifting", characters_present=["Obinna", "Daddy"],
+        motion_prompt="slow push-in, dust drifting", sound_design="light wind, distant roosters, dry leaves", characters_present=["Obinna", "Daddy"],
         narration_text="Years later, Obinna returned to the village to face his guardian.",
         dialogue_turns=[
             {"speaker": "Obinna", "text": "Daddy, please forgive me.", "expression": "pleading", "action": "kneeling"},
@@ -162,6 +180,59 @@ def main():
     res3 = r.render(quiet, chars, "Nollywood", cast, os.path.join(tmp, "scene_2"), "proj1", FakeCtx())
     assert res3.shots >= 1 and res3.duration > 3
     print("OK scene with no speech still renders (%.1fs)" % res3.duration)
+
+    # --- text-to-video mode: no keyframes, prompts carry the looks, thumbnail from first clip ---
+    from app.core.config import settings
+    settings.VIDEO_MODE = "t2v"
+    try:
+        tts3, img3, vid3 = FakeTTS(), FakeImage(), FakeVideoT2V()
+        r3 = SceneRenderer(img3, vid3, tts3, ff)
+        shown = []
+        ctx3 = FakeCtx()
+        ctx3.set_scene_image = lambda p: shown.append(p)
+        res4 = r3.render(make_scene(), chars, "Nollywood cinematic", cast, os.path.join(tmp, "scene_t2v"), "proj1", ctx3)
+        assert len(img3.prompts) == 0, "text-to-video must not draw any keyframes"
+        assert len(vid3.requests) == 0 and len(vid3.text_requests) == res4.shots >= 2
+        assert shown and os.path.getsize(shown[0]) > 1000, "a thumbnail should be cut from the first clip"
+        joined = " || ".join(p for p, _, _ in vid3.text_requests)
+        assert "teenage Nigerian boy" in joined and "grey agbada" in joined, "character looks must be repeated in the prompts"
+        assert all("static locked-off camera" in p for p, _, _ in vid3.text_requests)
+        seeds = {}
+        for p, _, sd in vid3.text_requests:
+            seeds.setdefault(("Obinna" in p.split(".")[0]), set()).add(sd)
+        assert abs(ff.get_duration(res4.final_path) - res4.duration) < 0.4
+        print("OK text-to-video: %d clips, 0 keyframes, thumbnail extracted, looks repeated in every prompt" % res4.shots)
+        print("   sample prompt:", vid3.text_requests[1][0][:260], "...")
+    finally:
+        settings.VIDEO_MODE = "i2v"
+
+    # --- hybrid sound: model background under the voices; none in voices-only mode; graceful with silent clips ---
+    import numpy as np
+
+    def audio_level(path, a, b):
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(a), "-t", str(b - a), "-i", path, "-vn",
+                              "-f", "f32le", "-ac", "1", "-ar", "48000", "-"], capture_output=True, check=True).stdout
+        x = np.frombuffer(raw, dtype=np.float32)
+        return float(np.sqrt(np.mean(x ** 2))) if len(x) else 0.0
+
+    results = {}
+    for label, mode, with_audio in (("hybrid", "hybrid", True), ("voices-only", "voices", True), ("hybrid-silent-clips", "hybrid", False)):
+        settings.VIDEO_MODE, settings.AUDIO_MODE = "t2v", mode
+        try:
+            v = FakeVideoT2V(with_audio=with_audio)
+            r4 = SceneRenderer(FakeImage(), v, FakeTTS(), ff)
+            res5 = r4.render(make_scene(), chars, "Nollywood cinematic", cast, os.path.join(tmp, "scene_" + label), "proj1", FakeCtx())
+            assert abs(ff.get_duration(res5.final_path) - res5.duration) < 0.4
+            assert ff.has_audio(res5.final_path)
+            results[label] = (audio_level(res5.final_path, 0.02, 0.28), v.text_requests)   # lead-in: nobody is speaking yet
+        finally:
+            settings.VIDEO_MODE, settings.AUDIO_MODE = "i2v", "hybrid"
+    hyb, vo, sil = results["hybrid"][0], results["voices-only"][0], results["hybrid-silent-clips"][0]
+    assert hyb > 0.01, f"hybrid should have background sound in the pauses (got {hyb})"
+    assert vo < 0.002 and sil < 0.002, (vo, sil)
+    assert all("no spoken dialogue" in p for p, _, _ in results["hybrid"][1]), "hybrid prompts must tell the model not to add speech"
+    assert not any("no spoken dialogue" in p for p, _, _ in results["voices-only"][1])
+    print("OK hybrid sound: background level in a pause = %.3f (hybrid) vs %.4f (voices-only) vs %.4f (silent clips)" % (hyb, vo, sil))
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("\nALL RENDERER CHECKS PASSED")

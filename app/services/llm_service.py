@@ -126,6 +126,7 @@ class LLMService:
                     "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here.",
                     "characters_present": ["Name1", "Name2"],
                     "motion_prompt": "Gentle, concrete camera and subject movement for a few seconds, e.g. 'slow push-in while the boy lowers his head'. Avoid fast or dramatic motion.",
+                    "sound_design": "The background sounds and effects you would HEAR here - 6 to 14 words, no speech, no music. e.g. 'distant gunfire, helicopter overhead, running footsteps' or 'light wind, birds, far-off market chatter'.",
                     "duration_seconds": 5
                 }}
             ]
@@ -185,9 +186,9 @@ class LLMService:
 
         # Small models sometimes emit null / wrong types; normalise before validating.
         for sc in parsed_data.get("scenes", []) or []:
-            for key in ("location", "motion_prompt", "image_prompt", "narration_text"):
+            for key in ("location", "motion_prompt", "image_prompt", "narration_text", "sound_design"):
                 if sc.get(key) is None:
-                    sc[key] = "" if key != "narration_text" else None
+                    sc[key] = "" if key not in ("narration_text", "sound_design") else None
             if not sc.get("visual_description"):
                 sc["visual_description"] = sc.get("image_prompt") or sc.get("location") or "A scene from the story."
             try:

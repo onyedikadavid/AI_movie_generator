@@ -187,6 +187,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
             narration_text=sc.narration_text,
             image_prompt=(sc.image_prompt or "").strip() or sc.visual_description,
             motion_prompt=sc.motion_prompt,
+            sound_design=(sc.sound_design or None),
             dialogue_turns=turns or None,
             characters_present=list(sc.characters_present or []) or None,
             render_status="PENDING",
