@@ -5,6 +5,7 @@ import httpx
 from app.core.config import settings
 from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
 from app.services.http_retry import post_with_retry
+from app.services.style_presets import KIDS_DIALOGUE_RULE
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class AgentService:
         character_b: Dict[str, str],
         scene_goal: str,
         turns: int = 4,
+        kids: bool = False,
     ) -> List[Dict[str, str]]:
         """
         Runs a short back-and-forth between two character agents. Each turn
@@ -90,6 +92,7 @@ class AgentService:
                 "Speak the way a real person speaks out loud - short, direct, emotional, in natural "
                 "conversational English. One to two sentences, under 25 words. Never describe actions inside "
                 "the spoken line, never say your own name, never narrate."
+                + (KIDS_DIALOGUE_RULE if kids else "")
             )
             recent = "\n".join(
                 f"{h['speaker']} ({h['expression']}): {h['text']}" for h in history[-3:]
@@ -109,6 +112,41 @@ class AgentService:
                 continue
             history.append({"speaker": active["name"], "text": text, "action": action, "expression": emotion})
 
+        return history
+
+    async def simulate_monologue(
+        self,
+        character: Dict[str, str],
+        scene_goal: str,
+        lines: int = 2,
+        kids: bool = False,
+    ) -> List[Dict[str, str]]:
+        """A character alone in a scene speaks 1-3 short lines out loud (thinking aloud, talking to
+        themselves or to someone off-screen). Used when there is no narrator to carry the scene."""
+        history: List[Dict[str, str]] = []
+        for i in range(max(1, lines)):
+            is_last = i == lines - 1
+            system_prompt = (
+                f"You are {character['name']}. Persona: {character.get('description', '')}. "
+                f"Situation: {scene_goal}. You are speaking OUT LOUD - thinking aloud, talking to yourself, "
+                "or to someone just off-screen. Speak the way a real person speaks: short, natural, emotional, "
+                "one or two sentences, under 25 words. Never say your own name, never narrate, never describe "
+                "actions inside the spoken line."
+                + (KIDS_DIALOGUE_RULE if kids else "")
+            )
+            recent = "\n".join(f"{h['text']}" for h in history[-2:]) or "(you speak first)"
+            ending = " This is your last line here - bring your thought to a natural close." if is_last else ""
+            user_prompt = (
+                f"What you already said:\n{recent}\n\n"
+                f"Reply with EXACTLY these three lines and nothing else:{ending}\n"
+                "Emotion: <one or two words, e.g. worried, hopeful, determined, amazed>\n"
+                "Action: <a short physical action>\n"
+                "Text: <what you say out loud>"
+            )
+            raw = await self._query_agent(system_prompt, user_prompt)
+            emotion, action, text = self._parse_turn(raw, character["name"])
+            if text:
+                history.append({"speaker": character["name"], "text": text, "action": action, "expression": emotion})
         return history
 
     @staticmethod

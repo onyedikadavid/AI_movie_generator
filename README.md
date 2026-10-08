@@ -29,6 +29,36 @@ Check the WanGP and LTX-2 license terms before any commercial use.
 
 ---
 
+## Video jobs (long renders)
+
+Video clips are requested as background **jobs**: the backend submits the clip, the GPU server answers at once with a job id, and the backend
+polls until it is done and then downloads it. A dropped ngrok connection or a timeout can no longer fail a render that is still running, and a
+retry (or Resume) re-uses the same job instead of making the GPU render the clip twice. Needs the `v3-jobs` Kaggle server notebook; older servers
+still work (the backend falls back to waiting for the video in one request).
+
+```
+VIDEO_ASYNC=true            # false = old single-request mode
+VIDEO_POLL_SECONDS=6
+VIDEO_JOB_MAX_WAIT=7200     # longest wait for ONE clip, in seconds
+```
+Self-test: `python scripts/selftest_video_client.py`
+
+## Narrator
+
+`NARRATOR_ENABLED=false` (default): **only the characters speak** - no narrator voice, narration text is not read aloud, and any line the script labels
+"Narrator" is skipped. A character who is alone in a scene is given spoken lines of their own by the script writer, so those scenes aren't silent.
+Set `NARRATOR_ENABLED=true` to bring the narrator voice back. Projects whose script was written earlier keep their existing dialogue: a lone-character scene with no
+dialogue stays silent until you add a line in the scene editor ("Add a spoken line") or write the script again.
+
+## Style options on the New Project form
+
+* **Visual style -> Cinematic:** film-style prompts (anamorphic lens, dramatic motivated lighting, shallow depth of field, colour grading, film grain) and
+  cinematographer-style scene prompts from the script writer.
+* **Genre -> Kids / Family** (or **Visual style -> Kids cartoon**): the script is written for ages 3-8 - simple words, gentle story, no violence/scary/adult
+  content, happy ending - dialogue agents are told the same, and images/videos use a bright children's-cartoon look with a "no scary / violent / realistic" negative prompt.
+  Picking the Kids genre selects the Kids look automatically. (An AI model can still slip - review the script before generating for children.)
+* Your own choice always wins over the script writer's paraphrase of it.
+
 # v2 - what changed, and how to run it
 
 See `CHANGES.md` (one level up, next to this folder) for the full explanation. Short version:

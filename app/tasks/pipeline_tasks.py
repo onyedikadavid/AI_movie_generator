@@ -28,6 +28,7 @@ from app.services.ffmpeg_service import FFmpegService
 from app.services.scene_renderer import SceneRenderer
 from app.services.voice_service import VoiceCast, normalize_age_group, normalize_gender
 from app.services.media_storage import publish_file
+from app.services.style_presets import resolve_style
 
 logger = logging.getLogger(__name__)
 
@@ -225,18 +226,35 @@ class _SceneCtx:
     def stage(self, status_name: str, frac: float, detail: str):
         # Scene work accounts for 0-92% of the bar; the final cut is the rest.
         pct = int(((self.index + max(0.0, min(1.0, frac))) / self.total) * 92)
-        self.project.status = ProjectStatus[status_name]
-        self.project.progress_pct = max(self.project.progress_pct or 0, pct)
-        self.project.stage_detail = f"Scene {self.scene.scene_number}/{self.total}: {detail}"
-        self.project.current_scene = self.scene.scene_number
-        self.db.commit()
+        # After a multi-minute GPU wait the hosted database may have dropped our idle connection;
+        # retry once on a fresh one instead of failing a render that is otherwise fine.
+        for attempt in (1, 2):
+            try:
+                self.project.status = ProjectStatus[status_name]
+                self.project.progress_pct = max(self.project.progress_pct or 0, pct)
+                self.project.stage_detail = f"Scene {self.scene.scene_number}/{self.total}: {detail}"
+                self.project.current_scene = self.scene.scene_number
+                self.db.commit()
+                return
+            except Exception:  # noqa: BLE001
+                self.db.rollback()
+                if attempt == 2:
+                    raise
+                logger.warning("Database connection hiccup while saving progress - retrying once.")
 
     def set_scene_image(self, path: str):
         # Publish the keyframe as soon as it exists so the gallery fills in live.
         # (Scenes that are already finished and unchanged never reach this.)
         url = self.ctl.call(publish_file, path, f"projects/{self.project.id}/scene_{self.scene.scene_number}/keyframe.png")
-        self.scene.image_path = url
-        self.db.commit()
+        for attempt in (1, 2):
+            try:
+                self.scene.image_path = url
+                self.db.commit()
+                return
+            except Exception:  # noqa: BLE001
+                self.db.rollback()
+                if attempt == 2:
+                    raise
 
 
 def _asset_body(db, project: Project, ctl: RunControl) -> None:
@@ -246,7 +264,10 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
         raise RuntimeError("This project has no scenes yet. Press Resume/Retry to write the script first.")
     characters = db.execute(select(Character).where(Character.project_id == pid)).scalars().all()
     script = db.execute(select(Script).where(Script.project_id == pid)).scalars().first()
-    style = (script.visual_style if script else None) or project.requested_visual_style or ""
+    style = resolve_style(
+        project.requested_visual_style, script.visual_style if script else None,
+        project.requested_genre, project.requested_tone,
+    )
 
     # Voices: each character gets (and keeps) their own male/female voice.
     cast = VoiceCast(

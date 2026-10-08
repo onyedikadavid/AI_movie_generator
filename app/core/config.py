@@ -109,6 +109,9 @@ class Settings(BaseSettings):
     # "edge" = Microsoft neural voices via the free `edge-tts` package (needs
     # outbound internet, no API key, no cost) - the natural-sounding option.
     # Falls back to Piper (if configured), then gTTS, then silence.
+    # False (default) = ONLY the characters speak: no narrator voice at all. A character who is alone in a scene
+    # gets spoken lines of their own (written by the script writer). True = also use a separate narrator voice.
+    NARRATOR_ENABLED: bool = False
     TTS_ENGINE: str = "edge"
     # auto = pick Nigerian-accented voices when the story is Nigerian, else US/UK.
     # Or force one of: ng | us | gb
@@ -154,6 +157,12 @@ class Settings(BaseSettings):
     # Resolution requested from a text-to-video server (WxH, both divisible by 32).
     VIDEO_T2V_RESOLUTION: str = "960x544"
     VIDEO_SERVER_TIMEOUT: int = 900
+    # Video clips are requested as background JOBS: the request returns at once and the backend polls for the
+    # result, so a long render never depends on one HTTP connection staying open (ngrok / timeouts / blips).
+    VIDEO_ASYNC: bool = True
+    VIDEO_POLL_SECONDS: int = 6
+    # Longest the backend will wait for ONE clip before giving up (seconds).
+    VIDEO_JOB_MAX_WAIT: int = 7200
     # Generate a dedicated close-up keyframe for each speaking character
     # (bigger, sharper faces -> far less "melting"). Turn off to render every
     # shot from the scene's wide keyframe instead (faster, lower quality).

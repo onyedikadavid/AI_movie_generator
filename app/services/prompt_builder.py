@@ -12,8 +12,10 @@ from __future__ import annotations
 import re
 from typing import Optional, Sequence
 
+from app.services.style_presets import is_cinematic, is_kids
+
 _ANIMATED = re.compile(
-    r"anim|cartoon|3d|pixar|disney|anime|manga|illustrat|comic|cel[- ]?shad|stylized|stylised|claymation|paint",
+    r"anim|cartoon|3d|pixar|disney|anime|manga|illustrat|comic|cel[- ]?shad|stylized|stylised|claymation|paint|watercolou?r|ghibli",
     re.IGNORECASE,
 )
 
@@ -24,14 +26,38 @@ def clip_words(text: Optional[str], n: int) -> str:
 
 
 def style_kind(style: Optional[str]) -> str:
-    return "animated" if style and _ANIMATED.search(style) else "realistic"
+    """kids | animated | cinematic | realistic"""
+    if not style:
+        return "realistic"
+    if is_kids(style):
+        return "kids"
+    if _ANIMATED.search(style):
+        return "animated"
+    if is_cinematic(style):
+        return "cinematic"
+    return "realistic"
+
+
+def _is_drawn(kind: str) -> bool:
+    return kind in ("kids", "animated")
 
 
 def image_style_suffix(style: Optional[str]) -> str:
-    if style_kind(style) == "animated":
+    kind = style_kind(style)
+    if kind == "kids":
+        return (
+            "bright colorful children's animation style, cute friendly characters with big expressive eyes, "
+            "soft rounded shapes, warm cheerful lighting, clean simple background, vivid colors, high quality"
+        )
+    if kind == "animated":
         return (
             "stylized 3D animated film still, clean shapes, expressive faces, rich colors, "
             "soft cinematic lighting, sharp details"
+        )
+    if kind == "cinematic":
+        return (
+            "cinematic film still, anamorphic lens, dramatic motivated lighting, shallow depth of field, "
+            "rich teal and orange color grading, subtle film grain, high production value, sharp focus"
         )
     return (
         "cinematic film still, photorealistic, natural skin texture, shallow depth of field, "
@@ -40,11 +66,16 @@ def image_style_suffix(style: Optional[str]) -> str:
 
 
 def image_negative(style: Optional[str]) -> str:
+    kind = style_kind(style)
     base = (
         "blurry, out of focus, low quality, jpeg artifacts, distorted face, asymmetrical face, "
         "deformed hands, extra fingers, extra limbs, bad anatomy, cropped, watermark, text, logo"
     )
-    return base + (", photo, photorealistic" if style_kind(style) == "animated" else ", cartoon, illustration, 3d render")
+    if kind == "kids":
+        return base + ", scary, dark, creepy, violent, gore, blood, weapon, realistic photo, photorealistic, nsfw"
+    if _is_drawn(kind):
+        return base + ", photo, photorealistic"
+    return base + ", cartoon, illustration, 3d render"
 
 
 def _style_text(style: Optional[str]) -> str:
@@ -153,8 +184,15 @@ def video_prompt(
 # recognisable from clip to clip.
 # ---------------------------------------------------------------------------
 def _t2v_style(style: Optional[str]) -> str:
-    if style_kind(style) == "animated":
+    kind = style_kind(style)
+    if kind == "kids":
+        return ("bright cheerful children's cartoon animation, cute rounded characters with big expressive eyes, "
+                "vivid saturated colors, soft warm light, smooth gentle motion, friendly and safe")
+    if kind == "animated":
         return "stylized 3D animated film look, clean shapes, expressive faces, rich colors, soft cinematic lighting"
+    if kind == "cinematic":
+        return ("cinematic film look, anamorphic lens, dramatic motivated lighting, shallow depth of field, "
+                "rich color grading, subtle film grain, high production value")
     return "cinematic live-action film look, natural lighting, shallow depth of field, realistic skin texture, 35mm"
 
 

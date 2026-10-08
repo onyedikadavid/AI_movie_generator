@@ -108,6 +108,7 @@ class SceneRenderer:
                 "camera": settings.VIDEO_CAMERA_MOTION,
                 "interp": settings.VIDEO_INTERPOLATE,
                 "mode": settings.VIDEO_MODE,
+                "narrator": bool(settings.NARRATOR_ENABLED),
                 "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None)],
                 "t2vres": settings.VIDEO_T2V_RESOLUTION,
             },
@@ -134,7 +135,11 @@ class SceneRenderer:
 
     def _segments(self, scene, cast: VoiceCast) -> List[Segment]:
         turns = [t for t in (scene.dialogue_turns or []) if clean_for_tts(t.get("text", ""), t.get("speaker", ""))]
-        narration = clean_for_tts(scene.narration_text or "")
+        narrator_on = bool(settings.NARRATOR_ENABLED)
+        if not narrator_on:
+            # Characters only: nothing is spoken by a narrator, not even lines the script labelled "Narrator".
+            turns = [t for t in turns if not is_narrator((t.get("speaker") or "").strip())]
+        narration = clean_for_tts(scene.narration_text or "") if narrator_on else ""
         segments: List[Segment] = []
 
         if narration:

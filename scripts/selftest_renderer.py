@@ -113,6 +113,9 @@ def make_scene():
 
 
 def main():
+    from app.core.config import settings
+
+    settings.NARRATOR_ENABLED = True   # the first checks cover the narrator-on path; narrator-off is tested below
     if not shutil.which("ffmpeg"):
         print("ffmpeg not found"); sys.exit(1)
     tmp = tempfile.mkdtemp()
@@ -233,6 +236,40 @@ def main():
     assert all("no spoken dialogue" in p for p, _, _ in results["hybrid"][1]), "hybrid prompts must tell the model not to add speech"
     assert not any("no spoken dialogue" in p for p, _, _ in results["voices-only"][1])
     print("OK hybrid sound: background level in a pause = %.3f (hybrid) vs %.4f (voices-only) vs %.4f (silent clips)" % (hyb, vo, sil))
+
+    # --- narrator OFF (the default): only characters speak -------------------------------------------
+    settings.NARRATOR_ENABLED = False
+    try:
+        tts6, img6, vid6 = FakeTTS(), FakeImage(), FakeVideo()
+        r6 = SceneRenderer(img6, vid6, tts6, ff)
+        sc = make_scene()
+        sc.dialogue_turns = sc.dialogue_turns + [{"speaker": "Narrator", "text": "And so the day went on.", "expression": "calm", "action": ""}]
+        res6 = r6.render(sc, chars, "Nollywood cinematic", cast, os.path.join(tmp, "scene_nonarr"), "proj1", FakeCtx())
+        labels = [l for l, _, _ in tts6.lines]
+        assert "Narrator" not in labels, labels
+        assert labels == ["Obinna", "Daddy", "Obinna"], labels      # the 3 character lines, nothing else
+        print("OK narrator off: only characters spoke ->", labels, "(narration text and a 'Narrator' line were both dropped)")
+
+        # a scene with ONLY narration and no character lines becomes a silent/ambient scene (nobody speaks)
+        tts7 = FakeTTS()
+        r7 = SceneRenderer(FakeImage(), FakeVideo(), tts7, ff)
+        only_narr = make_scene(); only_narr.dialogue_turns = None
+        res7 = r7.render(only_narr, chars, "Nollywood", cast, os.path.join(tmp, "scene_onlynarr"), "proj1", FakeCtx())
+        assert tts7.lines == [] and res7.duration > 3
+        print("OK narrator off: a narration-only scene stays silent (%.1fs) instead of being read aloud" % res7.duration)
+
+        # a lone character with their own spoken lines (what the script writer now produces) works
+        tts8 = FakeTTS()
+        r8 = SceneRenderer(FakeImage(), FakeVideo(), tts8, ff)
+        solo = make_scene()
+        solo.characters_present = ["Obinna"]
+        solo.dialogue_turns = [{"speaker": "Obinna", "text": "I have to be brave now.", "expression": "determined", "action": "clenches fists"},
+                               {"speaker": "Obinna", "text": "Here I go.", "expression": "nervous", "action": "steps forward"}]
+        res8 = r8.render(solo, chars, "Nollywood", cast, os.path.join(tmp, "scene_solo"), "proj1", FakeCtx())
+        assert [l for l, _, _ in tts8.lines] == ["Obinna", "Obinna"] and ff.has_audio(res8.final_path)
+        print("OK narrator off: a lone character speaks their own lines (%.1fs)" % res8.duration)
+    finally:
+        settings.NARRATOR_ENABLED = False
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("\nALL RENDERER CHECKS PASSED")

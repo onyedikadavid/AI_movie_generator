@@ -6,6 +6,7 @@ from typing import Dict, Any
 from app.core.config import settings
 from app.schemas.script import ScriptDecompositionSchema
 from app.services.agent_service import AgentService
+from app.services.style_presets import is_kids, script_constraints
 from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
 from app.services.http_retry import post_with_retry
 
@@ -78,6 +79,7 @@ class LLMService:
                 style_constraints += f"        - Tone: {tone_hint}\n"
             if visual_style_hint:
                 style_constraints += f"        - Visual style: {visual_style_hint}\n"
+            style_constraints += script_constraints(genre_hint, tone_hint, visual_style_hint) + "\n"
 
         # Step A: Generate Base Characters & High-Level Scene Outlines
         #
@@ -171,15 +173,27 @@ class LLMService:
         for scene in parsed_data.get("scenes", []) or []:
             present = [by_name[n.strip().lower()] for n in (scene.get("characters_present") or [])
                        if isinstance(n, str) and n.strip().lower() in by_name]
+            goal = f"{scene.get('location', '')} - {scene.get('visual_description', '')}"
+            kids = is_kids(genre_hint, tone_hint, visual_style_hint)
             if len(present) >= 2:
                 char_a, char_b = present[0], present[1]
             elif not present and len(characters) >= 2:
                 char_a, char_b = characters[0], characters[1]
             else:
-                continue  # a single person on screen: the narrator carries the scene
-            goal = f"{scene.get('location', '')} - {scene.get('visual_description', '')}"
+                # A single person on screen. With a narrator, the narrator carries the scene; without one,
+                # that character speaks out loud so the scene isn't silent.
+                solo = present[0] if len(present) == 1 else (characters[0] if len(characters) == 1 else None)
+                if solo is not None and not settings.NARRATOR_ENABLED:
+                    try:
+                        scene["dialogue_turns"] = await self.agent_service.simulate_monologue(solo, goal, lines=2, kids=kids)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Spoken lines for scene %s failed (%s).", scene.get("scene_number"), e)
+                        scene["dialogue_turns"] = []
+                continue
             try:
-                scene["dialogue_turns"] = await self.agent_service.simulate_interaction(char_a, char_b, goal, turns=4)
+                scene["dialogue_turns"] = await self.agent_service.simulate_interaction(
+                    char_a, char_b, goal, turns=4, kids=kids
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)
                 scene["dialogue_turns"] = []
