@@ -10,6 +10,7 @@ from sqlalchemy import delete, select
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
+from app.core.db_safety import release_connection, safe_rollback
 from app.core.schema_upgrade import ensure_schema
 from app.core.sync_db import SessionLocal, engine  # noqa: F401  (engine re-exported for older scripts)
 from app.models.project import Project, ProjectStatus
@@ -127,6 +128,13 @@ def _execute(project_id: str, token, first_status: ProjectStatus, body) -> None:
         db.close()
 
 
+def _call(db, ctl, fn, *args, **kwargs):
+    """A long blocking call (LLM, GPU server, upload...). The DB connection is released first, so it can't be
+    killed while idle during the wait."""
+    release_connection(db)
+    return ctl.call(fn, *args, **kwargs)
+
+
 def _set(db, project, **fields) -> None:
     for k, v in fields.items():
         setattr(project, k, v)
@@ -143,7 +151,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
     if project.audio_input_path and not project.raw_prompt:
         _set(db, project, status=ProjectStatus.TRANSCRIBING, stage_detail="Listening to your recording")
         stt = STTService()
-        text = ctl.call(stt.transcribe, project.audio_input_path)
+        text = _call(db, ctl, stt.transcribe, project.audio_input_path)
         _set(db, project, raw_prompt=text)
 
     ctl.checkpoint()
@@ -151,7 +159,8 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
 
     llm = LLMService()
     prompt, genre, tone, vstyle = project.raw_prompt, project.requested_genre, project.requested_tone, project.requested_visual_style
-    script_schema = ctl.call(
+    script_schema = _call(
+        db, ctl,
         lambda: asyncio.run(
             llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle)
         )
@@ -221,7 +230,7 @@ class _SceneCtx:
         self.ctl.checkpoint()
 
     def call(self, fn, *a, **kw):
-        return self.ctl.call(fn, *a, **kw)
+        return _call(self.db, self.ctl, fn, *a, **kw)
 
     def stage(self, status_name: str, frac: float, detail: str):
         # Scene work accounts for 0-92% of the bar; the final cut is the rest.
@@ -237,7 +246,7 @@ class _SceneCtx:
                 self.db.commit()
                 return
             except Exception:  # noqa: BLE001
-                self.db.rollback()
+                safe_rollback(self.db)
                 if attempt == 2:
                     raise
                 logger.warning("Database connection hiccup while saving progress - retrying once.")
@@ -245,14 +254,14 @@ class _SceneCtx:
     def set_scene_image(self, path: str):
         # Publish the keyframe as soon as it exists so the gallery fills in live.
         # (Scenes that are already finished and unchanged never reach this.)
-        url = self.ctl.call(publish_file, path, f"projects/{self.project.id}/scene_{self.scene.scene_number}/keyframe.png")
+        url = _call(self.db, self.ctl, publish_file, path, f"projects/{self.project.id}/scene_{self.scene.scene_number}/keyframe.png")
         for attempt in (1, 2):
             try:
                 self.scene.image_path = url
                 self.db.commit()
                 return
             except Exception:  # noqa: BLE001
-                self.db.rollback()
+                safe_rollback(self.db)
                 if attempt == 2:
                     raise
 
@@ -305,15 +314,21 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
         try:
             result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx)
         except RunStopped:
-            db.rollback()
-            if scene.render_status == "RENDERING":
-                scene.render_status = "PENDING"
-                db.commit()
+            safe_rollback(db)
+            try:
+                if scene.render_status == "RENDERING":
+                    scene.render_status = "PENDING"
+                    db.commit()
+            except Exception:  # noqa: BLE001 - never let bookkeeping hide the real reason we stopped
+                safe_rollback(db)
             raise
         except Exception:
-            db.rollback()
-            scene.render_status = "FAILED"
-            db.commit()
+            safe_rollback(db)
+            try:
+                scene.render_status = "FAILED"
+                db.commit()
+            except Exception:  # noqa: BLE001 - keep the ORIGINAL error (e.g. the video server's), not a DB one
+                safe_rollback(db)
             raise
 
         scene.video_path = result.final_path
@@ -330,9 +345,9 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     _set(db, project, status=ProjectStatus.COMPOSITING, progress_pct=94,
          stage_detail="Joining scenes into the final cut", current_scene=None)
     master = os.path.join(project_root, "final_master_video.mp4")
-    ctl.call(ff.concatenate_videos, finals, master, "aac")
+    _call(db, ctl, ff.concatenate_videos, finals, master, "aac")
     _set(db, project, progress_pct=97, stage_detail="Uploading the final video")
-    url = ctl.call(publish_file, master, f"projects/{pid}/final_master_video.mp4")
+    url = _call(db, ctl, publish_file, master, f"projects/{pid}/final_master_video.mp4")
 
     warnings = list(dict.fromkeys(tts.warnings))
     project.final_video_path = url

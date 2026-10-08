@@ -40,6 +40,7 @@ from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.db_safety import safe_rollback
 from app.core.sync_db import SessionLocal
 from app.models.lease import PipelineLease
 from app.models.project import ACTIVE_STATUSES, BUSY_STATUSES, Project, ProjectStatus
@@ -96,7 +97,7 @@ def acquire_lease(db: Session, project_id: str, holder: str = HOLDER) -> bool:
 
 def release_lease(db: Session, holder: str = HOLDER) -> None:
     try:
-        db.rollback()
+        safe_rollback(db)
         db.execute(
             update(PipelineLease)
             .where(PipelineLease.id == 1, PipelineLease.holder == holder)
@@ -105,7 +106,7 @@ def release_lease(db: Session, holder: str = HOLDER) -> None:
         db.commit()
     except Exception:  # noqa: BLE001
         logger.exception("Couldn't release the pipeline lease (it will expire on its own).")
-        db.rollback()
+        safe_rollback(db)
 
 
 def claim(db: Session, project_id: str, token: str, new_status: ProjectStatus) -> bool:
@@ -240,7 +241,7 @@ def project_dir(project_id: str) -> str:
 
 
 def delete_project_everywhere(db: Session, project_id: str) -> None:
-    db.rollback()
+    safe_rollback(db)
     obj = db.get(Project, project_id)
     if obj is not None:
         db.delete(obj)  # ORM cascade removes script / characters / scenes
@@ -254,7 +255,7 @@ def delete_project_everywhere(db: Session, project_id: str) -> None:
 
 def finish_stopped(db: Session, project_id: str, token: str, reason: str) -> None:
     """Called by the worker after a RunStopped: settle the project in its final state."""
-    db.rollback()
+    safe_rollback(db)
     if reason == "superseded":
         return  # a newer run owns this project now - don't touch it
     if reason == "delete":
@@ -271,7 +272,7 @@ def finish_stopped(db: Session, project_id: str, token: str, reason: str) -> Non
 
 
 def finish_failed(db: Session, project_id: str, token: str, message: str) -> None:
-    db.rollback()
+    safe_rollback(db)
     db.execute(
         update(Project)
         .where(Project.id == project_id, Project.run_token == token)
@@ -283,7 +284,7 @@ def finish_failed(db: Session, project_id: str, token: str, message: str) -> Non
 
 def finish_interrupted(db: Session, project_id: str, token: str) -> None:
     """The worker process itself is being shut down (Ctrl+C / SIGTERM)."""
-    db.rollback()
+    safe_rollback(db)
     db.execute(
         update(Project)
         .where(Project.id == project_id, Project.run_token == token)

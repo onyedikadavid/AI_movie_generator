@@ -43,6 +43,10 @@ VIDEO_JOB_MAX_WAIT=7200     # longest wait for ONE clip, in seconds
 ```
 Self-test: `python scripts/selftest_video_client.py`
 
+**Long waits and the database:** before every long wait (GPU server, LLM, upload) the worker saves its work and hands its database
+connection back, and error handling tolerates a connection the hosted database dropped - so a multi-minute render can no longer end in
+`SSL connection has been closed unexpectedly` and hide the real error. Self-test: `python scripts/selftest_db_safety.py`
+
 ## Narrator
 
 `NARRATOR_ENABLED=false` (default): **only the characters speak** - no narrator voice, narration text is not read aloud, and any line the script labels
