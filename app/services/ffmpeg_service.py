@@ -202,6 +202,53 @@ class FFmpegService:
         ])
         return dst_path
 
+    def normalize_clip(
+        self,
+        src_path: str,
+        dst_path: str,
+        width: int,
+        height: int,
+        fps: int = 24,
+        sharpen: float = 0.0,
+        interpolate: bool = False,
+    ) -> str:
+        """
+        Model-voice mode: makes a generated clip match the other shots (size, frame rate, codecs) but keeps its
+        OWN length and its OWN sound (the character's voice made by the video model). Nothing is slowed down or
+        stretched - that would pull the picture out of sync with the voice. A clip with no sound gets silence, so
+        every shot has an audio track and the shots can be joined.
+        """
+        _require_ffmpeg()
+        length = max(self.get_duration(src_path), 0.1)
+        vf = []
+        if interpolate:
+            vf.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+        vf += [
+            f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos",
+            f"crop={width}:{height}",
+            "setsar=1",
+            f"fps={fps}",
+        ]
+        if sharpen and sharpen > 0:
+            vf.append(f"unsharp=5:5:{sharpen:.2f}:5:5:0.0")
+        vf.append("format=yuv420p")
+
+        cmd = ["ffmpeg", "-y", "-i", src_path]
+        if self.has_audio(src_path):
+            # Per-clip loudness levelling keeps the voices at a similar volume from shot to shot.
+            af = "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,aformat=channel_layouts=stereo,apad"
+            cmd += ["-vf", ",".join(vf), "-af", af, "-map", "0:v:0", "-map", "0:a:0"]
+        else:
+            cmd += ["-f", "lavfi", "-t", f"{length:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
+                    "-vf", ",".join(vf), "-map", "0:v:0", "-map", "1:a:0"]
+        cmd += [
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-r", str(fps),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-shortest", "-movflags", "+faststart", dst_path,
+        ]
+        _run(cmd)
+        return dst_path
+
     # ------------------------------------------------------------------ hybrid audio
     def has_audio(self, media_path: str) -> bool:
         """True if the file has a usable audio stream."""

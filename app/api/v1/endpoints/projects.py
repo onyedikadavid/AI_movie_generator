@@ -17,11 +17,12 @@ from app.models.project import BUSY_STATUSES, Project
 from app.models.scene import Scene
 from app.schemas.character import CharacterResponse, CharacterUpdate
 from app.schemas.project import (
-    DeleteResult, ProjectDetailResponse, ProjectListItem, ProjectResponse, QueueSnapshot,
+    DeleteResult, ProjectDetailResponse, ProjectListItem, ProjectResponse, ProjectSettingsUpdate, QueueSnapshot,
+    normalize_video_mode,
 )
 from app.schemas.scene import SceneResponse, SceneUpdate
 from app.services import run_control as rc
-from app.services.voice_service import normalize_age_group, normalize_gender
+from app.services.voice_service import normalize_age_group, normalize_gender, normalize_turn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -47,6 +48,8 @@ async def _in_session(fn: Callable):
 
 def _project_out(db, p: Project, model=ProjectResponse):
     item = model.model_validate(p)
+    if hasattr(item, "video_mode") and item.video_mode is None:
+        item.video_mode = normalize_video_mode(settings.VIDEO_MODE) or "i2v"   # show the mode that will really be used
     if p.status.value in ("QUEUED", "CREATED"):
         order = rc.queued_ids_in_order(db)
         if p.id in order:
@@ -60,6 +63,7 @@ async def create_project(
     genre: Optional[str] = Form(None),
     tone: Optional[str] = Form(None),
     visual_style: Optional[str] = Form(None),
+    video_mode: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -76,6 +80,7 @@ async def create_project(
         requested_genre=genre or None,
         requested_tone=tone or None,
         requested_visual_style=visual_style or None,
+        video_mode=normalize_video_mode(video_mode),
     )
     db.add(new_project)
     await db.commit()
@@ -234,7 +239,10 @@ async def update_scene(project_id: str, scene_id: str, payload: SceneUpdate, db:
 
     changes = payload.model_dump(exclude_unset=True)
     if "dialogue_turns" in changes and changes["dialogue_turns"] is not None:
-        changes["dialogue_turns"] = [t for t in changes["dialogue_turns"] if (t.get("text") or "").strip()] or None
+        # Stage directions typed into a line ("Irritated Tapping on the board... \"What's wrong?\"") are moved into the
+        # turn's `action`, so only the spoken words stay in `text`.
+        turns = [normalize_turn(t) for t in changes["dialogue_turns"]]
+        changes["dialogue_turns"] = [t for t in turns if (t.get("text") or "").strip()] or None
     for field, value in changes.items():
         setattr(scene, field, value)
     if changes:
@@ -243,6 +251,34 @@ async def update_scene(project_id: str, scene_id: str, payload: SceneUpdate, db:
     await db.commit()
     await db.refresh(scene)
     return scene
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project_settings(project_id: str, payload: ProjectSettingsUpdate, db: AsyncSession = Depends(get_db)):
+    """Change how this project is generated (image-first vs text-to-video). Takes effect on the next run; scenes
+    rendered the other way are redone, scenes that don't depend on it are reused."""
+    project = await _get_project_or_404(project_id, db)
+    if project.status in BUSY_STATUSES:
+        raise HTTPException(status_code=409, detail="Pause the project (or wait for it to finish) before changing its settings.")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if "video_mode" in changes:
+        mode = normalize_video_mode(changes["video_mode"])
+        if changes["video_mode"] and mode is None:
+            raise HTTPException(status_code=422, detail="video_mode must be 'i2v' (image first) or 't2v' (text-to-video).")
+        if mode != project.video_mode:
+            project.video_mode = mode
+            scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id))).scalars().all()
+            for sc in scenes:
+                if sc.render_status == "DONE":
+                    sc.render_status = "PENDING"
+    await db.commit()
+    await db.refresh(project)
+
+    def out(sdb):
+        return _project_out(sdb, sdb.get(Project, project_id))
+
+    return await _in_session(out)
 
 
 @router.patch("/projects/{project_id}/characters/{character_id}", response_model=CharacterResponse)

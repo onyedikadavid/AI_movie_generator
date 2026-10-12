@@ -1,3 +1,27 @@
+## Model voices, free camera, and the image-vs-text switch
+
+**Voices.** `AUDIO_MODE=model` (the default) makes the video model (LTX-2.3) speak the lines itself - no edge-tts. Each line is written
+into the clip's prompt as `Kobi says in an adult male voice with a Nigerian accent: "..."`, with the character's gender, age and
+accent taken from the Cast screen so a voice stays similar between shots. Every spoken line is its own clip (long lines are split at
+sentence ends, `MODEL_VOICE_MAX_WORDS=9`) and clips keep their natural length, so lips stay in sync. Works in both modes (text-to-video
+and image-first). To go back to edge-tts: `AUDIO_MODE=voices` (or `hybrid`).
+
+**Action vs. words.** A dialogue line may hold both, e.g. `Irritated Tapping on the mixing board... "What's with this distortion?"`.
+Only the words are ever spoken; the stage direction goes into the turn's **Action** and is acted out. This happens when the script is
+written, when you save a scene, and again at render time (so scripts written before this update are fixed too).
+
+**Camera.** `VIDEO_CAMERA_MOTION=model` (the default) lets the camera move like a normal film: the scene's *Motion / camera direction*
+is used on the first shot, then a rotating set of classic moves (push-in, tracking, handheld, arc, dolly). `gentle` = small moves only,
+`static` = the old locked-off tripod look. Speakers are framed waist-up so hands and body can act.
+
+**Image first vs. text-to-video, per project.** Pick it on *New project* or on the review screen (`PATCH /api/v1/projects/{id}`
+with `{"video_mode": "i2v" | "t2v"}`). `VIDEO_MODE` in `.env` is only the default. Switching re-renders the scenes on the next run.
+
+Run `python scripts/selftest_model_voice.py` (needs only ffmpeg + Pillow) to check all of this without a GPU.
+New database column `projects.video_mode` is added automatically on start-up (or `alembic upgrade head`).
+
+---
+
 ## Text-to-video mode (LTX-2.3 via WanGP)
 
 Set `VIDEO_MODE=t2v` in `.env` (default is `i2v`). In this mode no keyframes are drawn (the SDXL notebook is not needed);
@@ -12,14 +36,14 @@ VIDEO_SHOT_SECONDS=4.5
 VIDEO_MAX_CLIP_SECONDS=5.0
 ```
 
-**Sound (hybrid):** `AUDIO_MODE=hybrid` (default) keeps the pipeline's character/narrator voices and also mixes in the video
+**Sound (hybrid):** `AUDIO_MODE=hybrid` keeps the pipeline's character/narrator voices and also mixes in the video
 model's own background sound and effects (wind, crowds, gunfire, footsteps...), automatically lowered by ~11 dB while someone speaks
 and crossfaded between shots. Each scene has an editable "Background sound & effects" field (the script writer fills it in). Prompts tell the
 model "no spoken dialogue, no music" so it never adds voices of its own. `AUDIO_MODE=voices` turns the model's sound off.
 Only text-to-video with an audio-capable model (LTX-2.x) produces background sound; otherwise the clip is silent and only the voices play.
 
 ```
-AUDIO_MODE=hybrid        # hybrid | voices
+AUDIO_MODE=model         # model (default) | hybrid | voices
 AMBIENCE_VOLUME=0.55     # background loudness before ducking
 ```
 

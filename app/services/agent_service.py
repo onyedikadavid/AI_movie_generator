@@ -173,5 +173,10 @@ class AgentService:
             text = re.sub(r"^\s*" + re.escape(speaker) + r"\s*:\s*", "", (raw or "").strip(), flags=re.IGNORECASE)
         text = re.sub(r"^\s*" + re.escape(speaker) + r"\s*:\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\*[^*]*\*|\([^)]*\)|\[[^\]]*\]", " ", text)
-        text = re.sub(r"\s+", " ", text).strip().strip('"\u201c\u201d').strip()
-        return emotion[:40], action[:80], text
+        text = re.sub(r"\s+", " ", text).strip()
+        # Small models sometimes put the stage direction inside the spoken line - keep only the words in `text`.
+        from app.services.voice_service import merge_actions, split_dialogue
+        extra_action, text = split_dialogue(text)
+        action = merge_actions(action, extra_action)
+        text = text.strip().strip('"\u201c\u201d').strip()
+        return emotion[:40], action[:120], text

@@ -8,12 +8,29 @@ from app.schemas.character import CharacterResponse
 from app.schemas.scene import SceneResponse
 
 
+def normalize_video_mode(value: Optional[str]) -> Optional[str]:
+    """'t2v' / 'i2v' (also accepts friendly spellings); anything else = None (use the server default)."""
+    v = (value or "").strip().lower().replace("_", "-")
+    if v in ("t2v", "text", "text-to-video", "video"):
+        return "t2v"
+    if v in ("i2v", "image", "image-to-video", "image-first", "images"):
+        return "i2v"
+    return None
+
+
 class ProjectCreate(BaseModel):
     raw_prompt: Optional[str] = None
     # Optional stylistic toggles from the "New Project" form - used as hints for the LLM breakdown.
     genre: Optional[str] = None
     tone: Optional[str] = None
     visual_style: Optional[str] = None
+    # "i2v" (image model first, then animate) or "t2v" (text-to-video). None = server default.
+    video_mode: Optional[str] = None
+
+
+class ProjectSettingsUpdate(BaseModel):
+    """Per-project generation settings, editable on the review screen before (re)generating."""
+    video_mode: Optional[str] = None
 
 
 class RunState(BaseModel):
@@ -52,6 +69,7 @@ class ProjectResponse(RunState):
     title: Optional[str]
     raw_prompt: Optional[str]
     final_video_path: Optional[str]
+    video_mode: Optional[str] = None
     created_at: datetime
 
     class Config:

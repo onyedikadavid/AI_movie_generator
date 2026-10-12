@@ -39,9 +39,13 @@ from app.services.shot_planner import Segment, Shot, layout_timeline, plan_shots
 from app.services.voice_service import (
     NARRATOR_NAME,
     VoiceCast,
+    chunk_speech,
     clean_for_tts,
+    estimate_speech_seconds,
     is_narrator,
     limit_words,
+    merge_actions,
+    normalize_turn,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,10 +92,10 @@ class SceneRenderer:
         chosen = [c for c in characters if c.name.strip().lower() in present]
         return chosen or list(characters)
 
-    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast) -> str:
+    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str) -> str:
         blob = json.dumps(
             {
-                "v": 4,
+                "v": 5,
                 "img": scene.image_prompt,
                 "motion": scene.motion_prompt,
                 "vis": scene.visual_description,
@@ -107,9 +111,9 @@ class SceneRenderer:
                 "sharp": settings.OUTPUT_SHARPEN,
                 "camera": settings.VIDEO_CAMERA_MOTION,
                 "interp": settings.VIDEO_INTERPOLATE,
-                "mode": settings.VIDEO_MODE,
+                "mode": video_mode,
                 "narrator": bool(settings.NARRATOR_ENABLED),
-                "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None)],
+                "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None), settings.MODEL_VOICE_MAX_WORDS],
                 "t2vres": settings.VIDEO_T2V_RESOLUTION,
             },
             sort_keys=True,
@@ -133,8 +137,13 @@ class SceneRenderer:
             f.write(fingerprint)
         return reusable
 
-    def _segments(self, scene, cast: VoiceCast) -> List[Segment]:
-        turns = [t for t in (scene.dialogue_turns or []) if clean_for_tts(t.get("text", ""), t.get("speaker", ""))]
+    def _segments(self, scene, cast: VoiceCast, model_audio: bool = False) -> List[Segment]:
+        # Each line is first split into ACTION (performed on screen) and WORDS (the only thing ever spoken).
+        turns = []
+        for raw in (scene.dialogue_turns or []):
+            t = normalize_turn(raw)
+            if clean_for_tts(t.get("text", ""), t.get("speaker", "")):
+                turns.append(t)
         narrator_on = bool(settings.NARRATOR_ENABLED)
         if not narrator_on:
             # Characters only: nothing is spoken by a narrator, not even lines the script labelled "Narrator".
@@ -142,26 +151,26 @@ class SceneRenderer:
         narration = clean_for_tts(scene.narration_text or "") if narrator_on else ""
         segments: List[Segment] = []
 
+        def add(speaker: str, kind: str, text: str, expression: str = "", action: str = "") -> None:
+            if model_audio:
+                # The video model speaks the line inside one clip: split long lines at sentence ends.
+                for n, piece in enumerate(chunk_speech(text, settings.MODEL_VOICE_MAX_WORDS) or [text]):
+                    segments.append(Segment(index=len(segments), speaker=speaker, kind=kind, text=piece,
+                                            expression=expression, action=action if n == 0 else ""))
+            else:
+                segments.append(Segment(index=len(segments), speaker=speaker, kind=kind, text=text,
+                                        expression=expression, action=action))
+
         if narration:
-            segments.append(
-                Segment(
-                    index=0, speaker=NARRATOR_NAME, kind="narration",
-                    text=limit_words(narration, 22 if turns else 45),
-                )
-            )
+            add(NARRATOR_NAME, "narration", limit_words(narration, 22 if turns else 45))
         for t in turns:
             speaker = (t.get("speaker") or "").strip() or "Character"
             if is_narrator(speaker):
                 kind, speaker = "narration", NARRATOR_NAME
             else:
                 kind = "dialogue"
-            segments.append(
-                Segment(
-                    index=len(segments), speaker=speaker, kind=kind,
-                    text=limit_words(clean_for_tts(t.get("text", ""), speaker), 40),
-                    expression=t.get("expression") or "", action=t.get("action") or "",
-                )
-            )
+            add(speaker, kind, limit_words(clean_for_tts(t.get("text", ""), speaker), 40),
+                t.get("expression") or "", t.get("action") or "")
         if not segments:
             segments.append(Segment(index=0, speaker=NARRATOR_NAME, kind="ambient"))
         return segments
@@ -185,11 +194,18 @@ class SceneRenderer:
         scene_dir: str,
         project_id: str,
         ctx,
+        video_mode: Optional[str] = None,
     ) -> SceneResult:
+        """video_mode: "i2v" (draw a keyframe with the image model, then animate it) or "t2v" (text-to-video, no
+        image model). None = the server-wide default (settings.VIDEO_MODE)."""
         W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
         reused = 0
+        mode = (video_mode or settings.VIDEO_MODE or "i2v").strip().lower()
+        mode = "t2v" if mode == "t2v" else "i2v"
+        model_audio = (settings.AUDIO_MODE or "voices").strip().lower() == "model"
+        free_cam = pb.is_free_camera(settings.VIDEO_CAMERA_MOTION)
 
-        fp = self._fingerprint(scene, characters, style, cast)
+        fp = self._fingerprint(scene, characters, style, cast, mode)
         may_reuse = self._prepare_dir(scene_dir, fp)
         final_path = os.path.join(scene_dir, "scene_final.mp4")
         if may_reuse and _nonempty(final_path):
@@ -198,14 +214,21 @@ class SceneRenderer:
             return SceneResult(final_path, wide, total, 0, 0)
 
         on_screen = self._characters_on_screen(scene, characters)
-        segments = self._segments(scene, cast)
+        segments = self._segments(scene, cast, model_audio)
 
         # ---------------------------------------------------------- 1. voices
-        ctx.stage(STAGE_AUDIO, 0.02, "Recording voices")
+        ctx.stage(STAGE_AUDIO, 0.02, "Preparing the lines" if model_audio else "Recording voices")
         for i, seg in enumerate(segments):
             ctx.checkpoint()
             seg.audio_path = os.path.join(scene_dir, f"seg_{i}_{_slug(seg.speaker)}.mp3")
-            if seg.kind == "ambient":
+            if model_audio:
+                # No text-to-speech: the video model speaks the line itself. Only its length is estimated here,
+                # to size the clip; the real length is whatever the model produces.
+                if seg.kind == "ambient":
+                    seg.duration = float(max(3, min(int(scene.duration_seconds or 5), 10)))
+                else:
+                    seg.duration = estimate_speech_seconds(seg.text)
+            elif seg.kind == "ambient":
                 seconds = float(max(3, min(int(scene.duration_seconds or 5), 8)))
                 if not _nonempty(seg.audio_path):
                     self._silent_mp3(seg.audio_path, seconds)
@@ -217,7 +240,8 @@ class SceneRenderer:
                     profile = cast.profile(seg.speaker, seg.expression, seg.action)
                     ctx.call(self.tts.synthesize, seg.text, profile, seg.audio_path, seg.speaker)
                 seg.duration = self.ff.get_duration(seg.audio_path)
-            ctx.stage(STAGE_AUDIO, 0.02 + 0.08 * (i + 1) / len(segments), f"Recording voices ({i + 1}/{len(segments)})")
+            if not model_audio:
+                ctx.stage(STAGE_AUDIO, 0.02 + 0.08 * (i + 1) / len(segments), f"Recording voices ({i + 1}/{len(segments)})")
 
         # --------------------------------------------------------- 2/3. timeline + shots
         total = layout_timeline(segments)
@@ -226,11 +250,12 @@ class SceneRenderer:
             max_len=settings.VIDEO_SHOT_SECONDS,
             max_shots=settings.VIDEO_MAX_SHOTS_PER_SCENE,
             hard_max_len=settings.VIDEO_MAX_CLIP_SECONDS + 1.2,
+            one_per_segment=model_audio,
         )
 
-        t2v = (settings.VIDEO_MODE or "i2v").lower() == "t2v"
+        t2v = mode == "t2v"
         # Hybrid sound = the video model's own background sound mixed under the pipeline's voices.
-        hybrid = t2v and (settings.AUDIO_MODE or "voices").lower() == "hybrid"
+        hybrid = t2v and (settings.AUDIO_MODE or "voices").lower() == "hybrid" and not model_audio
         ambience_parts: List[str] = []
         wide_path = os.path.join(scene_dir, "keyframe.png")
         keyframe_for_speaker: Dict[str, str] = {}
@@ -275,7 +300,7 @@ class SceneRenderer:
                         ctx.checkpoint()
                         ctx.call(
                             self.image.generate_image,
-                            pb.closeup_prompt(member, expression, scene.location, style),
+                            pb.closeup_prompt(member, expression, scene.location, style, free_cam),
                             path, pb.image_negative(style), None, None, _seed(project_id, member.name, "face"),
                         )
                     keyframe_for_speaker[name] = path
@@ -295,35 +320,52 @@ class SceneRenderer:
             fit = os.path.join(scene_dir, f"shot_{sh.index}.mp4")
             if may_reuse and _nonempty(raw):
                 reused += 1
-            elif t2v:
-                member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
-                prompt = pb.text_video_prompt(
-                    sh.kind, sh.speaker, sh.expression, sh.action,
-                    getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
-                    on_screen, scene.location, scene.visual_description, style, sh.index,
-                    settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
-                )
-                request_len = min(sh.duration + 0.4, settings.VIDEO_MAX_CLIP_SECONDS)
-                # Same seed for the same character = the best-effort way to keep a similar face between shots.
-                seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
-                ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed)
             else:
-                source = keyframe_for_speaker.get(sh.speaker) or wide_path
-                prompt = pb.video_prompt(
-                    sh.kind, sh.speaker, sh.expression, sh.action,
-                    scene.motion_prompt, scene.visual_description, sh.index,
-                    settings.VIDEO_CAMERA_MOTION,
+                speech = sh.text if (model_audio and sh.kind in ("dialogue", "narration")) else ""
+                voice_desc = cast.voice_description(sh.speaker) if speech else ""
+                # Model voices need real room for the line plus a beat of breathing space; clips are capped by the server.
+                request_len = min(
+                    sh.duration + (0.8 if model_audio else 0.4), settings.VIDEO_MAX_CLIP_SECONDS
                 )
-                request_len = min(sh.duration + 0.4, settings.VIDEO_MAX_CLIP_SECONDS)
-                ctx.call(
-                    self.video.generate_clip, source, raw, prompt, request_len,
-                    _seed(project_id, scene.scene_number, sh.index, "clip"),
-                )
+                if t2v:
+                    member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
+                    prompt = pb.text_video_prompt(
+                        sh.kind, sh.speaker, sh.expression, sh.action,
+                        getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
+                        on_screen, scene.location, scene.visual_description, style, sh.index,
+                        settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
+                        scene_motion=scene.motion_prompt, speech=speech, voice_desc=voice_desc, model_voice=model_audio,
+                    )
+                    # Same seed for the same character = the best-effort way to keep a similar face between shots.
+                    seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
+                    if model_audio:
+                        ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed, True)
+                    else:
+                        ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed)
+                else:
+                    source = keyframe_for_speaker.get(sh.speaker) or wide_path
+                    prompt = pb.video_prompt(
+                        sh.kind, sh.speaker, sh.expression, sh.action,
+                        scene.motion_prompt, scene.visual_description, sh.index,
+                        settings.VIDEO_CAMERA_MOTION,
+                        speech=speech, voice_desc=voice_desc, sound_design=getattr(scene, "sound_design", None),
+                        model_voice=model_audio,
+                    )
+                    if model_audio:
+                        ctx.call(self.video.generate_clip, source, raw, prompt, request_len,
+                                 _seed(project_id, scene.scene_number, sh.index, "clip"), True)
+                    else:
+                        ctx.call(self.video.generate_clip, source, raw, prompt, request_len,
+                                 _seed(project_id, scene.scene_number, sh.index, "clip"))
             if t2v and sh.index == 0 and not _nonempty(wide_path):
                 # Thumbnail for the gallery: a frame from the first generated clip.
                 ctx.call(self.ff.extract_frame, raw, wide_path)
                 ctx.set_scene_image(wide_path)
-            ctx.call(self.ff.fit_clip, raw, fit, sh.duration, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
+            if model_audio:
+                # Keep the clip's own length and its own voice/sound: no stretching, so lips stay in sync.
+                ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
+            else:
+                ctx.call(self.ff.fit_clip, raw, fit, sh.duration, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
             fitted.append(fit)
             if hybrid:
                 # Every shot except the last also carries a short tail, so shots can be crossfaded together.
@@ -334,6 +376,13 @@ class SceneRenderer:
 
         # ---------------------------------------------------------- 6. mix
         ctx.checkpoint()
+        if model_audio:
+            ctx.stage(STAGE_ASSEMBLE, 0.93, "Joining shots")
+            self.ff.concatenate_videos(fitted, final_path, "aac")
+            total = self.ff.get_duration(final_path)
+            ctx.stage(STAGE_ASSEMBLE, 1.0, "Scene done")
+            return SceneResult(final_path, wide_path, total, len(shots), reused)
+
         ctx.stage(STAGE_ASSEMBLE, 0.93, "Mixing audio and picture")
         wav = os.path.join(scene_dir, "voices.wav")
         self.ff.build_audio_track(

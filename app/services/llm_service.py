@@ -127,7 +127,7 @@ class LLMService:
                     "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - subject(s), action, setting, time of day, lighting and camera framing (e.g. wide shot / medium shot). Sent directly to the image generator, so it must make sense on its own.",
                     "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here.",
                     "characters_present": ["Name1", "Name2"],
-                    "motion_prompt": "Gentle, concrete camera and subject movement for a few seconds, e.g. 'slow push-in while the boy lowers his head'. Avoid fast or dramatic motion.",
+                    "motion_prompt": "Cinematic camera direction plus what the people DO, for a few seconds, like a real film: e.g. 'slow dolly-in on the boy as he lowers his head, then a handheld pan to the door' or 'tracking shot following her down the corridor'. Vary the camera from scene to scene (push-in, tracking, pan, handheld, low angle).",
                     "sound_design": "The background sounds and effects you would HEAR here - 6 to 14 words, no speech, no music. e.g. 'distant gunfire, helicopter overhead, running footsteps' or 'light wind, birds, far-off market chatter'.",
                     "duration_seconds": 5
                 }}

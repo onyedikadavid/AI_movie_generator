@@ -51,6 +51,9 @@ class Project(Base):
     requested_genre = Column(String, nullable=True)
     requested_tone = Column(String, nullable=True)
     requested_visual_style = Column(String, nullable=True)
+    # How the scenes are made: "i2v" = draw a keyframe with the image model, then animate it;
+    # "t2v" = text-to-video straight from the prompt (no image model). NULL = the server default (VIDEO_MODE).
+    video_mode = Column(String, nullable=True)
 
     status = Column(Enum(ProjectStatus), default=ProjectStatus.CREATED)
     error_message = Column(Text, nullable=True)

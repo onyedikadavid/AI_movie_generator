@@ -143,8 +143,10 @@ class VideoGenerationService:
         prompt: str,
         duration: float,
         seed: int = None,
+        want_audio: bool = False,
     ) -> str:
-        """Image-to-video: render one short clip (<= ~5 s) that starts from `image_path`."""
+        """Image-to-video: render one short clip (<= ~5 s) that starts from `image_path`.
+        want_audio=True also returns the model's own sound (its voices + effects) inside the mp4."""
         if not os.path.exists(image_path):
             raise RuntimeError(f"Keyframe image not found at {image_path}; cannot generate video.")
         data = {
@@ -152,6 +154,7 @@ class VideoGenerationService:
             "text_cue": "",
             "duration": f"{max(1.0, float(duration)):.2f}",
             "fps": str(settings.VIDEO_FPS),
+            "with_audio": "1" if want_audio else "",
         }
         if seed is not None:
             data["seed"] = str(int(seed))
@@ -162,16 +165,20 @@ class VideoGenerationService:
         atomic_write(output_path, self._post(data, files, image_bytes))
         return output_path
 
-    def generate_text_clip(self, prompt: str, output_path: str, duration: float, seed: int = None) -> str:
-        """Text-to-video: render one short clip from the prompt alone (no start image)."""
+    def generate_text_clip(self, prompt: str, output_path: str, duration: float, seed: int = None,
+                           want_audio: bool = None) -> str:
+        """Text-to-video: render one short clip from the prompt alone (no start image).
+        want_audio=None -> follow AUDIO_MODE (the model's sound is wanted in 'hybrid' and 'model' modes)."""
+        if want_audio is None:
+            want_audio = (settings.AUDIO_MODE or "").lower() in ("hybrid", "model")
         try:
             width, height = (int(v) for v in settings.VIDEO_T2V_RESOLUTION.lower().split("x"))
         except Exception:  # noqa: BLE001
             width, height = 960, 544
         data = {
             "mode": "t2v",
-            # Ask the server to include the model's own background sound (the pipeline mixes it with the voices).
-            "with_audio": "1" if (settings.AUDIO_MODE or "").lower() == "hybrid" else "",
+            # Ask the server to include the model's own sound (background only in 'hybrid', voices too in 'model').
+            "with_audio": "1" if want_audio else "",
             "motion_prompt": prompt,
             "duration": f"{max(1.0, float(duration)):.2f}",
             "fps": str(settings.VIDEO_FPS),

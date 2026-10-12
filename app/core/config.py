@@ -149,10 +149,15 @@ class Settings(BaseSettings):
     # Sound: "voices" = only the pipeline's character/narrator voices;
     #        "hybrid" = voices + the video model's own background sound/effects (text-to-video LTX-2.x only),
     #        mixed underneath and automatically lowered while someone speaks.
-    AUDIO_MODE: str = "hybrid"
+    #        "model"  = (default) the video model speaks the lines ITSELF (LTX-2.3 makes voice + sound together with the
+    #                   picture, lips in sync) - no edge-tts at all. Works for both text-to-video and image-to-video.
+    AUDIO_MODE: str = "model"
+    # Model-voice mode: the longest spoken piece (words) put into ONE clip. A longer line is split at sentence
+    # ends into several clips, so the model never has to fit a whole paragraph into ~5 seconds.
+    MODEL_VOICE_MAX_WORDS: int = 9
     # Loudness of the model's background sound before ducking (1.0 = as generated).
     AMBIENCE_VOLUME: float = 0.55
-    # "i2v" / "t2v" - see below
+    # Default for projects that don't pick their own on the New Project / review screen: "i2v" or "t2v".
     VIDEO_MODE: str = "i2v"
     # Resolution requested from a text-to-video server (WxH, both divisible by 32).
     VIDEO_T2V_RESOLUTION: str = "960x544"
@@ -166,8 +171,10 @@ class Settings(BaseSettings):
     # Generate a dedicated close-up keyframe for each speaking character
     # (bigger, sharper faces -> far less "melting"). Turn off to render every
     # shot from the scene's wide keyframe instead (faster, lower quality).
-    # "static" = the camera never moves (most stable, recommended); "gentle" = slow, small camera moves.
-    VIDEO_CAMERA_MOTION: str = "static"
+    # Camera: "model" (default) = free, cinematic camera - the scene's own camera direction (or a rotating set of
+    # film moves) goes into the prompt and the video model decides how to move, like a normal movie.
+    # "gentle" = slow, small moves only; "static" = locked-off tripod shot (the old, stiff behaviour).
+    VIDEO_CAMERA_MOTION: str = "model"
     SHOT_COVERAGE: bool = True
     # Final export size and sharpening (0 disables sharpening).
     OUTPUT_WIDTH: int = 1280

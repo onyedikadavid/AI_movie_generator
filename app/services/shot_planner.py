@@ -122,6 +122,7 @@ def plan_shots(
     min_len: float = 1.6,
     max_shots: int = 5,
     hard_max_len: float = 6.2,
+    one_per_segment: bool = False,
 ) -> List[Shot]:
     """Partitions [0, total] into consecutive shots (no gaps, no overlaps).
 
@@ -134,10 +135,15 @@ def plan_shots(
     max_len = max(1.0, float(max_len))
     max_shots = max(1, int(max_shots))
 
-    groups = _group(_spans(segments, total, max_len), max_len, min_len)
+    if one_per_segment:
+        # Model-voice mode: every spoken line is its own clip (the model speaks it inside that clip), so lines
+        # are never merged into one shot or cut in half. Only long silent (ambient) stretches are split.
+        groups = [[sp] for sp in _spans(segments, total, hard_max_len - 1.2)]
+    else:
+        groups = _group(_spans(segments, total, max_len), max_len, min_len)
     # Too many shots for the budget: lengthen them until it fits.
     attempts = 0
-    while len(groups) > max_shots and attempts < 12:
+    while not one_per_segment and len(groups) > max_shots and attempts < 12:
         grown = max(max_len * 1.2, total / max_shots * 1.02)
         if grown > hard_max_len:
             max_len = max(max_len, hard_max_len)

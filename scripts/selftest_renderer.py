@@ -116,6 +116,9 @@ def main():
     from app.core.config import settings
 
     settings.NARRATOR_ENABLED = True   # the first checks cover the narrator-on path; narrator-off is tested below
+    # This file tests the classic edge-tts path (pipeline voices + locked camera); the new defaults
+    # (model voices + free camera) are covered by scripts/selftest_model_voice.py.
+    settings.AUDIO_MODE, settings.VIDEO_CAMERA_MOTION = "voices", "static"
     if not shutil.which("ffmpeg"):
         print("ffmpeg not found"); sys.exit(1)
     tmp = tempfile.mkdtemp()
@@ -229,7 +232,7 @@ def main():
             assert ff.has_audio(res5.final_path)
             results[label] = (audio_level(res5.final_path, 0.02, 0.28), v.text_requests)   # lead-in: nobody is speaking yet
         finally:
-            settings.VIDEO_MODE, settings.AUDIO_MODE = "i2v", "hybrid"
+            settings.VIDEO_MODE, settings.AUDIO_MODE = "i2v", "voices"
     hyb, vo, sil = results["hybrid"][0], results["voices-only"][0], results["hybrid-silent-clips"][0]
     assert hyb > 0.01, f"hybrid should have background sound in the pauses (got {hyb})"
     assert vo < 0.002 and sil < 0.002, (vo, sil)

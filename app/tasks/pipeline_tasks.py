@@ -27,7 +27,7 @@ from app.services.video_service import VideoGenerationService
 from app.services.tts_service import TTSService
 from app.services.ffmpeg_service import FFmpegService
 from app.services.scene_renderer import SceneRenderer
-from app.services.voice_service import VoiceCast, normalize_age_group, normalize_gender
+from app.services.voice_service import VoiceCast, normalize_age_group, normalize_gender, normalize_turn
 from app.services.media_storage import publish_file
 from app.services.style_presets import resolve_style
 
@@ -188,6 +188,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
 
     for sc in script_schema.scenes:
         turns = [t.model_dump() if hasattr(t, "model_dump") else t for t in (sc.dialogue_turns or [])]
+        turns = [t for t in (normalize_turn(t) for t in turns) if (t.get("text") or "").strip()]  # words only; actions -> `action`
         db.add(Scene(
             project_id=pid,
             scene_number=sc.scene_number,
@@ -312,7 +313,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
 
         sctx = _SceneCtx(db, project, scene, ctl, i, total)
         try:
-            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx)
+            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode)
         except RunStopped:
             safe_rollback(db)
             try:
@@ -332,7 +333,8 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
             raise
 
         scene.video_path = result.final_path
-        scene.audio_path = os.path.join(scene_dir, "voices.wav")
+        wav = os.path.join(scene_dir, "voices.wav")
+        scene.audio_path = wav if os.path.exists(wav) else None   # model-voice mode has no separate voice track
         scene.render_status = "DONE"
         project.progress_pct = int(((i + 1) / total) * 92)
         db.commit()

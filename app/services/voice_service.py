@@ -384,6 +384,145 @@ def limit_words(text: str, max_words: int = 40) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Dialogue text = ACTION + WORDS. Only the words may ever be spoken.
+#
+# Lines often arrive as  Irritated Tapping on the mixing board... "What's with this distortion?"
+# - the part before the quote is what the character DOES, the quoted part is what they SAY.
+# Speaking the whole string out loud is the bug this section fixes.
+# ---------------------------------------------------------------------------
+_OPEN_Q = '"“'
+_CLOSE_Q = '"”'
+_PERSONAL = re.compile(
+    r"\b(i|i'm|i've|i'll|i'd|me|my|mine|you|you're|your|we|we're|us|our|let's|don't|can't|won't|didn't|isn't)\b",
+    re.IGNORECASE,
+)
+_SPLIT_AT = re.compile(r"\s*(?:\.\.\.|…|\s[-–—]\s|:)\s*")
+DEFAULT_ACTIONS = {"", "neutral", "gesturing while speaking", "stands attentively"}
+
+
+def _looks_like_action(prefix: str) -> bool:
+    """True for stage-direction-ish openers such as 'Frustrated Fiddling with the gain'."""
+    words = re.findall(r"[A-Za-z']+", prefix)
+    if not (2 <= len(words) <= 10) or _PERSONAL.search(prefix):
+        return False
+    ing_at = next((i for i, w in enumerate(words) if len(w) > 4 and w.lower().endswith("ing")), None)
+    if ing_at is None or ing_at > 2:
+        return False
+    first = words[0].lower()
+    return len(words) >= 4 or first.endswith(("ed", "ly")) or ing_at == 1
+
+
+def split_dialogue(text: str):
+    """Returns (action, speech). `speech` is only what the character says out loud; `action` is whatever
+    stage direction was mixed into the line (may be '')."""
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if not t:
+        return "", ""
+
+    # 1. Quoted speech. A missing closing quote means "speech runs to the end".
+    first = next((i for i, ch in enumerate(t) if ch in _OPEN_Q), None)
+    if first is not None:
+        action_parts, speech_parts, pos = [], [], 0
+        while True:
+            start = next((i for i in range(pos, len(t)) if t[i] in _OPEN_Q), None)
+            if start is None:
+                action_parts.append(t[pos:])
+                break
+            action_parts.append(t[pos:start])
+            end = next((i for i in range(start + 1, len(t)) if t[i] in _CLOSE_Q), None)
+            if end is None:
+                speech_parts.append(t[start + 1:])
+                break
+            speech_parts.append(t[start + 1:end])
+            pos = end + 1
+        speech = re.sub(r"\s+", " ", " ".join(p.strip() for p in speech_parts if p.strip())).strip()
+        action = re.sub(r"\s+", " ", " ".join(a.strip() for a in action_parts if a.strip())).strip()
+        action = action.strip(" .,:;-…–—")
+        return action, speech
+
+    # 2. No quotes: a leading stage direction followed by '...' / ':' / ' - ' and then the words.
+    m = _SPLIT_AT.search(t)
+    if m and m.start() > 0:
+        prefix, rest = t[:m.start()], t[m.end():]
+        if rest.strip() and _looks_like_action(prefix):
+            return prefix.strip(" .,:;-"), rest.strip()
+    return "", t
+
+
+def merge_actions(existing: str, extracted: str) -> str:
+    existing, extracted = (existing or "").strip(), (extracted or "").strip()
+    if not extracted:
+        return existing
+    if (existing.lower() in DEFAULT_ACTIONS) or existing.lower() == extracted.lower():
+        return extracted
+    return f"{existing}; {extracted}"
+
+
+def normalize_turn(turn: dict) -> dict:
+    """A dialogue turn with the stage direction moved into `action`, so `text` holds spoken words only."""
+    out = dict(turn)
+    action, speech = split_dialogue(out.get("text", ""))
+    if action or speech != (out.get("text") or "").strip():
+        out["text"] = speech
+        out["action"] = merge_actions(out.get("action", ""), action)
+    return out
+
+
+# Speech pace of the video model's own voices (words per second) - used to size clips before they exist.
+_WORDS_PER_SECOND = 2.5
+
+
+def estimate_speech_seconds(text: str) -> float:
+    words = len((text or "").split())
+    pauses = sum(text.count(c) for c in ",;:") * 0.10 + sum(text.count(c) for c in ".!?") * 0.22 if text else 0.0
+    return round(max(0.8, words / _WORDS_PER_SECOND + pauses + 0.25), 2)
+
+
+def chunk_speech(text: str, max_words: int = 10) -> List[str]:
+    """Splits a line at sentence / clause ends into pieces of at most `max_words` words, so each piece fits
+    in ONE short video clip and the model never has to speak half a sentence. A clause that is still too long
+    is cut into equal parts (ending in a comma, so the voice carries on rather than stopping)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text.split()) <= max_words:
+        return [text]
+    atoms: List[str] = []
+    for sentence in re.findall(r"[^.!?\u2026]+(?:[.!?\u2026]+|$)", text):
+        for clause in re.split(r"(?<=[,;:])\s+", sentence.strip()):
+            words = clause.split()
+            if not words:
+                continue
+            if len(words) > max_words:
+                n = -(-len(words) // max_words)
+                size = -(-len(words) // n)
+                parts = [words[i:i + size] for i in range(0, len(words), size)]
+                for j, pw in enumerate(parts):
+                    tail = "," if j < len(parts) - 1 and pw[-1][-1] not in ",;:.!?\u2026" else ""
+                    atoms.append(" ".join(pw) + tail)
+            else:
+                atoms.append(" ".join(words))
+    chunks: List[str] = []
+    for a in atoms:
+        if chunks and len((chunks[-1] + " " + a).split()) <= max_words:
+            chunks[-1] += " " + a
+        else:
+            chunks.append(a)
+    out: List[str] = []
+    for i, c in enumerate(chunks):
+        c = c.strip()
+        if i == len(chunks) - 1:
+            c = c.rstrip(",;:- ")
+            if c and c[-1] not in ".!?\u2026":
+                c += "."
+        elif c and c[-1] not in ",;:.!?\u2026":
+            c += ","
+        if c:
+            out.append(c)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # VoiceCast: one object per project render that answers "who sounds like what"
 # ---------------------------------------------------------------------------
 class VoiceCast:
@@ -430,6 +569,21 @@ class VoiceCast:
         if is_narrator(speaker):
             return narrator_profile(self.region, self.narrator_voice, expression)
         return profile_for(self.member_for(speaker), expression, action)
+
+    def voice_description(self, speaker: str) -> str:
+        """Plain-English description of a speaker's voice, written into the video prompt so the video model's
+        own voices stay consistent (same gender / age / accent) from shot to shot."""
+        accent = {"ng": "a Nigerian accent", "gb": "a British accent", "us": "an American accent"}.get(self.region, "a clear accent")
+        if is_narrator(speaker):
+            return f"a calm, deep, steady male narrator voice with {accent}"
+        m = self.member_for(speaker)
+        male = m.gender == "male"
+        who = {
+            "child": "a young boy's" if male else "a young girl's",
+            "teen": "a teenage boy's" if male else "a teenage girl's",
+            "elder": "an elderly man's" if male else "an elderly woman's",
+        }.get(m.age_group, "an adult male" if male else "an adult female")
+        return f"{who} voice with {accent}"
 
     def signature(self) -> str:
         """Changes whenever anybody's voice assignment changes (used to decide
