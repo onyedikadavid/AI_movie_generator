@@ -92,7 +92,7 @@ class SceneRenderer:
         chosen = [c for c in characters if c.name.strip().lower() in present]
         return chosen or list(characters)
 
-    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str) -> str:
+    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str, narrator: bool = False) -> str:
         blob = json.dumps(
             {
                 "v": 5,
@@ -112,7 +112,7 @@ class SceneRenderer:
                 "camera": settings.VIDEO_CAMERA_MOTION,
                 "interp": settings.VIDEO_INTERPOLATE,
                 "mode": video_mode,
-                "narrator": bool(settings.NARRATOR_ENABLED),
+                "narrator": bool(narrator),
                 "scenemode": [settings.SCENE_MODE, settings.WHOLE_SCENE_MAX_SECONDS],
                 "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None), settings.MODEL_VOICE_MAX_WORDS],
                 "t2vres": settings.VIDEO_T2V_RESOLUTION,
@@ -138,14 +138,14 @@ class SceneRenderer:
             f.write(fingerprint)
         return reusable
 
-    def _segments(self, scene, cast: VoiceCast, model_audio: bool = False) -> List[Segment]:
+    def _segments(self, scene, cast: VoiceCast, model_audio: bool = False, narrator: bool = False) -> List[Segment]:
         # Each line is first split into ACTION (performed on screen) and WORDS (the only thing ever spoken).
         turns = []
         for raw in (scene.dialogue_turns or []):
             t = normalize_turn(raw)
             if clean_for_tts(t.get("text", ""), t.get("speaker", "")):
                 turns.append(t)
-        narrator_on = bool(settings.NARRATOR_ENABLED)
+        narrator_on = bool(narrator)
         if not narrator_on:
             # Characters only: nothing is spoken by a narrator, not even lines the script labelled "Narrator".
             turns = [t for t in turns if not is_narrator((t.get("speaker") or "").strip())]
@@ -210,13 +210,42 @@ class SceneRenderer:
             parts.append(cur)
         return parts
 
+    @staticmethod
+    def _fit_to_clip(spoken: List[Segment], cap: float, scene_number) -> None:
+        """One clip must hold the whole scene: shorten the lines (each keeps its start) until they fit."""
+        def need() -> float:
+            return sum(sg.duration + 0.5 for sg in spoken) + 0.8
+        ratio = 1.0
+        original = need()
+        while spoken and need() > cap and ratio > 0.2:
+            ratio -= 0.1
+            for sg in spoken:
+                words = len(sg.text.split())
+                sg.text = limit_words(sg.text, max(3, int(words * ratio)))
+                sg.duration = estimate_speech_seconds(sg.text)
+        if spoken and abs(need() - original) > 0.01:
+            logger.warning("Scene %s: the dialogue (%.1f s) is longer than one %.1f s clip, so lines were shortened to "
+                           "fit. Shorten the lines in the editor, or raise LTX_MAX_FRAMES / WHOLE_SCENE_MAX_SECONDS.",
+                           scene_number, original, cap)
+
     def _render_whole(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, mode,
                       on_screen, may_reuse, final_path):
         """One clip per scene (or per `WHOLE_SCENE_MAX_SECONDS` piece of a long one). Returns None when the server
         could only render a fraction of the requested length, so the caller can use the shot-by-shot path."""
         W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
         cap = float(settings.WHOLE_SCENE_MAX_SECONDS)
-        parts = self._whole_parts(segments, cap) or [[]]
+        server_cap = getattr(self.video, "server_max_seconds", lambda: None)()
+        if server_cap and server_cap < cap:
+            logger.warning("Scene %s: the video server only makes %.1f s clips (LTX_MAX_FRAMES), below "
+                           "WHOLE_SCENE_MAX_SECONDS=%.0f. Raise LTX_MAX_FRAMES in the Kaggle launch cell for longer scenes.",
+                           scene.scene_number, server_cap, cap)
+            cap = server_cap
+        spoken = [sg for sg in segments if sg.kind != "ambient"]
+        if settings.WHOLE_SCENE_SPLIT:
+            parts = self._whole_parts(segments, cap) or [[]]
+        else:
+            self._fit_to_clip(spoken, cap, scene.scene_number)
+            parts = [spoken]
         t2v = mode == "t2v"
         wide_path = os.path.join(scene_dir, "keyframe.png")
         ctx.stage(STAGE_AUDIO, 0.05, "Preparing the scene")
@@ -267,10 +296,13 @@ class SceneRenderer:
                     ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed, True)
                 got = self.ff.get_duration(raw)
                 if got < 0.8 * request_len:
-                    for f in (raw, key_file):
-                        if os.path.exists(f):
-                            os.remove(f)
-                    return None
+                    if settings.WHOLE_SCENE_FALLBACK:
+                        for f in (raw, key_file):
+                            if os.path.exists(f):
+                                os.remove(f)
+                        return None
+                    logger.warning("Scene %s: asked for %.1f s but the server returned %.1f s (GPU memory). Keeping it; "
+                                   "lower VIDEO_T2V_RESOLUTION or WHOLE_SCENE_MAX_SECONDS.", scene.scene_number, request_len, got)
                 with open(key_file, "w") as fh:
                     fh.write(key)
             if n == 0 and t2v and not _nonempty(wide_path):
@@ -299,6 +331,7 @@ class SceneRenderer:
         project_id: str,
         ctx,
         video_mode: Optional[str] = None,
+        narrator: Optional[bool] = None,
     ) -> SceneResult:
         """video_mode: "i2v" (draw a keyframe with the image model, then animate it) or "t2v" (text-to-video, no
         image model). None = the server-wide default (settings.VIDEO_MODE)."""
@@ -308,8 +341,9 @@ class SceneRenderer:
         mode = "t2v" if mode == "t2v" else "i2v"
         model_audio = (settings.AUDIO_MODE or "voices").strip().lower() == "model"
         free_cam = pb.is_free_camera(settings.VIDEO_CAMERA_MOTION)
+        narrator = bool(settings.NARRATOR_ENABLED if narrator is None else narrator)   # per-project choice wins
 
-        fp = self._fingerprint(scene, characters, style, cast, mode)
+        fp = self._fingerprint(scene, characters, style, cast, mode, narrator)
         may_reuse = self._prepare_dir(scene_dir, fp)
         final_path = os.path.join(scene_dir, "scene_final.mp4")
         if may_reuse and _nonempty(final_path):
@@ -318,7 +352,7 @@ class SceneRenderer:
             return SceneResult(final_path, wide, total, 0, 0)
 
         on_screen = self._characters_on_screen(scene, characters)
-        segments = self._segments(scene, cast, model_audio)
+        segments = self._segments(scene, cast, model_audio, narrator)
 
         # ---------------------------------------------------------- 1. voices
         ctx.stage(STAGE_AUDIO, 0.02, "Preparing the lines" if model_audio else "Recording voices")

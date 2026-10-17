@@ -162,19 +162,49 @@ def main():
         assert len(reqs) == n, "finished scene is reused"
         print("OK whole scene (%s): 1 generation, %.1fs, lines in order" % (mode, res.duration))
         print("   prompt:", pr[:420])
-    # a scene longer than the cap is split at line boundaries, not mid-line
+    # DEFAULT: a scene longer than the cap is still ONE generation - the lines are shortened to fit
     big = scene(); big.dialogue_turns = [{"speaker": "Kobi", "text": "This is line number %d, and it has a handful of words in it." % i, "action": "pacing"} for i in range(8)]
     vid = FakeModelVideo(); vid.cap = 289
     settings.WHOLE_SCENE_MAX_SECONDS = 12.0
     res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(big, chars, "Cinematic", cast, os.path.join(tmp, "big"), "p1", FakeCtx(), video_mode="t2v")
-    assert 2 <= len(vid.t2v) <= 8 and all(d_ <= 12.01 for _, d_, _ in vid.t2v), [(round(d_, 1)) for _, d_, _ in vid.t2v]
-    print("OK long scene -> %d pieces of <= 12 s" % len(vid.t2v))
-    # server could only make 5 s of the 10 s asked (GPU memory) -> falls back to shots instead of losing lines
+    assert len(vid.t2v) == 1 and vid.t2v[0][1] <= 12.01, [(round(d_, 1)) for _, d_, _ in vid.t2v]
+    print("OK long scene -> still ONE generation of %.1f s (lines shortened to fit)" % vid.t2v[0][1])
+    # a server that only makes 2.7 s clips is respected (asked via /health) - still one generation
+    class Limited(FakeModelVideo):
+        def server_max_seconds(self):
+            return 64 / 24.0
+    vid = Limited(); vid.cap = 65
+    res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(scene(), chars, "Cinematic", cast, os.path.join(tmp, "lim"), "p1", FakeCtx(), video_mode="t2v")
+    assert len(vid.t2v) == 1 and vid.t2v[0][1] <= 2.7, vid.t2v[0][1]
+    print("OK server limit 2.7 s -> one generation of %.1f s" % vid.t2v[0][1])
+    # optional: allow splitting
+    settings.WHOLE_SCENE_SPLIT = True
+    vid = FakeModelVideo(); vid.cap = 289
+    settings.WHOLE_SCENE_MAX_SECONDS = 12.0
+    SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(big, chars, "Cinematic", cast, os.path.join(tmp, "split"), "p1", FakeCtx(), video_mode="t2v")
+    assert 2 <= len(vid.t2v) <= 8 and all(d_ <= 12.01 for _, d_, _ in vid.t2v)
+    print("OK WHOLE_SCENE_SPLIT=true -> %d pieces of <= 12 s" % len(vid.t2v))
+    settings.WHOLE_SCENE_SPLIT = False
+    # truncated clip: kept by default (never generate twice); fallback to shots only if asked
     settings.WHOLE_SCENE_MAX_SECONDS = 30.0
+    vid = FakeModelVideo(); vid.cap = 121
+    res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(scene(), chars, "Cinematic", cast, os.path.join(tmp, "keep"), "p1", FakeCtx(), video_mode="t2v")
+    assert len(vid.t2v) == 1 and res.shots == 1
+    settings.WHOLE_SCENE_FALLBACK = True
     vid = FakeModelVideo(); vid.cap = 121
     res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(scene(), chars, "Cinematic", cast, os.path.join(tmp, "fb"), "p1", FakeCtx(), video_mode="t2v")
     assert res.shots >= 3 and ff.has_audio(res.final_path), "fallback to shots"
-    print("OK truncated whole clip -> automatic fallback to %d shots" % res.shots)
+    settings.WHOLE_SCENE_FALLBACK = False
+    print("OK truncated clip kept by default; WHOLE_SCENE_FALLBACK=true redoes it as %d shots" % res.shots)
+    # per-project narrator switch (overrides .env both ways)
+    for nar in (True, False):
+        settings.NARRATOR_ENABLED = not nar
+        vid = FakeModelVideo(); vid.cap = 721
+        SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(scene(), chars, "Cinematic", cast, os.path.join(tmp, "nar%s" % nar), "p1", FakeCtx(), video_mode="t2v", narrator=nar)
+        has = "off-screen narrator" in vid.t2v[0][0].lower() or "narrator says" in vid.t2v[0][0].lower()
+        assert has == nar, (nar, vid.t2v[0][0][:600])
+    settings.NARRATOR_ENABLED = False
+    print("OK narrator on/off comes from the project, not .env")
     settings.SCENE_MODE = "shots"
 
     print("\nALL MODEL-VOICE CHECKS PASSED")

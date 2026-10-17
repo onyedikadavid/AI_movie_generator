@@ -1,17 +1,21 @@
 ## One clip per scene (SCENE_MODE=whole)
 
-Default is `SCENE_MODE=shots` (a scene = several short clips joined). To generate each scene in one go instead, set in `.env`:
-
     AUDIO_MODE=model
     SCENE_MODE=whole
     WHOLE_SCENE_MAX_SECONDS=10
 
-and in the Kaggle launch cell set `os.environ["LTX_MAX_FRAMES"] = "241"` (24 fps, 8k+1 frames: 121 = 5 s, 241 = 10 s, 361 = 15 s).
-The whole scene goes into one prompt (place, cast, every action and quoted line in order, camera direction). A scene longer
-than WHOLE_SCENE_MAX_SECONDS is split between lines into the fewest pieces. If the server could only render part of the
-requested length (GPU out of memory), that scene automatically falls back to shots, so no line is lost.
-Finished clips are cached per exact prompt (`whole_N_raw.mp4.key`), so a restart never re-renders a finished clip.
-Narration limit: `MODEL_NARRATION_WORDS` (x3 in whole mode).
+Each scene is ONE generation: one prompt with the place, cast, every action and quoted line in order, and a moving camera.
+- The backend asks the Kaggle server for its real limit (`max_frames` on /health) and never asks for more. Set
+  `LTX_MAX_FRAMES` in the Kaggle launch cell: 121 = ~5 s, 241 = ~10 s, 361 = ~15 s (needs the v4 notebook).
+- If the dialogue is longer than the clip can hold, the lines are shortened (a warning in the worker log says so).
+  `WHOLE_SCENE_SPLIT=true` allows splitting a long scene between lines instead.
+- A clip the server returned shorter than asked (GPU memory) is kept; `WHOLE_SCENE_FALLBACK=true` redoes it shot by shot.
+- Finished clips are cached per exact prompt (`whole_N_raw.mp4.key`).
+
+## Narrator on/off
+
+Now a per-project switch (New Project screen and the review screen). `NARRATOR_ENABLED` in .env is only the default
+for projects that never touched it. Switching it re-renders the scenes on the next run.
 
 ## Model voices, free camera, and the image-vs-text switch
 

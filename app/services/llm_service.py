@@ -64,6 +64,7 @@ class LLMService:
         genre_hint: str = None,
         tone_hint: str = None,
         visual_style_hint: str = None,
+        narrator: bool = None,
     ) -> ScriptDecompositionSchema:
         """
         Generates full script breakdown utilizing AgentService for character interactions.
@@ -183,7 +184,8 @@ class LLMService:
                 # A single person on screen. With a narrator, the narrator carries the scene; without one,
                 # that character speaks out loud so the scene isn't silent.
                 solo = present[0] if len(present) == 1 else (characters[0] if len(characters) == 1 else None)
-                if solo is not None and not settings.NARRATOR_ENABLED:
+                # Written whether or not a narrator is on, so switching the narrator off later never leaves a silent scene.
+                if solo is not None:
                     try:
                         scene["dialogue_turns"] = await self.agent_service.simulate_monologue(solo, goal, lines=2, kids=kids)
                     except Exception as e:  # noqa: BLE001

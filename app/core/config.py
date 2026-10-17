@@ -168,6 +168,12 @@ class Settings(BaseSettings):
     # 241 = ~10 s, 361 = 15 s). Generation time and GPU memory grow quickly with length.
     SCENE_MODE: str = "shots"
     WHOLE_SCENE_MAX_SECONDS: float = 10.0
+    # False (default) = exactly ONE clip per scene: if the dialogue is longer than fits, the lines are shortened.
+    # True = a long scene may be split between lines into several clips.
+    WHOLE_SCENE_SPLIT: bool = False
+    # What to do if the server returns less than 80% of the requested length (GPU memory): False = keep it (never
+    # generate a scene twice), True = redo that scene shot by shot.
+    WHOLE_SCENE_FALLBACK: bool = False
     # Loudness of the model's background sound before ducking (1.0 = as generated).
     AMBIENCE_VOLUME: float = 0.55
     # Default for projects that don't pick their own on the New Project / review screen: "i2v" or "t2v".

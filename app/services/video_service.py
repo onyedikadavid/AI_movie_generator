@@ -56,6 +56,28 @@ class VideoGenerationService:
             h.update(hashlib.sha1(image_bytes).digest())
         return h.hexdigest()
 
+    _limit_cache = (0.0, None)
+
+    def server_max_seconds(self):
+        """Longest clip the video server will really make (it reports max_frames on /health), or None if it
+        can't be asked. Used so a scene is planned to fit ONE clip instead of being cut off by the server."""
+        at, val = VideoGenerationService._limit_cache
+        if time.time() - at < 60:
+            return val
+        val = None
+        try:
+            url = resolve_url(KEY_WAN_API_URL, settings.WAN_API_URL)
+            base = url.split("/v1/")[0].rstrip("/")
+            resp = self._send("get", base + "/health", timeout=httpx.Timeout(20.0, connect=10.0), attempts=1)
+            info = resp.json()
+            frames, fps = int(info.get("max_frames") or 0), int(info.get("fps") or 24)
+            if frames > 8:
+                val = (frames - 1) / float(fps)
+        except Exception as e:  # noqa: BLE001 - an older server has no max_frames; just don't plan around it
+            logger.info("Could not read the video server's clip limit (%s).", e)
+        VideoGenerationService._limit_cache = (time.time(), val)
+        return val
+
     def _post(self, data: dict, files=None, image_bytes: bytes = None) -> bytes:
         """Ask the video server for one clip; returns the MP4 bytes."""
         # Resolved fresh on every call - picks up a restarted notebook's new URL.

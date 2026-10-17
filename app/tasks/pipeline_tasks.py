@@ -287,8 +287,10 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     )
     if cast.write_back(characters):
         db.commit()
-    logger.info("Settings in effect: AUDIO_MODE=%s | VIDEO_CAMERA_MOTION=%s | video mode=%s",
-                settings.AUDIO_MODE, settings.VIDEO_CAMERA_MOTION, project.video_mode or settings.VIDEO_MODE)
+    logger.info("Settings in effect: AUDIO_MODE=%s | SCENE_MODE=%s (max %ss) | CAMERA=%s | video mode=%s | narrator=%s",
+                settings.AUDIO_MODE, settings.SCENE_MODE, settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
+                project.video_mode or settings.VIDEO_MODE,
+                project.narrator_enabled if project.narrator_enabled is not None else settings.NARRATOR_ENABLED)
     if (settings.AUDIO_MODE or "").strip().lower() != "model":
         logger.warning("AUDIO_MODE is '%s', so edge-tts voices are used. Set AUDIO_MODE=model in .env (and restart the "
                        "worker) to use the video model's own voices.", settings.AUDIO_MODE)
@@ -318,7 +320,8 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
 
         sctx = _SceneCtx(db, project, scene, ctl, i, total)
         try:
-            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode)
+            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode,
+                                     narrator=project.narrator_enabled)
         except RunStopped:
             safe_rollback(db)
             try:

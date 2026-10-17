@@ -50,6 +50,8 @@ def _project_out(db, p: Project, model=ProjectResponse):
     item = model.model_validate(p)
     if hasattr(item, "video_mode") and item.video_mode is None:
         item.video_mode = normalize_video_mode(settings.VIDEO_MODE) or "i2v"   # show the mode that will really be used
+    if hasattr(item, "narrator_enabled") and item.narrator_enabled is None:
+        item.narrator_enabled = bool(settings.NARRATOR_ENABLED)   # show what will really happen
     if p.status.value in ("QUEUED", "CREATED"):
         order = rc.queued_ids_in_order(db)
         if p.id in order:
@@ -64,6 +66,7 @@ async def create_project(
     tone: Optional[str] = Form(None),
     visual_style: Optional[str] = Form(None),
     video_mode: Optional[str] = Form(None),
+    narrator_enabled: Optional[bool] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -81,6 +84,7 @@ async def create_project(
         requested_tone=tone or None,
         requested_visual_style=visual_style or None,
         video_mode=normalize_video_mode(video_mode),
+        narrator_enabled=narrator_enabled,
     )
     db.add(new_project)
     await db.commit()
@@ -268,6 +272,13 @@ async def update_project_settings(project_id: str, payload: ProjectSettingsUpdat
             raise HTTPException(status_code=422, detail="video_mode must be 'i2v' (image first) or 't2v' (text-to-video).")
         if mode != project.video_mode:
             project.video_mode = mode
+            scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id))).scalars().all()
+            for sc in scenes:
+                if sc.render_status == "DONE":
+                    sc.render_status = "PENDING"
+    if "narrator_enabled" in changes and changes["narrator_enabled"] is not None:
+        if bool(changes["narrator_enabled"]) != bool(project.narrator_enabled if project.narrator_enabled is not None else settings.NARRATOR_ENABLED):
+            project.narrator_enabled = bool(changes["narrator_enabled"])
             scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id))).scalars().all()
             for sc in scenes:
                 if sc.render_status == "DONE":

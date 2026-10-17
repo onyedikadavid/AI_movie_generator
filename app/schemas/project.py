@@ -26,11 +26,14 @@ class ProjectCreate(BaseModel):
     visual_style: Optional[str] = None
     # "i2v" (image model first, then animate) or "t2v" (text-to-video). None = server default.
     video_mode: Optional[str] = None
+    # True/False = narrator voice-over on/off for this project. None = server default.
+    narrator_enabled: Optional[bool] = None
 
 
 class ProjectSettingsUpdate(BaseModel):
     """Per-project generation settings, editable on the review screen before (re)generating."""
     video_mode: Optional[str] = None
+    narrator_enabled: Optional[bool] = None
 
 
 class RunState(BaseModel):
@@ -70,6 +73,7 @@ class ProjectResponse(RunState):
     raw_prompt: Optional[str]
     final_video_path: Optional[str]
     video_mode: Optional[str] = None
+    narrator_enabled: Optional[bool] = None
     created_at: datetime
 
     class Config:
