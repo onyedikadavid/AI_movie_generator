@@ -154,7 +154,20 @@ class Settings(BaseSettings):
     AUDIO_MODE: str = "model"
     # Model-voice mode: the longest spoken piece (words) put into ONE clip. A longer line is split at sentence
     # ends into several clips, so the model never has to fit a whole paragraph into ~5 seconds.
-    MODEL_VOICE_MAX_WORDS: int = 9
+    MODEL_VOICE_MAX_WORDS: int = 10
+    # Model-voice mode: narrator voice-over is kept to this many words per scene (one clip) when the scene also has
+    # character dialogue (twice this when it has none). Every extra narration chunk is a whole extra clip, and
+    # consecutive narration clips of the same place look like repeats of each other.
+    MODEL_NARRATION_WORDS: int = 10
+    # "shots"  = (default) a scene is cut into several short clips that are joined.
+    # "whole"  = needs AUDIO_MODE=model. The scene is generated as ONE clip: a single prompt that lists everything in
+    #            order (who does what, who says what, camera moves), then the next scene. If the scene is longer than
+    #            WHOLE_SCENE_MAX_SECONDS it is split into the fewest pieces at line boundaries. If the video server
+    #            could only render part of the requested length (GPU memory), the scene falls back to "shots".
+    # The video server must allow the length too: set LTX_MAX_FRAMES in the Kaggle launch cell (24 fps, 8k+1 frames:
+    # 241 = ~10 s, 361 = 15 s). Generation time and GPU memory grow quickly with length.
+    SCENE_MODE: str = "shots"
+    WHOLE_SCENE_MAX_SECONDS: float = 10.0
     # Loudness of the model's background sound before ducking (1.0 = as generated).
     AMBIENCE_VOLUME: float = 0.55
     # Default for projects that don't pick their own on the New Project / review screen: "i2v" or "t2v".

@@ -113,6 +113,7 @@ class SceneRenderer:
                 "interp": settings.VIDEO_INTERPOLATE,
                 "mode": video_mode,
                 "narrator": bool(settings.NARRATOR_ENABLED),
+                "scenemode": [settings.SCENE_MODE, settings.WHOLE_SCENE_MAX_SECONDS],
                 "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None), settings.MODEL_VOICE_MAX_WORDS],
                 "t2vres": settings.VIDEO_T2V_RESOLUTION,
             },
@@ -149,12 +150,14 @@ class SceneRenderer:
             # Characters only: nothing is spoken by a narrator, not even lines the script labelled "Narrator".
             turns = [t for t in turns if not is_narrator((t.get("speaker") or "").strip())]
         narration = clean_for_tts(scene.narration_text or "") if narrator_on else ""
+        whole = (settings.SCENE_MODE or "shots").strip().lower() == "whole"
+        chunk_words = 60 if whole else settings.MODEL_VOICE_MAX_WORDS   # whole scene: lines stay whole
         segments: List[Segment] = []
 
         def add(speaker: str, kind: str, text: str, expression: str = "", action: str = "") -> None:
             if model_audio:
                 # The video model speaks the line inside one clip: split long lines at sentence ends.
-                for n, piece in enumerate(chunk_speech(text, settings.MODEL_VOICE_MAX_WORDS) or [text]):
+                for n, piece in enumerate(chunk_speech(text, chunk_words) or [text]):
                     segments.append(Segment(index=len(segments), speaker=speaker, kind=kind, text=piece,
                                             expression=expression, action=action if n == 0 else ""))
             else:
@@ -162,7 +165,11 @@ class SceneRenderer:
                                         expression=expression, action=action))
 
         if narration:
-            add(NARRATOR_NAME, "narration", limit_words(narration, 22 if turns else 45))
+            if model_audio:
+                n_words = settings.MODEL_NARRATION_WORDS * (3 if whole else 1) * (1 if turns else 2)
+            else:
+                n_words = 22 if turns else 45
+            add(NARRATOR_NAME, "narration", limit_words(narration, n_words))
         for t in turns:
             speaker = (t.get("speaker") or "").strip() or "Character"
             if is_narrator(speaker):
@@ -183,6 +190,103 @@ class SceneRenderer:
             m = cast.member_for(name)
             member = next((c for c in characters if c.name.strip().lower() == m.name.strip().lower()), None)
         return member
+
+    # ------------------------------------------------------- whole-scene mode
+    def _whole_parts(self, segments: List[Segment], cap: float) -> List[List[Segment]]:
+        """Groups consecutive lines into the fewest pieces that each fit in `cap` seconds (a line is never cut)."""
+        parts: List[List[Segment]] = []
+        cur: List[Segment] = []
+        used = 0.0
+        for seg in segments:
+            if seg.kind == "ambient":
+                continue
+            need = seg.duration + 0.5
+            if cur and used + need > cap - 0.8:
+                parts.append(cur)
+                cur, used = [], 0.0
+            cur.append(seg)
+            used += need
+        if cur:
+            parts.append(cur)
+        return parts
+
+    def _render_whole(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, mode,
+                      on_screen, may_reuse, final_path):
+        """One clip per scene (or per `WHOLE_SCENE_MAX_SECONDS` piece of a long one). Returns None when the server
+        could only render a fraction of the requested length, so the caller can use the shot-by-shot path."""
+        W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
+        cap = float(settings.WHOLE_SCENE_MAX_SECONDS)
+        parts = self._whole_parts(segments, cap) or [[]]
+        t2v = mode == "t2v"
+        wide_path = os.path.join(scene_dir, "keyframe.png")
+        ctx.stage(STAGE_AUDIO, 0.05, "Preparing the scene")
+        source = None
+        if not t2v:
+            ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
+            if not (may_reuse and _nonempty(wide_path)):
+                ctx.checkpoint()
+                ctx.call(
+                    self.image.generate_image,
+                    pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
+                    wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"),
+                )
+            ctx.set_scene_image(wide_path)
+            source = wide_path
+        fitted: List[str] = []
+        reused = 0
+        for n, part in enumerate(parts):
+            ctx.checkpoint()
+            ctx.stage(STAGE_VIDEOS, 0.35 + 0.55 * n / len(parts), f"Generating the scene ({n + 1}/{len(parts)})")
+            beats = []
+            for seg in part:
+                member = self._character_for(seg.speaker, cast, characters) if seg.kind == "dialogue" else None
+                beats.append({
+                    "kind": seg.kind, "speaker": seg.speaker, "expression": seg.expression, "action": seg.action,
+                    "speech": seg.text, "voice_desc": cast.voice_description(seg.speaker),
+                })
+            talk = sum(sg.duration + 0.5 for sg in part)
+            request_len = min(max(talk + 0.8, 4.0), cap)
+            prompt = pb.whole_scene_prompt(
+                beats, on_screen, scene.location, scene.visual_description, style, scene.motion_prompt,
+                getattr(scene, "sound_design", None), start_image=bool(source and n > 0),
+            )
+            seed = _seed(project_id, scene.scene_number, "whole", n)
+            raw = os.path.join(scene_dir, f"whole_{n}_raw.mp4")
+            fit = os.path.join(scene_dir, f"whole_{n}.mp4")
+            key = hashlib.sha1(
+                f"whole|{mode}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(source or '')}".encode()
+            ).hexdigest()
+            key_file = raw + ".key"
+            stored = open(key_file).read().strip() if os.path.exists(key_file) else None
+            if may_reuse and _nonempty(raw) and stored == key:
+                reused += 1
+            else:
+                if t2v:
+                    ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed, True)
+                else:
+                    ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed, True)
+                got = self.ff.get_duration(raw)
+                if got < 0.8 * request_len:
+                    for f in (raw, key_file):
+                        if os.path.exists(f):
+                            os.remove(f)
+                    return None
+                with open(key_file, "w") as fh:
+                    fh.write(key)
+            if n == 0 and t2v and not _nonempty(wide_path):
+                ctx.call(self.ff.extract_frame, raw, wide_path)
+                ctx.set_scene_image(wide_path)
+            ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
+            fitted.append(fit)
+        ctx.checkpoint()
+        ctx.stage(STAGE_ASSEMBLE, 0.93, "Finishing the scene")
+        if len(fitted) == 1:
+            shutil.copyfile(fitted[0], final_path)
+        else:
+            self.ff.concatenate_videos(fitted, final_path, "aac")
+        total = self.ff.get_duration(final_path)
+        ctx.stage(STAGE_ASSEMBLE, 1.0, "Scene done")
+        return SceneResult(final_path, wide_path, total, len(fitted), reused)
 
     # ------------------------------------------------------------------ main
     def render(
@@ -253,6 +357,13 @@ class SceneRenderer:
             one_per_segment=model_audio,
         )
 
+        if model_audio and (settings.SCENE_MODE or "shots").strip().lower() == "whole":
+            whole = self._render_whole(scene, characters, style, cast, scene_dir, project_id, ctx,
+                                       segments, mode, on_screen, may_reuse, final_path)
+            if whole is not None:
+                return whole
+            logger.warning("Scene %s: whole-scene clip came back too short; falling back to shots.", scene.scene_number)
+
         t2v = mode == "t2v"
         # Hybrid sound = the video model's own background sound mixed under the pipeline's voices.
         hybrid = t2v and (settings.AUDIO_MODE or "voices").lower() == "hybrid" and not model_audio
@@ -318,45 +429,60 @@ class SceneRenderer:
             )
             raw = os.path.join(scene_dir, f"shot_{sh.index}_raw.mp4")
             fit = os.path.join(scene_dir, f"shot_{sh.index}.mp4")
-            if may_reuse and _nonempty(raw):
+            speech = sh.text if (model_audio and sh.kind in ("dialogue", "narration")) else ""
+            voice_desc = cast.voice_description(sh.speaker) if speech else ""
+            # Model voices need real room for the line plus a beat of breathing space; clips are capped by the server.
+            request_len = min(sh.duration + (0.8 if model_audio else 0.4), settings.VIDEO_MAX_CLIP_SECONDS)
+            if t2v:
+                member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
+                prompt = pb.text_video_prompt(
+                    sh.kind, sh.speaker, sh.expression, sh.action,
+                    getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
+                    on_screen, scene.location, scene.visual_description, style, sh.index,
+                    settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
+                    scene_motion=scene.motion_prompt, speech=speech, voice_desc=voice_desc, model_voice=model_audio,
+                )
+                # Same seed for the same character = the best-effort way to keep a similar face between shots.
+                seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
+                source = None
+            else:
+                source = keyframe_for_speaker.get(sh.speaker) or wide_path
+                prompt = pb.video_prompt(
+                    sh.kind, sh.speaker, sh.expression, sh.action,
+                    scene.motion_prompt, scene.visual_description, sh.index,
+                    settings.VIDEO_CAMERA_MOTION,
+                    speech=speech, voice_desc=voice_desc, sound_design=getattr(scene, "sound_design", None),
+                    model_voice=model_audio,
+                )
+                seed = _seed(project_id, scene.scene_number, sh.index, "clip")
+
+            # A finished clip is reused only if it was made from EXACTLY this request. (Reusing by shot number alone
+            # would put the wrong picture/speech in a slot whenever the shot plan shifts.) Clips from older versions
+            # have no key file and are kept as they are.
+            clip_key = hashlib.sha1(
+                f"{mode}|{model_audio}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(source or '')}".encode()
+            ).hexdigest()
+            key_file = raw + ".key"
+            stored_key = None
+            if os.path.exists(key_file):
+                try:
+                    stored_key = open(key_file).read().strip()
+                except OSError:
+                    stored_key = None
+            if may_reuse and _nonempty(raw) and (stored_key is None or stored_key == clip_key):
                 reused += 1
             else:
-                speech = sh.text if (model_audio and sh.kind in ("dialogue", "narration")) else ""
-                voice_desc = cast.voice_description(sh.speaker) if speech else ""
-                # Model voices need real room for the line plus a beat of breathing space; clips are capped by the server.
-                request_len = min(
-                    sh.duration + (0.8 if model_audio else 0.4), settings.VIDEO_MAX_CLIP_SECONDS
-                )
                 if t2v:
-                    member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
-                    prompt = pb.text_video_prompt(
-                        sh.kind, sh.speaker, sh.expression, sh.action,
-                        getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
-                        on_screen, scene.location, scene.visual_description, style, sh.index,
-                        settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
-                        scene_motion=scene.motion_prompt, speech=speech, voice_desc=voice_desc, model_voice=model_audio,
-                    )
-                    # Same seed for the same character = the best-effort way to keep a similar face between shots.
-                    seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
                     if model_audio:
                         ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed, True)
                     else:
                         ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed)
+                elif model_audio:
+                    ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed, True)
                 else:
-                    source = keyframe_for_speaker.get(sh.speaker) or wide_path
-                    prompt = pb.video_prompt(
-                        sh.kind, sh.speaker, sh.expression, sh.action,
-                        scene.motion_prompt, scene.visual_description, sh.index,
-                        settings.VIDEO_CAMERA_MOTION,
-                        speech=speech, voice_desc=voice_desc, sound_design=getattr(scene, "sound_design", None),
-                        model_voice=model_audio,
-                    )
-                    if model_audio:
-                        ctx.call(self.video.generate_clip, source, raw, prompt, request_len,
-                                 _seed(project_id, scene.scene_number, sh.index, "clip"), True)
-                    else:
-                        ctx.call(self.video.generate_clip, source, raw, prompt, request_len,
-                                 _seed(project_id, scene.scene_number, sh.index, "clip"))
+                    ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed)
+                with open(key_file, "w") as fh:
+                    fh.write(clip_key)
             if t2v and sh.index == 0 and not _nonempty(wide_path):
                 # Thumbnail for the gallery: a frame from the first generated clip.
                 ctx.call(self.ff.extract_frame, raw, wide_path)

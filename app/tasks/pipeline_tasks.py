@@ -287,6 +287,11 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     )
     if cast.write_back(characters):
         db.commit()
+    logger.info("Settings in effect: AUDIO_MODE=%s | VIDEO_CAMERA_MOTION=%s | video mode=%s",
+                settings.AUDIO_MODE, settings.VIDEO_CAMERA_MOTION, project.video_mode or settings.VIDEO_MODE)
+    if (settings.AUDIO_MODE or "").strip().lower() != "model":
+        logger.warning("AUDIO_MODE is '%s', so edge-tts voices are used. Set AUDIO_MODE=model in .env (and restart the "
+                       "worker) to use the video model's own voices.", settings.AUDIO_MODE)
     logger.info("Voice cast (%s): %s | narrator=%s", cast.region, [(m.name, m.voice_id) for m in cast.members], cast.narrator_voice)
 
     tts, ff = TTSService(), FFmpegService()

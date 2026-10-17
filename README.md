@@ -1,9 +1,24 @@
+## One clip per scene (SCENE_MODE=whole)
+
+Default is `SCENE_MODE=shots` (a scene = several short clips joined). To generate each scene in one go instead, set in `.env`:
+
+    AUDIO_MODE=model
+    SCENE_MODE=whole
+    WHOLE_SCENE_MAX_SECONDS=10
+
+and in the Kaggle launch cell set `os.environ["LTX_MAX_FRAMES"] = "241"` (24 fps, 8k+1 frames: 121 = 5 s, 241 = 10 s, 361 = 15 s).
+The whole scene goes into one prompt (place, cast, every action and quoted line in order, camera direction). A scene longer
+than WHOLE_SCENE_MAX_SECONDS is split between lines into the fewest pieces. If the server could only render part of the
+requested length (GPU out of memory), that scene automatically falls back to shots, so no line is lost.
+Finished clips are cached per exact prompt (`whole_N_raw.mp4.key`), so a restart never re-renders a finished clip.
+Narration limit: `MODEL_NARRATION_WORDS` (x3 in whole mode).
+
 ## Model voices, free camera, and the image-vs-text switch
 
 **Voices.** `AUDIO_MODE=model` (the default) makes the video model (LTX-2.3) speak the lines itself - no edge-tts. Each line is written
 into the clip's prompt as `Kobi says in an adult male voice with a Nigerian accent: "..."`, with the character's gender, age and
 accent taken from the Cast screen so a voice stays similar between shots. Every spoken line is its own clip (long lines are split at
-sentence ends, `MODEL_VOICE_MAX_WORDS=9`) and clips keep their natural length, so lips stay in sync. Works in both modes (text-to-video
+sentence ends, `MODEL_VOICE_MAX_WORDS=10`) and clips keep their natural length, so lips stay in sync. Works in both modes (text-to-video
 and image-first). To go back to edge-tts: `AUDIO_MODE=voices` (or `hybrid`).
 
 **Action vs. words.** A dialogue line may hold both, e.g. `Irritated Tapping on the mixing board... "What's with this distortion?"`.

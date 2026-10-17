@@ -13,6 +13,7 @@ import re
 from typing import Optional, Sequence
 
 from app.services.style_presets import is_cinematic, is_kids
+from app.services.voice_service import DEFAULT_ACTIONS
 
 _ANIMATED = re.compile(
     r"anim|cartoon|3d|pixar|disney|anime|manga|illustrat|comic|cel[- ]?shad|stylized|stylised|claymation|paint|watercolou?r|ghibli",
@@ -165,7 +166,7 @@ def perform(speaker: str, action: str) -> str:
     """'Kobi is tapping on the mixing board' from an action string such as 'Irritated Tapping on the mixing board'
     or 'turns away'. Gerund openers get 'is'; a leading mood word ('Irritated ...') becomes 'is irritated, ...'."""
     act = " ".join((action or "").split())
-    if not act:
+    if not act or act.lower() in DEFAULT_ACTIONS:   # placeholder actions like "stands attentively" would freeze the character
         return f"{speaker} moves and gestures naturally"
     words = [w.lower() if w[:1].isupper() and w.lower().endswith(("ing", "ed", "ly")) else w for w in act.split()]
     words[0] = words[0][:1].lower() + words[0][1:]
@@ -340,4 +341,59 @@ def text_video_prompt(
         # The characters' voices are recorded separately by the pipeline, so ask the video model for
         # ONLY the background sound: no speech of its own (it would clash), no music.
         bits.append(_audio_clause(sound_design, "", False))
+    return ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip()).replace('". ', '" ') + "."
+
+
+
+def whole_scene_prompt(
+    beats: Sequence[dict],
+    on_screen: Sequence,
+    location: Optional[str],
+    visual_description: Optional[str],
+    style: Optional[str],
+    scene_motion: Optional[str] = None,
+    sound_design: Optional[str] = None,
+    start_image: bool = False,
+) -> str:
+    """ONE prompt for a whole scene (or a long part of one). Beats are in order; each is a dict with
+    kind ("dialogue"|"narration"), speaker, expression, action, speech, voice_desc.
+    LTX-2.x follows a flowing, chronological description: the place and cast first, then what happens in order,
+    with each spoken line in quotes next to who says it. Action is written as action, speech only in quotes."""
+    place = clip_words(location, 10)
+    setting = clip_words(visual_description, 40)
+    motion = clip_words(scene_motion, 26)
+    cast_bits = []
+    for c in list(on_screen)[:4]:
+        look = clip_words(getattr(c, "appearance_prompt", "") or getattr(c, "description", ""), 30)
+        cast_bits.append(f"{c.name}, {look}" if look else c.name)
+    lead = "Continuing the same shot" if start_image else (f"A film scene in {place}" if place else "A film scene")
+    steps = []
+    order = ["First", "Then", "Next", "After that", "Finally"]
+    spoken = 0
+    for i, b in enumerate(beats):
+        word = order[min(i, len(order) - 1)] if len(beats) > 1 else ""
+        speech = b.get("speech") or ""
+        if b.get("kind") == "narration":
+            line = speech_clause(b.get("speaker") or "Narrator", speech, b.get("voice_desc", ""), "", off_screen=True) if speech else ""
+        else:
+            who = b.get("speaker") or "A character"
+            act = perform(who, clip_words(b.get("action"), 18))
+            line = act
+            if speech:
+                line += ", and " + speech_clause(who, speech, b.get("voice_desc", ""), b.get("expression", ""))
+        if speech:
+            spoken += 1
+        if line:
+            steps.append(f"{word + ': ' if word else ''}{line}".strip())
+    bits = [lead, setting, ("Characters: " + "; ".join(cast_bits)) if cast_bits else ""]
+    bits += steps
+    camera = (f"Camera: {motion}, and it keeps moving like a real film, changing angle and framing to follow whoever is "
+              "speaking, with natural cuts between wide, medium and close-up shots") if motion else (
+              "Camera: moves like a real film, changing angle and framing to follow whoever is speaking, with natural "
+              "cuts between wide, medium and close-up shots")
+    bits += [camera, _t2v_style(style),
+             "Natural, fluid, lifelike motion, sharp focus, consistent character appearance throughout"]
+    cue = clip_words(sound_design, 22) or "natural ambient sound of the location"
+    bits.append(f"Audio: every spoken line is clearly audible, in the order given, and lip-synced, with {cue} quietly "
+                "underneath, no background music" if spoken else f"Audio: {cue}, no spoken dialogue, no background music")
     return ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip()).replace('". ', '" ') + "."

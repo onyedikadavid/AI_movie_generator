@@ -27,9 +27,10 @@ class FakeModelVideo:
 
     def __init__(self):
         self.t2v, self.i2v = [], []
+        self.cap = 121
 
     def _clip(self, path, duration, w, h):
-        secs = (8 * int(min(duration * 24, 121) // 8) + 1) / 24
+        secs = (8 * int(min(duration * 24, self.cap) // 8) + 1) / 24
         subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc2=s={w}x{h}:r=24:d={secs}",
                         "-f", "lavfi", "-i", f"sine=f=220:d={secs}", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-shortest", path], check=True, capture_output=True)
@@ -140,6 +141,42 @@ def main():
     print("OK long line split into %d clips:" % len(quoted), quoted)
 
     shutil.rmtree(tmp, ignore_errors=True)
+    # --- whole-scene mode: ONE clip for the scene, every line in one ordered prompt ---------------------
+    settings.SCENE_MODE, settings.WHOLE_SCENE_MAX_SECONDS = "whole", 30.0
+    for mode in ("t2v", "i2v"):
+        vid = FakeModelVideo(); vid.cap = 721
+        img = FakeImage()
+        r = SceneRenderer(img, vid, FakeTTS(), ff)
+        d = os.path.join(tmp, "whole_" + mode)
+        res = r.render(scene(), chars, "Cinematic", cast, d, "p1", FakeCtx(), video_mode=mode)
+        reqs = vid.t2v if mode == "t2v" else vid.i2v
+        assert len(reqs) == 1 and res.shots == 1, "the whole scene must be ONE generation, got %d" % len(reqs)
+        pr = reqs[0][0] if mode == "t2v" else reqs[0][1]
+        assert pr.index("distortion") < pr.index("Harmonics are all wrong") < pr.index("I dont know"), pr
+        assert "Kobi is irritated, tapping on the mixing board" in pr and '"Irritated' not in pr
+        assert pr.count("Camera:") == 1 and "static" not in pr
+        if mode == "i2v":
+            assert len(img.prompts) == 1, "i2v whole-scene draws only the one wide keyframe"
+        n = len(reqs)
+        r.render(scene(), chars, "Cinematic", cast, d, "p1", FakeCtx(), video_mode=mode)
+        assert len(reqs) == n, "finished scene is reused"
+        print("OK whole scene (%s): 1 generation, %.1fs, lines in order" % (mode, res.duration))
+        print("   prompt:", pr[:420])
+    # a scene longer than the cap is split at line boundaries, not mid-line
+    big = scene(); big.dialogue_turns = [{"speaker": "Kobi", "text": "This is line number %d, and it has a handful of words in it." % i, "action": "pacing"} for i in range(8)]
+    vid = FakeModelVideo(); vid.cap = 289
+    settings.WHOLE_SCENE_MAX_SECONDS = 12.0
+    res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(big, chars, "Cinematic", cast, os.path.join(tmp, "big"), "p1", FakeCtx(), video_mode="t2v")
+    assert 2 <= len(vid.t2v) <= 8 and all(d_ <= 12.01 for _, d_, _ in vid.t2v), [(round(d_, 1)) for _, d_, _ in vid.t2v]
+    print("OK long scene -> %d pieces of <= 12 s" % len(vid.t2v))
+    # server could only make 5 s of the 10 s asked (GPU memory) -> falls back to shots instead of losing lines
+    settings.WHOLE_SCENE_MAX_SECONDS = 30.0
+    vid = FakeModelVideo(); vid.cap = 121
+    res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(scene(), chars, "Cinematic", cast, os.path.join(tmp, "fb"), "p1", FakeCtx(), video_mode="t2v")
+    assert res.shots >= 3 and ff.has_audio(res.final_path), "fallback to shots"
+    print("OK truncated whole clip -> automatic fallback to %d shots" % res.shots)
+    settings.SCENE_MODE = "shots"
+
     print("\nALL MODEL-VOICE CHECKS PASSED")
 
 
