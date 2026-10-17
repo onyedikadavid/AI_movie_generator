@@ -393,6 +393,8 @@ def whole_scene_prompt(
               "cuts between wide, medium and close-up shots")
     bits += [camera, _t2v_style(style),
              "Natural, fluid, lifelike motion, sharp focus, consistent character appearance throughout"]
+    if spoken:
+        bits.append("The scene runs until the last spoken line is completely finished, then holds for a moment")
     cue = clip_words(sound_design, 22) or "natural ambient sound of the location"
     bits.append(f"Audio: every spoken line is clearly audible, in the order given, and lip-synced, with {cue} quietly "
                 "underneath, no background music" if spoken else f"Audio: {cue}, no spoken dialogue, no background music")

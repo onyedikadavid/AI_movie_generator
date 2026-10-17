@@ -235,6 +235,11 @@ class FFmpegService:
 
         cmd = ["ffmpeg", "-y", "-i", src_path]
         if self.has_audio(src_path):
+            # If the model's voice runs longer than its picture, hold the last frame until the speech ends instead of
+            # cutting the speech off ("-shortest" below would otherwise trim the audio to the picture).
+            a_len, v_len = self.stream_duration(src_path, "a"), self.stream_duration(src_path, "v")
+            if v_len > 0 and a_len > v_len + 0.05:
+                vf.insert(len(vf) - 1, f"tpad=stop_mode=clone:stop_duration={a_len - v_len + 0.1:.3f}")
             # Per-clip loudness levelling keeps the voices at a similar volume from shot to shot.
             af = "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,aformat=channel_layouts=stereo,apad"
             cmd += ["-vf", ",".join(vf), "-af", af, "-map", "0:v:0", "-map", "0:a:0"]
@@ -250,6 +255,15 @@ class FFmpegService:
         return dst_path
 
     # ------------------------------------------------------------------ hybrid audio
+    def stream_duration(self, media_path: str, kind: str) -> float:
+        """Length of just the video ('v') or audio ('a') stream; 0.0 if it can't be read."""
+        try:
+            out = _run(["ffprobe", "-v", "error", "-select_streams", f"{kind}:0", "-show_entries", "stream=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1", media_path]).stdout.strip().split()
+            return float(out[0]) if out else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     def has_audio(self, media_path: str) -> bool:
         """True if the file has a usable audio stream."""
         if shutil.which("ffprobe") is None:

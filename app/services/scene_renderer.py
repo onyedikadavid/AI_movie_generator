@@ -214,7 +214,7 @@ class SceneRenderer:
     def _fit_to_clip(spoken: List[Segment], cap: float, scene_number) -> None:
         """One clip must hold the whole scene: shorten the lines (each keeps its start) until they fit."""
         def need() -> float:
-            return sum(sg.duration + 0.5 for sg in spoken) + 0.8
+            return sum(sg.duration + 0.5 for sg in spoken) * 1.25 + 1.8
         ratio = 1.0
         original = need()
         while spoken and need() > cap and ratio > 0.2:
@@ -274,7 +274,9 @@ class SceneRenderer:
                     "speech": seg.text, "voice_desc": cast.voice_description(seg.speaker),
                 })
             talk = sum(sg.duration + 0.5 for sg in part)
-            request_len = min(max(talk + 0.8, 4.0), cap)
+            # Real speech is slower than the estimate and starts a moment after the clip begins; the server also rounds
+            # the length DOWN to 8k+1 frames. Ask for generous room so the last line is never cut off.
+            request_len = min(max(talk * 1.25 + 1.8, 4.0), cap)
             prompt = pb.whole_scene_prompt(
                 beats, on_screen, scene.location, scene.visual_description, style, scene.motion_prompt,
                 getattr(scene, "sound_design", None), start_image=bool(source and n > 0),
