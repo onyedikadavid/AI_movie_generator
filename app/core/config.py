@@ -165,9 +165,9 @@ class Settings(BaseSettings):
     #            WHOLE_SCENE_MAX_SECONDS it is split into the fewest pieces at line boundaries. If the video server
     #            could only render part of the requested length (GPU memory), the scene falls back to "shots".
     # The video server must allow the length too: set LTX_MAX_FRAMES in the Kaggle launch cell (24 fps, 8k+1 frames:
-    # 241 = ~10 s, 361 = 15 s). Generation time and GPU memory grow quickly with length.
+    # 145 = 6 s, 193 = 8 s, 241 = ~10 s). Generation time and GPU memory grow quickly with length.
     SCENE_MODE: str = "shots"
-    WHOLE_SCENE_MAX_SECONDS: float = 10.0
+    WHOLE_SCENE_MAX_SECONDS: float = 8.0
     # False (default) = exactly ONE clip per scene: if the dialogue is longer than fits, the lines are shortened.
     # True = a long scene may be split between lines into several clips.
     WHOLE_SCENE_SPLIT: bool = False

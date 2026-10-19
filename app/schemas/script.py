@@ -32,6 +32,7 @@ class CharacterSchema(BaseModel):
 
 class SceneSchema(BaseModel):
     scene_number: int = Field(..., description="Sequential index of the scene starting at 1.")
+    story_beat: Optional[str] = Field(default=None, description="What this scene does for the story (hook, setup, turning point, ending...).")
     duration_seconds: int = Field(default=5, description="Estimated duration of the scene in seconds.")
     location: str = Field(default="", description="Setting or background environment for the scene.")
     visual_description: str = Field(..., description="Detailed visual action and layout of the scene.")

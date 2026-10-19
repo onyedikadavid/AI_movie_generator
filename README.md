@@ -2,7 +2,7 @@
 
     AUDIO_MODE=model
     SCENE_MODE=whole
-    WHOLE_SCENE_MAX_SECONDS=10
+    WHOLE_SCENE_MAX_SECONDS=8
 
 Each scene is ONE generation: one prompt with the place, cast, every action and quoted line in order, and a moving camera.
 - The backend asks the Kaggle server for its real limit (`max_frames` on /health) and never asks for more. Set
@@ -11,6 +11,20 @@ Each scene is ONE generation: one prompt with the place, cast, every action and 
   `WHOLE_SCENE_SPLIT=true` allows splitting a long scene between lines instead.
 - A clip the server returned shorter than asked (GPU memory) is kept; `WHOLE_SCENE_FALLBACK=true` redoes it shot by shot.
 - Finished clips are cached per exact prompt (`whole_N_raw.mp4.key`).
+
+## Clip length (why scenes were ~2 s)
+
+Clip length is set by the Kaggle server, not the backend: `LTX_MAX_FRAMES` in the launch cell (24 fps): 121 = 5 s,
+145 = 6 s, 193 = 8 s. A server started with a small value (your log showed 65 frames = 2.7 s) makes every scene that
+short and squeezes the dialogue, which sounds rushed. Set it to 193 and keep `WHOLE_SCENE_MAX_SECONDS=8`. Longer clips
+need more GPU memory and time; if the server runs out of memory it retries shorter (the worker log says so), and
+`VIDEO_T2V_RESOLUTION=768x448` gives it more room.
+
+## Script writer
+
+The prompt is first analysed (logline, main character, problem, turning point, ending, message, hook). The scenes are
+then written from that analysis: scene 1 is a hook, the middle escalates, the last scene resolves, and the story stays
+faithful to the prompt. A script with fewer than 3 scenes or no hook/ending is sent back once for a fix.
 
 ## Narrator on/off
 

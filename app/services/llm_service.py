@@ -58,6 +58,75 @@ class LLMService:
         self.model_name = getattr(settings, "LLM_MODEL", "llama3:latest")
         self.agent_service = AgentService()
 
+    _HEADERS = {
+        # Combined header strategy for ngrok, localtunnel, and standard browser emulation
+        "ngrok-skip-browser-warning": "true",
+        "bypass-tunnel-reminder": "true",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/json",
+    }
+
+    async def _generate(self, prompt: str) -> str:
+        """One JSON-mode call to the Ollama server; returns the raw text of the answer."""
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await post_with_retry(
+                client,
+                f"{self.ollama_url}/api/generate",
+                json={"model": self.model_name, "prompt": prompt, "stream": False, "format": "json"},
+                headers=self._HEADERS,
+            )
+            # Catch bad gateways (502) or forbidden edge blocks (403) before parsing
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Ollama API request failed with status {response.status_code}: {response.text[:300]}"
+                )
+            return response.json().get("response", "{}")
+
+    async def _story_bible(self, prompt: str, genre_hint=None, tone_hint=None) -> dict:
+        """Step 1 of the script: the model states what the story IS before any scene is written. Best effort - if it
+        fails the scenes are still written from the prompt alone."""
+        hints = ""
+        if genre_hint or tone_hint:
+            hints = f"\nRequested genre: {genre_hint or 'any'}. Requested tone: {tone_hint or 'any'}."
+        ask = f"""
+        Read this story idea and explain it like a story editor. Be faithful to it - do not invent a different story.{hints}
+        Return JSON with exactly these keys (each a short plain sentence):
+        {{"logline": "what the story is about in one sentence",
+          "main_character": "who we follow and what they want",
+          "problem": "what stands in their way",
+          "turning_point": "the moment everything changes",
+          "ending": "how it ends (if the idea has no ending, write the most natural one that fits)",
+          "message": "the meaning / feeling the viewer should be left with",
+          "hook": "the single most intriguing moment or image to OPEN the film with so viewers keep watching in the first 3 seconds"}}
+        Story idea: {prompt}
+        Respond ONLY with raw JSON.
+        """
+        try:
+            data = self._parse_json(await self._generate(ask))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Story analysis failed (%s) - writing the scenes straight from the prompt.", e)
+            return {}
+        keys = ("logline", "main_character", "problem", "turning_point", "ending", "message", "hook")
+        return {k: str(data.get(k)).strip() for k in keys if isinstance(data, dict) and data.get(k)}
+
+    @staticmethod
+    def _story_problems(data: dict) -> list:
+        """Cheap structural checks on the LLM's script; anything found is sent back to the model once."""
+        problems = []
+        scenes = (data or {}).get("scenes") or []
+        if len(scenes) < 3:
+            problems.append("fewer than 3 scenes - split the story into its beginning, middle and end")
+        elif not all(isinstance(sc, dict) for sc in scenes):
+            return ["scenes must be JSON objects"]
+        else:
+            if not (scenes[0].get("narration_text") or scenes[0].get("story_beat")):
+                problems.append("scene 1 has no hook")
+            if len(scenes) >= 3 and not (scenes[-1].get("story_beat") or scenes[-1].get("visual_description")):
+                problems.append("the last scene does not show the ending")
+        if not (data or {}).get("characters"):
+            problems.append("no characters were listed")
+        return problems
+
     async def generate_script_structure(
         self,
         prompt: str,
@@ -98,16 +167,38 @@ class LLMService:
         # the model can (and did, in practice) compress an entire short
         # story into a single scene instead of breaking it into the several
         # scenes/shots a real short film would actually have.
+        # Stage 1: UNDERSTAND the story. The model first reads the prompt and writes a short "story bible" (what it is
+        # about, who wants what, what stands in the way, how it ends, and a hook). Stage 2 then builds the scenes
+        # from that bible, so the film has one clear line from beginning to end instead of loosely related pictures.
+        bible = await self._story_bible(prompt, genre_hint, tone_hint)
+        bible_text = ""
+        if bible:
+            bible_text = "\n        STORY BIBLE (your own analysis of the prompt - the film MUST follow it):\n" + "".join(
+                f"        - {k}: {v}\n" for k, v in bible.items() if v
+            )
+
         base_prompt = f"""
-        Analyze this raw story prompt and break it into a short film's worth
-        of scenes - typically 4 to 8 scenes for a short story, one scene per
-        distinct narrative beat (e.g. arrival, confrontation, turning point,
-        resolution). Do NOT compress the entire story into a single scene
-        unless the prompt is genuinely a single-moment vignette.
+        You are a screenwriter turning a raw story idea into a short film that ANYONE can follow without explanation.
+        Read the prompt carefully, understand it, then restructure it into scenes with a clear beginning, middle and end.
+        {bible_text}
+        RULES FOR THE STORY
+        1. HOOK: scene 1 must grab the viewer within the first 3 seconds - open on the most intriguing, surprising or
+           emotional moment (a striking image, a problem already happening, a question the viewer wants answered).
+           Do NOT open with slow scenery or a boring introduction. Its narration_text or first spoken line is the hook line.
+        2. STRUCTURE: scene 1 = hook + who/where, the middle scenes = the problem grows (each scene is caused by the one
+           before it, with rising stakes), the last scene = a clear, satisfying ending that answers the hook.
+        3. FAITHFUL: keep the prompt's characters, names, places, events and meaning. You may reorder and fill small gaps
+           so the story makes sense, but never change what the story is about and never add major characters or events
+           that are not implied by the prompt.
+        4. CLEAR: a viewer who has not read the prompt must understand who the people are, what they want, what goes wrong
+           and how it ends. Use simple, concrete wording. One idea per scene.
+        5. Typically 4 to 8 scenes (one per distinct story beat). Do NOT compress the story into one scene unless the prompt
+           is genuinely a single moment.
+        6. Every scene's visuals, narration and mood must match the genre and tone of the story.
 
         Output valid JSON matching this structure exactly:
         {{
-            "title": "...",
+            "title": "A short, catchy title",
             "genre": "...",
             "tone": "...",
             "visual_style": "...",
@@ -123,10 +214,11 @@ class LLMService:
             "scenes": [
                 {{
                     "scene_number": 1,
+                    "story_beat": "One sentence: what happens in this scene and why it matters to the story (hook / setup / complication / turning point / climax / ending).",
                     "location": "...",
                     "visual_description": "...",
                     "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - subject(s), action, setting, time of day, lighting and camera framing (e.g. wide shot / medium shot). Sent directly to the image generator, so it must make sense on its own.",
-                    "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here.",
+                    "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here. In scene 1 this is the HOOK line.",
                     "characters_present": ["Name1", "Name2"],
                     "motion_prompt": "Cinematic camera direction plus what the people DO, for a few seconds, like a real film: e.g. 'slow dolly-in on the boy as he lowers his head, then a handheld pan to the door' or 'tracking shot following her down the corridor'. Vary the camera from scene to scene (push-in, tracking, pan, handheld, low angle).",
                     "sound_design": "The background sounds and effects you would HEAR here - 6 to 14 words, no speech, no music. e.g. 'distant gunfire, helicopter overhead, running footsteps' or 'light wind, birds, far-off market chatter'.",
@@ -138,33 +230,21 @@ class LLMService:
         Prompt: {prompt}
         Respond ONLY with raw JSON.
         """
-        
-        # Combined header strategy for ngrok, localtunnel, and standard browser emulation
-        headers = {
-            "ngrok-skip-browser-warning": "true",
-            "bypass-tunnel-reminder": "true",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Content-Type": "application/json"
-        }
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await post_with_retry(
-                client,
-                f"{self.ollama_url}/api/generate",
-                json={"model": self.model_name, "prompt": base_prompt, "stream": False, "format": "json"},
-                headers=headers
-            )
-            
-            # Catch bad gateways (502) or forbidden edge blocks (403) before parsing
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Ollama API request failed with status {response.status_code}: {response.text[:300]}"
-                )
-
-            payload = response.json()
-            raw_json = payload.get("response", "{}")
-
+        raw_json = await self._generate(base_prompt)
         parsed_data = self._parse_json(raw_json)
+        problems = self._story_problems(parsed_data)
+        if problems:
+            logger.warning("Script needs another pass (%s) - asking the model to fix it.", "; ".join(problems))
+            try:
+                retry = await self._generate(
+                    base_prompt + "\n        YOUR PREVIOUS ANSWER HAD THESE PROBLEMS - FIX THEM: " + "; ".join(problems) + "\n"
+                )
+                fixed = self._parse_json(retry)
+                if not self._story_problems(fixed) or len(fixed.get("scenes") or []) > len(parsed_data.get("scenes") or []):
+                    parsed_data = fixed
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Second script pass failed (%s) - keeping the first one.", e)
 
         # Step B: character-to-character dialogue for scenes with 2+ people.
         # Speakers are the characters actually present in each scene (not
@@ -174,7 +254,9 @@ class LLMService:
         for scene in parsed_data.get("scenes", []) or []:
             present = [by_name[n.strip().lower()] for n in (scene.get("characters_present") or [])
                        if isinstance(n, str) and n.strip().lower() in by_name]
-            goal = f"{scene.get('location', '')} - {scene.get('visual_description', '')}"
+            beat = scene.get("story_beat") or ""
+            goal = f"{scene.get('location', '')} - {scene.get('visual_description', '')}" + (
+                f". What this moment must achieve in the story: {beat}" if beat else "")
             kids = is_kids(genre_hint, tone_hint, visual_style_hint)
             if len(present) >= 2:
                 char_a, char_b = present[0], present[1]
@@ -194,7 +276,7 @@ class LLMService:
                 continue
             try:
                 scene["dialogue_turns"] = await self.agent_service.simulate_interaction(
-                    char_a, char_b, goal, turns=4, kids=kids
+                    char_a, char_b, goal, turns=(3 if (settings.SCENE_MODE or '').lower() == 'whole' else 4), kids=kids
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)
