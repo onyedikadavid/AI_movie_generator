@@ -110,11 +110,13 @@ class LLMService:
         return {k: str(data.get(k)).strip() for k in keys if isinstance(data, dict) and data.get(k)}
 
     @staticmethod
-    def _story_problems(data: dict) -> list:
+    def _story_problems(data: dict, scene_count: int = None) -> list:
         """Cheap structural checks on the LLM's script; anything found is sent back to the model once."""
         problems = []
         scenes = (data or {}).get("scenes") or []
-        if len(scenes) < 3:
+        if scene_count and len(scenes) != int(scene_count):
+            problems.append(f"the script must have exactly {int(scene_count)} scenes (it has {len(scenes)})")
+        elif len(scenes) < 3 and not scene_count:
             problems.append("fewer than 3 scenes - split the story into its beginning, middle and end")
         elif not all(isinstance(sc, dict) for sc in scenes):
             return ["scenes must be JSON objects"]
@@ -134,6 +136,8 @@ class LLMService:
         tone_hint: str = None,
         visual_style_hint: str = None,
         narrator: bool = None,
+        scene_count: int = None,
+        scene_seconds: int = None,
     ) -> ScriptDecompositionSchema:
         """
         Generates full script breakdown utilizing AgentService for character interactions.
@@ -170,6 +174,15 @@ class LLMService:
         # Stage 1: UNDERSTAND the story. The model first reads the prompt and writes a short "story bible" (what it is
         # about, who wants what, what stands in the way, how it ends, and a hook). Stage 2 then builds the scenes
         # from that bible, so the film has one clear line from beginning to end instead of loosely related pictures.
+        n_words = len((prompt or "").split())
+        if scene_count:
+            count_rule = (f"Write EXACTLY {int(scene_count)} scenes - no more, no fewer. Spread the whole story "
+                          f"(beginning, middle and end) across them.")
+        else:
+            lo, hi = (3, 4) if n_words < 40 else ((4, 6) if n_words < 120 else (6, 8))
+            count_rule = (f"Choose the number of scenes the story needs - for this prompt usually {lo} to {hi}. "
+                          f"Every scene must be a distinct story beat.")
+        secs = int(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)
         bible = await self._story_bible(prompt, genre_hint, tone_hint)
         bible_text = ""
         if bible:
@@ -192,8 +205,8 @@ class LLMService:
            that are not implied by the prompt.
         4. CLEAR: a viewer who has not read the prompt must understand who the people are, what they want, what goes wrong
            and how it ends. Use simple, concrete wording. One idea per scene.
-        5. Typically 4 to 8 scenes (one per distinct story beat). Do NOT compress the story into one scene unless the prompt
-           is genuinely a single moment.
+        5. {count_rule} Do NOT compress the story into one scene unless the prompt is genuinely a single moment.
+           Each scene is filmed as ONE continuous clip of about {secs} seconds, so give it only what fits in that time.
         6. Every scene's visuals, narration and mood must match the genre and tone of the story.
 
         Output valid JSON matching this structure exactly:
@@ -222,7 +235,7 @@ class LLMService:
                     "characters_present": ["Name1", "Name2"],
                     "motion_prompt": "Cinematic camera direction plus what the people DO, for a few seconds, like a real film: e.g. 'slow dolly-in on the boy as he lowers his head, then a handheld pan to the door' or 'tracking shot following her down the corridor'. Vary the camera from scene to scene (push-in, tracking, pan, handheld, low angle).",
                     "sound_design": "The background sounds and effects you would HEAR here - 6 to 14 words, no speech, no music. e.g. 'distant gunfire, helicopter overhead, running footsteps' or 'light wind, birds, far-off market chatter'.",
-                    "duration_seconds": 5
+                    "duration_seconds": {secs}
                 }}
             ]
         }}
@@ -233,7 +246,7 @@ class LLMService:
 
         raw_json = await self._generate(base_prompt)
         parsed_data = self._parse_json(raw_json)
-        problems = self._story_problems(parsed_data)
+        problems = self._story_problems(parsed_data, scene_count)
         if problems:
             logger.warning("Script needs another pass (%s) - asking the model to fix it.", "; ".join(problems))
             try:
@@ -241,10 +254,16 @@ class LLMService:
                     base_prompt + "\n        YOUR PREVIOUS ANSWER HAD THESE PROBLEMS - FIX THEM: " + "; ".join(problems) + "\n"
                 )
                 fixed = self._parse_json(retry)
-                if not self._story_problems(fixed) or len(fixed.get("scenes") or []) > len(parsed_data.get("scenes") or []):
+                if not self._story_problems(fixed, scene_count) or len(fixed.get("scenes") or []) > len(parsed_data.get("scenes") or []):
                     parsed_data = fixed
             except Exception as e:  # noqa: BLE001
                 logger.warning("Second script pass failed (%s) - keeping the first one.", e)
+
+        if scene_count and len(parsed_data.get("scenes") or []) > int(scene_count):
+            parsed_data["scenes"] = parsed_data["scenes"][: int(scene_count)]        # never more than asked for
+        for i, sc in enumerate(parsed_data.get("scenes") or [], 1):
+            if isinstance(sc, dict):
+                sc["scene_number"] = i
 
         # Step B: character-to-character dialogue for scenes with 2+ people.
         # Speakers are the characters actually present in each scene (not
@@ -276,7 +295,7 @@ class LLMService:
                 continue
             try:
                 scene["dialogue_turns"] = await self.agent_service.simulate_interaction(
-                    char_a, char_b, goal, turns=(3 if (settings.SCENE_MODE or '').lower() == 'whole' else 4), kids=kids
+                    char_a, char_b, goal, turns=(2 if secs <= 5 else 3 if secs <= 9 else 4) if (settings.SCENE_MODE or '').lower() == 'whole' else 4, kids=kids
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)

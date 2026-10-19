@@ -92,7 +92,7 @@ class SceneRenderer:
         chosen = [c for c in characters if c.name.strip().lower() in present]
         return chosen or list(characters)
 
-    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str, narrator: bool = False) -> str:
+    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str, narrator: bool = False, scene_seconds=None) -> str:
         blob = json.dumps(
             {
                 "v": 5,
@@ -113,7 +113,7 @@ class SceneRenderer:
                 "interp": settings.VIDEO_INTERPOLATE,
                 "mode": video_mode,
                 "narrator": bool(narrator),
-                "scenemode": [settings.SCENE_MODE, settings.WHOLE_SCENE_MAX_SECONDS],
+                "scenemode": [settings.SCENE_MODE, float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)],
                 "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None), settings.MODEL_VOICE_MAX_WORDS],
                 "t2vres": settings.VIDEO_T2V_RESOLUTION,
             },
@@ -229,15 +229,15 @@ class SceneRenderer:
                            scene_number, original, cap)
 
     def _render_whole(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, mode,
-                      on_screen, may_reuse, final_path):
+                      on_screen, may_reuse, final_path, scene_seconds=None):
         """One clip per scene (or per `WHOLE_SCENE_MAX_SECONDS` piece of a long one). Returns None when the server
         could only render a fraction of the requested length, so the caller can use the shot-by-shot path."""
         W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
-        cap = float(settings.WHOLE_SCENE_MAX_SECONDS)
+        cap = float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)   # the project's own choice wins over .env
         server_cap = getattr(self.video, "server_max_seconds", lambda: None)()
         if server_cap and server_cap < cap:
             logger.warning("Scene %s: the video server only makes %.1f s clips (LTX_MAX_FRAMES), below "
-                           "WHOLE_SCENE_MAX_SECONDS=%.0f. Raise LTX_MAX_FRAMES in the Kaggle launch cell for longer scenes.",
+                           "the %.0f s you asked for. Raise LTX_MAX_FRAMES in the Kaggle launch cell for longer scenes.",
                            scene.scene_number, server_cap, cap)
             cap = server_cap
         spoken = [sg for sg in segments if sg.kind != "ambient"]
@@ -334,6 +334,7 @@ class SceneRenderer:
         ctx,
         video_mode: Optional[str] = None,
         narrator: Optional[bool] = None,
+        scene_seconds: Optional[int] = None,
     ) -> SceneResult:
         """video_mode: "i2v" (draw a keyframe with the image model, then animate it) or "t2v" (text-to-video, no
         image model). None = the server-wide default (settings.VIDEO_MODE)."""
@@ -345,7 +346,7 @@ class SceneRenderer:
         free_cam = pb.is_free_camera(settings.VIDEO_CAMERA_MOTION)
         narrator = bool(settings.NARRATOR_ENABLED if narrator is None else narrator)   # per-project choice wins
 
-        fp = self._fingerprint(scene, characters, style, cast, mode, narrator)
+        fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds)
         may_reuse = self._prepare_dir(scene_dir, fp)
         final_path = os.path.join(scene_dir, "scene_final.mp4")
         if may_reuse and _nonempty(final_path):
@@ -395,7 +396,7 @@ class SceneRenderer:
 
         if model_audio and (settings.SCENE_MODE or "shots").strip().lower() == "whole":
             whole = self._render_whole(scene, characters, style, cast, scene_dir, project_id, ctx,
-                                       segments, mode, on_screen, may_reuse, final_path)
+                                       segments, mode, on_screen, may_reuse, final_path, scene_seconds)
             if whole is not None:
                 return whole
             logger.warning("Scene %s: whole-scene clip came back too short; falling back to shots.", scene.scene_number)

@@ -26,6 +26,13 @@ The prompt is first analysed (logline, main character, problem, turning point, e
 then written from that analysis: scene 1 is a hook, the middle escalates, the last scene resolves, and the story stays
 faithful to the prompt. A script with fewer than 3 scenes or no hook/ending is sent back once for a fix.
 
+## Scene count, scene length, downloads (set in the app)
+
+New Project screen: *Number of scenes* (empty = the script writer decides, usually 3-8 depending on the story) and
+*Seconds per scene* (empty = `WHOLE_SCENE_MAX_SECONDS`). Seconds can be changed later on the review screen. The video
+server's own maximum (`LTX_MAX_FRAMES`) still applies. Text-to-video never draws images; only "Image first" does.
+Every finished scene is uploaded on its own (Scenes list on the player page, Download button).
+
 ## Narrator on/off
 
 Now a per-project switch (New Project screen and the review screen). `NARRATOR_ENABLED` in .env is only the default

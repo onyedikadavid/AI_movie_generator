@@ -8,6 +8,22 @@ from app.schemas.character import CharacterResponse
 from app.schemas.scene import SceneResponse
 
 
+def clamp_scene_count(value) -> Optional[int]:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(n, 20)) if n > 0 else None
+
+
+def clamp_scene_seconds(value) -> Optional[int]:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(3, min(n, 30)) if n > 0 else None
+
+
 def normalize_video_mode(value: Optional[str]) -> Optional[str]:
     """'t2v' / 'i2v' (also accepts friendly spellings); anything else = None (use the server default)."""
     v = (value or "").strip().lower().replace("_", "-")
@@ -28,12 +44,16 @@ class ProjectCreate(BaseModel):
     video_mode: Optional[str] = None
     # True/False = narrator voice-over on/off for this project. None = server default.
     narrator_enabled: Optional[bool] = None
+    # Leave empty for automatic.
+    scene_count: Optional[int] = None
+    scene_seconds: Optional[int] = None
 
 
 class ProjectSettingsUpdate(BaseModel):
     """Per-project generation settings, editable on the review screen before (re)generating."""
     video_mode: Optional[str] = None
     narrator_enabled: Optional[bool] = None
+    scene_seconds: Optional[int] = None
 
 
 class RunState(BaseModel):
@@ -74,6 +94,8 @@ class ProjectResponse(RunState):
     final_video_path: Optional[str]
     video_mode: Optional[str] = None
     narrator_enabled: Optional[bool] = None
+    scene_count: Optional[int] = None
+    scene_seconds: Optional[int] = None
     created_at: datetime
 
     class Config:

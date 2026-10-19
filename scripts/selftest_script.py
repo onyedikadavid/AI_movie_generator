@@ -47,4 +47,20 @@ async def main():
     assert len(out.scenes) == 5 and out.scenes[0].story_beat == "hook"
     assert any("hook" in g or "ending" in g for g in FakeAgent.goals), FakeAgent.goals
     print("OK story analysis -> scenes with hook/ending rules; weak script got one fix-up pass; beat reaches the dialogue writer")
-asyncio.run(main())
+async def main2():
+    # an explicit scene count is enforced; no count -> automatic range in the prompt
+    svc = object.__new__(LLMService); svc.agent_service = FakeAgent(); calls.clear()
+    three = {**GOOD, "scenes": GOOD["scenes"][:3]}
+    answers = [json.dumps(BIBLE), json.dumps(GOOD)]            # model returns 5 although 3 were asked
+    async def fake(prompt):
+        calls.append(prompt); return answers.pop(0) if answers else json.dumps(three)
+    svc._generate = fake
+    out = await svc.generate_script_structure("A fisherman must warn his village about a storm", scene_count=3, scene_seconds=8)
+    assert "EXACTLY 3 scenes" in calls[1] and "about 8 seconds" in calls[1]
+    assert len(out.scenes) == 3 and [s.scene_number for s in out.scenes] == [1, 2, 3]
+    calls.clear(); answers[:] = [json.dumps(BIBLE), json.dumps(GOOD)]
+    await svc.generate_script_structure("A fisherman must warn his village about a storm")
+    assert "Choose the number of scenes the story needs" in calls[1] and "EXACTLY" not in calls[1]
+    print("OK explicit scene count enforced (extra scenes dropped, renumbered); no count = automatic")
+
+asyncio.run(main()); asyncio.run(main2())

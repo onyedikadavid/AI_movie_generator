@@ -56,6 +56,9 @@ class Project(Base):
     video_mode = Column(String, nullable=True)
     # None = follow NARRATOR_ENABLED from the server config; True/False = this project's own choice (set in the UI).
     narrator_enabled = Column(Boolean, nullable=True)
+    # Chosen in the UI. None = automatic (the script writer decides the number of scenes; scene length = server default).
+    scene_count = Column(Integer, nullable=True)
+    scene_seconds = Column(Integer, nullable=True)
 
     status = Column(Enum(ProjectStatus), default=ProjectStatus.CREATED)
     error_message = Column(Text, nullable=True)

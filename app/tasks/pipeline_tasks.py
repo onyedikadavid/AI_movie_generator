@@ -162,7 +162,8 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
     script_schema = _call(
         db, ctl,
         lambda: asyncio.run(
-            llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle)
+            llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
+                                         scene_count=project.scene_count, scene_seconds=project.scene_seconds)
         )
     )
     ctl.checkpoint()
@@ -287,8 +288,8 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     )
     if cast.write_back(characters):
         db.commit()
-    logger.info("Settings in effect: AUDIO_MODE=%s | SCENE_MODE=%s (max %ss) | CAMERA=%s | video mode=%s | narrator=%s",
-                settings.AUDIO_MODE, settings.SCENE_MODE, settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
+    logger.info("Settings in effect: AUDIO_MODE=%s | SCENE_MODE=%s (%ss per scene) | CAMERA=%s | video mode=%s | narrator=%s",
+                settings.AUDIO_MODE, settings.SCENE_MODE, project.scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
                 project.video_mode or settings.VIDEO_MODE,
                 project.narrator_enabled if project.narrator_enabled is not None else settings.NARRATOR_ENABLED)
     if (settings.AUDIO_MODE or "").strip().lower() != "model":
@@ -321,7 +322,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
         sctx = _SceneCtx(db, project, scene, ctl, i, total)
         try:
             result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode,
-                                     narrator=project.narrator_enabled)
+                                     narrator=project.narrator_enabled, scene_seconds=project.scene_seconds)
         except RunStopped:
             safe_rollback(db)
             try:
@@ -340,7 +341,9 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
                 safe_rollback(db)
             raise
 
-        scene.video_path = result.final_path
+        # Publish the finished scene so it can be played and downloaded on its own (falls back to the local path).
+        scene.video_path = _call(db, ctl, publish_file, result.final_path,
+                                 f"projects/{pid}/scene_{scene.scene_number}/scene_final.mp4")
         wav = os.path.join(scene_dir, "voices.wav")
         scene.audio_path = wav if os.path.exists(wav) else None   # model-voice mode has no separate voice track
         scene.render_status = "DONE"
