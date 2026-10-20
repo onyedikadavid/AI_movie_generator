@@ -66,6 +66,9 @@ class ScriptDecompositionSchema(BaseModel):
     visual_style: str = Field(..., description="Consistent visual aesthetics and lighting style.")
     characters: List[CharacterSchema] = Field(..., description="List of characters participating in the project.")
     scenes: List[SceneSchema] = Field(..., description="Sequential breakdown of scenes.")
+    story: Optional[str] = Field(default=None, description="The full story written from the user's idea (hook first, clear beginning-middle-end).")
+    hook: Optional[str] = None
+    story_outline: Optional[dict] = None
 
 
 # --- FastAPI Database Request/Response Schemas ---
@@ -75,6 +78,9 @@ class ScriptBase(BaseModel):
     tone: Optional[str] = None
     visual_style: Optional[str] = None
     full_text: Optional[str] = None
+    story_text: Optional[str] = None
+    story_hook: Optional[str] = None
+    story_outline: Optional[dict] = None
 
 class ScriptCreate(ScriptBase):
     pass

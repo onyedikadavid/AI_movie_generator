@@ -83,21 +83,28 @@ class LLMService:
             return response.json().get("response", "{}")
 
     async def _story_bible(self, prompt: str, genre_hint=None, tone_hint=None) -> dict:
-        """Step 1 of the script: the model states what the story IS before any scene is written. Best effort - if it
-        fails the scenes are still written from the prompt alone."""
+        """Step 1 of the script: the model reads the idea, states what the story IS and WRITES THE FULL STORY (hook
+        first, beginning-middle-end) before any scene exists. Best effort - on failure the scenes are written from the
+        prompt alone. Returns the analysis keys plus "story"."""
         hints = ""
         if genre_hint or tone_hint:
             hints = f"\nRequested genre: {genre_hint or 'any'}. Requested tone: {tone_hint or 'any'}."
         ask = f"""
-        Read this story idea and explain it like a story editor. Be faithful to it - do not invent a different story.{hints}
-        Return JSON with exactly these keys (each a short plain sentence):
+        You are a story editor and screenwriter. Read this story idea, understand it, and turn it into a COMPLETE short
+        story that anyone can follow. Be faithful to the idea - keep its characters, names, places and events, only
+        reorder and fill small gaps so it makes sense. Do not invent a different story.{hints}
+        The story must: open with a HOOK (the most intriguing, surprising or emotional moment, in the first sentence or
+        two, so viewers keep watching within the first 3 seconds); then set up who and where; let the problem grow, each
+        event causing the next; reach a turning point; and END clearly, answering the hook. Simple, concrete words.
+        Return JSON with exactly these keys:
         {{"logline": "what the story is about in one sentence",
           "main_character": "who we follow and what they want",
           "problem": "what stands in their way",
           "turning_point": "the moment everything changes",
-          "ending": "how it ends (if the idea has no ending, write the most natural one that fits)",
-          "message": "the meaning / feeling the viewer should be left with",
-          "hook": "the single most intriguing moment or image to OPEN the film with so viewers keep watching in the first 3 seconds"}}
+          "ending": "how it ends",
+          "message": "the meaning / feeling the viewer is left with",
+          "hook": "the opening hook, one or two sentences",
+          "story": "the complete story, 150 to 350 words, in short paragraphs, written in present tense, hook first, ending last"}}
         Story idea: {prompt}
         Respond ONLY with raw JSON.
         """
@@ -106,7 +113,7 @@ class LLMService:
         except Exception as e:  # noqa: BLE001
             logger.warning("Story analysis failed (%s) - writing the scenes straight from the prompt.", e)
             return {}
-        keys = ("logline", "main_character", "problem", "turning_point", "ending", "message", "hook")
+        keys = ("logline", "main_character", "problem", "turning_point", "ending", "message", "hook", "story")
         return {k: str(data.get(k)).strip() for k in keys if isinstance(data, dict) and data.get(k)}
 
     @staticmethod
@@ -184,11 +191,15 @@ class LLMService:
                           f"Every scene must be a distinct story beat.")
         secs = int(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)
         bible = await self._story_bible(prompt, genre_hint, tone_hint)
+        story_text = bible.pop("story", "") if bible else ""
         bible_text = ""
         if bible:
             bible_text = "\n        STORY BIBLE (your own analysis of the prompt - the film MUST follow it):\n" + "".join(
                 f"        - {k}: {v}\n" for k, v in bible.items() if v
             )
+        if story_text:
+            bible_text += ("\n        THE FULL STORY (already written from the prompt - the scenes must tell EXACTLY this story, "
+                           "in this order, hook first, ending last):\n        " + story_text.replace("\n", "\n        ") + "\n")
 
         base_prompt = f"""
         You are a screenwriter turning a raw story idea into a short film that ANYONE can follow without explanation.
@@ -318,4 +329,7 @@ class LLMService:
             ch["appearance_prompt"] = ch.get("appearance_prompt") or ch.get("description") or ""
             ch["description"] = ch.get("description") or ch["appearance_prompt"]
 
+        parsed_data["story"] = story_text or None
+        parsed_data["hook"] = (bible or {}).get("hook") or None
+        parsed_data["story_outline"] = {k: v for k, v in (bible or {}).items() if k != "hook"} or None
         return ScriptDecompositionSchema(**parsed_data)

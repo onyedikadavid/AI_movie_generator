@@ -178,6 +178,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
     db.add(Script(
         project_id=pid, genre=script_schema.genre, tone=script_schema.tone,
         visual_style=script_schema.visual_style, full_text=project.raw_prompt,
+        story_text=script_schema.story, story_hook=script_schema.hook, story_outline=script_schema.story_outline,
     ))
 
     for ch in script_schema.characters:

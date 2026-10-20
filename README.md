@@ -22,6 +22,8 @@ need more GPU memory and time; if the server runs out of memory it retries short
 
 ## Script writer
 
+The full story (hook, structure) is saved with the script and shown in the app ("The story" card on the review and player screens).
+
 The prompt is first analysed (logline, main character, problem, turning point, ending, message, hook). The scenes are
 then written from that analysis: scene 1 is a hook, the middle escalates, the last scene resolves, and the story stays
 faithful to the prompt. A script with fewer than 3 scenes or no hook/ending is sent back once for a fix.
