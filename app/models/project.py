@@ -59,6 +59,9 @@ class Project(Base):
     # Chosen in the UI. None = automatic (the script writer decides the number of scenes; scene length = server default).
     scene_count = Column(Integer, nullable=True)
     scene_seconds = Column(Integer, nullable=True)
+    # A pending 'continue the story' request (read by the worker, then cleared).
+    continue_prompt = Column(Text, nullable=True)
+    continue_scenes = Column(Integer, nullable=True)
 
     status = Column(Enum(ProjectStatus), default=ProjectStatus.CREATED)
     error_message = Column(Text, nullable=True)

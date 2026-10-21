@@ -20,6 +20,7 @@ from app.schemas.project import (
     DeleteResult, ProjectDetailResponse, ProjectListItem, ProjectResponse, ProjectSettingsUpdate, QueueSnapshot,
     normalize_video_mode,
     clamp_scene_count,
+    ContinueRequest,
     clamp_scene_seconds,
 )
 from app.schemas.scene import SceneResponse, SceneUpdate
@@ -179,6 +180,17 @@ async def run_pipeline(
     def inner(db):
         p = rc.start_generation(db, project_id, fresh=fresh)
         return _project_out(db, p)
+
+    return await _in_session(inner)
+
+
+@router.post("/projects/{project_id}/continue", response_model=ProjectResponse, status_code=202)
+async def continue_story(project_id: str, payload: ContinueRequest):
+    """Write the next scene(s) of this story, keeping the same characters. Leave `prompt` empty to let the writer
+    decide what happens. The project then goes back to review (SCRIPT_READY) with the new scenes added."""
+
+    def inner(db):
+        return _project_out(db, rc.start_continuation(db, project_id, payload.prompt, payload.scene_count))
 
     return await _in_session(inner)
 

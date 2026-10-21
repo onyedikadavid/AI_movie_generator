@@ -35,6 +35,17 @@ New Project screen: *Number of scenes* (empty = the script writer decides, usual
 server's own maximum (`LTX_MAX_FRAMES`) still applies. Text-to-video never draws images; only "Image first" does.
 Every finished scene is uploaded on its own (Scenes list on the player page, Download button).
 
+## Continue the story
+
+Player page -> *Continue the story*: describe what happens next (or leave it empty), pick how many new scenes, press the
+button. The writer gets the story so far, the scenes so far and every character with their exact look, and adds new
+scenes after the last one (new characters only if the story needs them). Finished scenes and existing characters are
+never changed; the project goes back to review, and *Generate* renders only the new scenes, then re-joins the film.
+Consistency: character looks and voices are reused verbatim. A new scene marked *Carry on from the previous scene*
+starts from the previous clip's last picture (works in text-to-video and image-first mode, needs SCENE_MODE=whole),
+which keeps people and place identical. A scene that is a normal cut starts fresh from text/keyframe, so a face can
+still drift a little - true face locking needs a reference-image model (IP-Adapter) in the image notebook.
+
 ## Narrator on/off
 
 Now a per-project switch (New Project screen and the review screen). `NARRATOR_ENABLED` in .env is only the default

@@ -65,4 +65,28 @@ async def main2():
     assert "Choose the number of scenes the story needs" in calls[1] and "no more, no fewer" not in calls[1]
     print("OK explicit scene count enforced (extra scenes dropped, renumbered); no count = automatic")
 
-asyncio.run(main()); asyncio.run(main2())
+async def main3():
+    svc = object.__new__(LLMService); svc.agent_service = FakeAgent(); calls.clear()
+    cont = {"story_addition": "Tunde reaches the shore and rings the bell.",
+            "new_characters": [{"name": "Tunde", "description": "dup"}, {"name": "Ada", "description": "his daughter", "appearance_prompt": "10yo girl", "gender": "female", "age_group": "child"}],
+            "scenes": [{"scene_number": 9, "story_beat": "warning", "continues_previous": True, "location": "shore", "visual_description": "Tunde rings the bell",
+                        "characters_present": ["Tunde", "Ada"], "image_prompt": "i", "motion_prompt": "m", "duration_seconds": 8}]}
+    async def fake(prompt):
+        calls.append(prompt); return json.dumps(cont)
+    svc._generate = fake
+    class Agent2:
+        async def simulate_interaction(self, a, b, goal, turns=4, kids=False):
+            return [{"speaker": a["name"], "text": "Run!", "expression": "scared", "action": ""}]
+    svc.agent_service = Agent2()
+    chars = [{"name": "Tunde", "description": "fisherman", "appearance_prompt": "40yo man in a blue shirt", "gender": "male", "age_group": "adult"}]
+    out = await svc.continue_story("A wave rises.", chars, [{"scene_number": 1, "location": "coast", "visual_description": "wave", "lines": ""}],
+                                   direction="his daughter appears", scene_count=1, scene_seconds=8)
+    p = calls[0]
+    assert "STORY SO FAR" in p and "40yo man in a blue shirt" in p and "his daughter appears" in p and "numbered from 2" in p
+    assert [c["name"] for c in out["new_characters"]] == ["Ada"], out["new_characters"]       # existing character not duplicated
+    assert out["scenes"][0]["scene_number"] == 2 and out["scenes"][0]["continues_previous"] is True
+    assert out["scenes"][0]["dialogue_turns"], "new scene gets dialogue"
+    assert out["story_addition"].startswith("Tunde reaches")
+    print("OK continue_story: same characters kept, only new ones added, numbered after the last scene, with dialogue")
+
+asyncio.run(main()); asyncio.run(main2()); asyncio.run(main3())

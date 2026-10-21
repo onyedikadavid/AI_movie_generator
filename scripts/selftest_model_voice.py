@@ -205,6 +205,19 @@ def main():
         assert has == nar, (nar, vid.t2v[0][0][:600])
     settings.NARRATOR_ENABLED = False
     print("OK narrator on/off comes from the project, not .env")
+    # a scene that carries on from the previous one starts from its last frame (even in text-to-video mode)
+    settings.WHOLE_SCENE_MAX_SECONDS = 30.0
+    vid = FakeModelVideo(); vid.cap = 721; img = FakeImage()
+    r = SceneRenderer(img, vid, FakeTTS(), ff)
+    first = r.render(scene(), chars, "Cinematic", cast, os.path.join(tmp, "c1"), "p1", FakeCtx(), video_mode="t2v")
+    nxt = scene(); nxt.scene_number = 2; nxt.continues_previous = True
+    res = r.render(nxt, chars, "Cinematic", cast, os.path.join(tmp, "c2"), "p1", FakeCtx(), video_mode="t2v", prev_clip=first.final_path)
+    assert len(vid.i2v) == 1 and vid.i2v[0][0] == "start_frame.png" and "Continuing the same shot" in vid.i2v[0][1], vid.i2v
+    assert len(img.prompts) == 0, "carrying on needs no image model"
+    nxt2 = scene(); nxt2.scene_number = 3; nxt2.continues_previous = False
+    r.render(nxt2, chars, "Cinematic", cast, os.path.join(tmp, "c3"), "p1", FakeCtx(), video_mode="t2v", prev_clip=first.final_path)
+    assert len(vid.i2v) == 1, "a normal cut still starts from text"
+    print("OK 'continues previous' scene starts from the last frame of the previous scene; a normal cut does not")
     settings.SCENE_MODE = "shots"
 
     print("\nALL MODEL-VOICE CHECKS PASSED")

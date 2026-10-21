@@ -255,6 +255,14 @@ class FFmpegService:
         return dst_path
 
     # ------------------------------------------------------------------ hybrid audio
+    def extract_last_frame(self, video_path: str, image_path: str) -> str:
+        """Saves (nearly) the last picture of a video - the starting point of a scene that carries straight on."""
+        _require_ffmpeg()
+        _run(["ffmpeg", "-y", "-sseof", "-0.15", "-i", video_path, "-frames:v", "1", "-q:v", "2", image_path])
+        if not os.path.exists(image_path) or os.path.getsize(image_path) < 500:
+            _run(["ffmpeg", "-y", "-i", video_path, "-vf", "reverse", "-frames:v", "1", "-q:v", "2", image_path])
+        return image_path
+
     def stream_duration(self, media_path: str, kind: str) -> float:
         """Length of just the video ('v') or audio ('a') stream; 0.0 if it can't be read."""
         try:

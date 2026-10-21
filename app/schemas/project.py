@@ -49,6 +49,12 @@ class ProjectCreate(BaseModel):
     scene_seconds: Optional[int] = None
 
 
+class ContinueRequest(BaseModel):
+    """What should happen next. Both fields are optional: no prompt = the writer continues naturally."""
+    prompt: Optional[str] = None
+    scene_count: Optional[int] = None
+
+
 class ProjectSettingsUpdate(BaseModel):
     """Per-project generation settings, editable on the review screen before (re)generating."""
     video_mode: Optional[str] = None

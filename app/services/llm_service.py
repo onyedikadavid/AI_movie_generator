@@ -136,6 +136,165 @@ class LLMService:
             problems.append("no characters were listed")
         return problems
 
+    async def _complete_scenes(self, parsed_data: dict, genre_hint, tone_hint, visual_style_hint, secs: int) -> dict:
+        """Writes each scene's dialogue and cleans up the model's output (shared by the first script and by
+        story continuations). `parsed_data` needs "characters" (everyone who may appear) and "scenes"."""
+        # Step B: character-to-character dialogue for scenes with 2+ people.
+        # Speakers are the characters actually present in each scene (not
+        # always the first two). One failed call never loses the whole script.
+        characters = parsed_data.get("characters", []) or []
+        by_name = {str(c.get("name", "")).strip().lower(): c for c in characters}
+        for scene in parsed_data.get("scenes", []) or []:
+            present = [by_name[n.strip().lower()] for n in (scene.get("characters_present") or [])
+                       if isinstance(n, str) and n.strip().lower() in by_name]
+            beat = scene.get("story_beat") or ""
+            goal = f"{scene.get('location', '')} - {scene.get('visual_description', '')}" + (
+                f". What this moment must achieve in the story: {beat}" if beat else "")
+            kids = is_kids(genre_hint, tone_hint, visual_style_hint)
+            if len(present) >= 2:
+                char_a, char_b = present[0], present[1]
+            elif not present and len(characters) >= 2:
+                char_a, char_b = characters[0], characters[1]
+            else:
+                # A single person on screen. With a narrator, the narrator carries the scene; without one,
+                # that character speaks out loud so the scene isn't silent.
+                solo = present[0] if len(present) == 1 else (characters[0] if len(characters) == 1 else None)
+                # Written whether or not a narrator is on, so switching the narrator off later never leaves a silent scene.
+                if solo is not None:
+                    try:
+                        scene["dialogue_turns"] = await self.agent_service.simulate_monologue(solo, goal, lines=2, kids=kids)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Spoken lines for scene %s failed (%s).", scene.get("scene_number"), e)
+                        scene["dialogue_turns"] = []
+                continue
+            try:
+                scene["dialogue_turns"] = await self.agent_service.simulate_interaction(
+                    char_a, char_b, goal, turns=(2 if secs <= 5 else 3 if secs <= 9 else 4) if (settings.SCENE_MODE or '').lower() == 'whole' else 4, kids=kids
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)
+                scene["dialogue_turns"] = []
+
+        # Small models sometimes emit null / wrong types; normalise before validating.
+        for sc in parsed_data.get("scenes", []) or []:
+            for key in ("location", "motion_prompt", "image_prompt", "narration_text", "sound_design"):
+                if sc.get(key) is None:
+                    sc[key] = "" if key not in ("narration_text", "sound_design") else None
+            if not sc.get("visual_description"):
+                sc["visual_description"] = sc.get("image_prompt") or sc.get("location") or "A scene from the story."
+            try:
+                sc["duration_seconds"] = max(2, min(int(float(sc.get("duration_seconds") or 5)), 20))
+            except (TypeError, ValueError):
+                sc["duration_seconds"] = 5
+            if not isinstance(sc.get("characters_present"), list):
+                sc["characters_present"] = []
+        for ch in parsed_data.get("characters", []) or []:
+            ch["appearance_prompt"] = ch.get("appearance_prompt") or ch.get("description") or ""
+            ch["description"] = ch.get("description") or ch["appearance_prompt"]
+        return parsed_data
+
+    async def continue_story(
+        self,
+        story_so_far: str,
+        characters: list,
+        scenes_so_far: list,
+        direction: str = "",
+        scene_count: int = None,
+        scene_seconds: int = None,
+        genre_hint: str = None,
+        tone_hint: str = None,
+        visual_style_hint: str = None,
+    ) -> dict:
+        """Writes what happens NEXT in an existing film: more of the story and new scenes (numbered after the existing
+        ones) with the SAME characters, looks and voices. Returns {"story_addition", "new_characters", "scenes"}."""
+        n = max(1, int(scene_count or 1))
+        secs = int(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)
+        start = len(scenes_so_far) + 1
+        cast = "\n".join(
+            f"        - {c['name']} ({c.get('gender') or '?'}, {c.get('age_group') or '?'}): {c.get('description') or ''} | LOOK: {c.get('appearance_prompt') or ''}"
+            for c in characters
+        )
+        recap = "\n".join(
+            f"        Scene {sc['scene_number']} [{sc.get('location') or ''}]: {sc.get('visual_description') or ''}"
+            + (f" Said: {sc['lines']}" if sc.get("lines") else "")
+            for sc in scenes_so_far[-6:]
+        )
+        last = scenes_so_far[-1] if scenes_so_far else {}
+        want = (f"The user wants the story to continue like this: {direction.strip()}" if (direction or "").strip()
+                else "The user gave no direction - continue the story in the most natural, interesting way.")
+        prompt = f"""
+        You are a screenwriter continuing a short film. Keep the story consistent and keep going from where it stopped.
+
+        STORY SO FAR:
+        {story_so_far or '(not written down - use the scenes below)'}
+
+        CHARACTERS (their names, looks and personalities are FIXED - reuse them exactly, never change how they look):
+{cast}
+
+        LAST SCENES:
+{recap}
+        The film stopped at: scene {last.get('scene_number', 0)} in "{last.get('location') or ''}".
+
+        {want}
+
+        RULES
+        1. Write EXACTLY {n} new scene{'s' if n != 1 else ''}, numbered from {start}. They follow directly after the last scene
+           and move the story forward - never repeat what already happened.
+        2. Same characters, same names, same world and tone. Only add a NEW character if the story truly needs one
+           (list them in "new_characters" with a full, concrete "appearance_prompt").
+        3. Each new scene is filmed as ONE continuous clip of about {secs} seconds: give it only what fits.
+        4. Cause and effect: each scene follows from the one before. Keep it clear for someone who has not read anything.
+        5. "continues_previous": true ONLY if the scene continues the same moment in the same place with the same people
+           (the camera simply carries on); false if it is a new place or time (a normal cut).
+        6. If the story already ended, continue with what happens next (a new chapter), do not restart it.
+
+        Return JSON exactly like this:
+        {{
+            "story_addition": "The new part of the story in 80 to 250 words, short paragraphs, present tense.",
+            "new_characters": [{{"name": "...", "description": "...", "appearance_prompt": "...", "gender": "male or female", "age_group": "child, teen, adult or elder"}}],
+            "scenes": [
+                {{
+                    "scene_number": {start},
+                    "story_beat": "One sentence: what happens and why it matters.",
+                    "continues_previous": false,
+                    "location": "...",
+                    "visual_description": "...",
+                    "image_prompt": "Detailed standalone text-to-image prompt for the keyframe.",
+                    "narration_text": "One or two short narrator sentences (under 25 words), never a character's own words.",
+                    "characters_present": ["Name1"],
+                    "motion_prompt": "Cinematic camera direction plus what the people DO.",
+                    "sound_design": "Background sounds, 6 to 14 words, no speech, no music.",
+                    "duration_seconds": {secs}
+                }}
+            ]
+        }}
+        Respond ONLY with raw JSON.
+        """
+        data = self._parse_json(await self._generate(prompt))
+        scenes = [sc for sc in (data.get("scenes") or []) if isinstance(sc, dict)]
+        if not scenes:
+            raise RuntimeError("The story writer didn't return any new scenes. Press Continue again.")
+        scenes = scenes[:n]
+        known = {c["name"].strip().lower() for c in characters}
+        new_chars = [c for c in (data.get("new_characters") or [])
+                     if isinstance(c, dict) and str(c.get("name", "")).strip() and str(c["name"]).strip().lower() not in known]
+        for sc in scenes:
+            sc["story_beat"] = sc.get("story_beat") or ""
+        for i, sc in enumerate(scenes):
+            sc["scene_number"] = start + i
+            sc["continues_previous"] = bool(sc.get("continues_previous")) and bool(scenes_so_far or i)
+        everyone = [dict(c) for c in characters] + new_chars
+        completed = await self._complete_scenes(
+            {"characters": everyone, "scenes": scenes}, genre_hint, tone_hint, visual_style_hint, secs
+        )
+        for sc, orig in zip(completed["scenes"], scenes):
+            sc["scene_number"], sc["continues_previous"] = orig["scene_number"], orig["continues_previous"]
+        return {
+            "story_addition": str(data.get("story_addition") or "").strip(),
+            "new_characters": new_chars,
+            "scenes": completed["scenes"],
+        }
+
     async def generate_script_structure(
         self,
         prompt: str,
@@ -276,58 +435,7 @@ class LLMService:
             if isinstance(sc, dict):
                 sc["scene_number"] = i
 
-        # Step B: character-to-character dialogue for scenes with 2+ people.
-        # Speakers are the characters actually present in each scene (not
-        # always the first two). One failed call never loses the whole script.
-        characters = parsed_data.get("characters", []) or []
-        by_name = {str(c.get("name", "")).strip().lower(): c for c in characters}
-        for scene in parsed_data.get("scenes", []) or []:
-            present = [by_name[n.strip().lower()] for n in (scene.get("characters_present") or [])
-                       if isinstance(n, str) and n.strip().lower() in by_name]
-            beat = scene.get("story_beat") or ""
-            goal = f"{scene.get('location', '')} - {scene.get('visual_description', '')}" + (
-                f". What this moment must achieve in the story: {beat}" if beat else "")
-            kids = is_kids(genre_hint, tone_hint, visual_style_hint)
-            if len(present) >= 2:
-                char_a, char_b = present[0], present[1]
-            elif not present and len(characters) >= 2:
-                char_a, char_b = characters[0], characters[1]
-            else:
-                # A single person on screen. With a narrator, the narrator carries the scene; without one,
-                # that character speaks out loud so the scene isn't silent.
-                solo = present[0] if len(present) == 1 else (characters[0] if len(characters) == 1 else None)
-                # Written whether or not a narrator is on, so switching the narrator off later never leaves a silent scene.
-                if solo is not None:
-                    try:
-                        scene["dialogue_turns"] = await self.agent_service.simulate_monologue(solo, goal, lines=2, kids=kids)
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("Spoken lines for scene %s failed (%s).", scene.get("scene_number"), e)
-                        scene["dialogue_turns"] = []
-                continue
-            try:
-                scene["dialogue_turns"] = await self.agent_service.simulate_interaction(
-                    char_a, char_b, goal, turns=(2 if secs <= 5 else 3 if secs <= 9 else 4) if (settings.SCENE_MODE or '').lower() == 'whole' else 4, kids=kids
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)
-                scene["dialogue_turns"] = []
-
-        # Small models sometimes emit null / wrong types; normalise before validating.
-        for sc in parsed_data.get("scenes", []) or []:
-            for key in ("location", "motion_prompt", "image_prompt", "narration_text", "sound_design"):
-                if sc.get(key) is None:
-                    sc[key] = "" if key not in ("narration_text", "sound_design") else None
-            if not sc.get("visual_description"):
-                sc["visual_description"] = sc.get("image_prompt") or sc.get("location") or "A scene from the story."
-            try:
-                sc["duration_seconds"] = max(2, min(int(float(sc.get("duration_seconds") or 5)), 20))
-            except (TypeError, ValueError):
-                sc["duration_seconds"] = 5
-            if not isinstance(sc.get("characters_present"), list):
-                sc["characters_present"] = []
-        for ch in parsed_data.get("characters", []) or []:
-            ch["appearance_prompt"] = ch.get("appearance_prompt") or ch.get("description") or ""
-            ch["description"] = ch.get("description") or ch["appearance_prompt"]
+        parsed_data = await self._complete_scenes(parsed_data, genre_hint, tone_hint, visual_style_hint, secs)
 
         parsed_data["story"] = story_text or None
         parsed_data["hook"] = (bible or {}).get("hook") or None

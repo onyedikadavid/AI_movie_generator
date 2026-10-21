@@ -92,7 +92,7 @@ class SceneRenderer:
         chosen = [c for c in characters if c.name.strip().lower() in present]
         return chosen or list(characters)
 
-    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str, narrator: bool = False, scene_seconds=None) -> str:
+    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str, narrator: bool = False, scene_seconds=None, prev_sig: str = "") -> str:
         blob = json.dumps(
             {
                 "v": 5,
@@ -113,6 +113,7 @@ class SceneRenderer:
                 "interp": settings.VIDEO_INTERPOLATE,
                 "mode": video_mode,
                 "narrator": bool(narrator),
+                "continues": prev_sig,
                 "scenemode": [settings.SCENE_MODE, float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)],
                 "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None), settings.MODEL_VOICE_MAX_WORDS],
                 "t2vres": settings.VIDEO_T2V_RESOLUTION,
@@ -229,7 +230,7 @@ class SceneRenderer:
                            scene_number, original, cap)
 
     def _render_whole(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, mode,
-                      on_screen, may_reuse, final_path, scene_seconds=None):
+                      on_screen, may_reuse, final_path, scene_seconds=None, prev_clip=None):
         """One clip per scene (or per `WHOLE_SCENE_MAX_SECONDS` piece of a long one). Returns None when the server
         could only render a fraction of the requested length, so the caller can use the shot-by-shot path."""
         W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
@@ -250,7 +251,17 @@ class SceneRenderer:
         wide_path = os.path.join(scene_dir, "keyframe.png")
         ctx.stage(STAGE_AUDIO, 0.05, "Preparing the scene")
         source = None
-        if not t2v:
+        continuing = bool(prev_clip)
+        if continuing:
+            # Carry on from the previous scene: its last frame is the first picture (works in both modes, no image model).
+            ctx.stage(STAGE_IMAGES, 0.10, "Carrying on from the previous scene")
+            start_frame = os.path.join(scene_dir, "start_frame.png")
+            if not (may_reuse and _nonempty(start_frame)):
+                ctx.call(self.ff.extract_last_frame, prev_clip, start_frame)
+            wide_path = start_frame
+            ctx.set_scene_image(start_frame)
+            source = start_frame
+        elif not t2v:
             ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
             if not (may_reuse and _nonempty(wide_path)):
                 ctx.checkpoint()
@@ -279,7 +290,7 @@ class SceneRenderer:
             request_len = min(max(talk * 1.25 + 1.8, 4.0), cap)
             prompt = pb.whole_scene_prompt(
                 beats, on_screen, scene.location, scene.visual_description, style, scene.motion_prompt,
-                getattr(scene, "sound_design", None), start_image=bool(source and n > 0),
+                getattr(scene, "sound_design", None), start_image=bool(continuing or (source and n > 0)),
             )
             seed = _seed(project_id, scene.scene_number, "whole", n)
             raw = os.path.join(scene_dir, f"whole_{n}_raw.mp4")
@@ -292,7 +303,7 @@ class SceneRenderer:
             if may_reuse and _nonempty(raw) and stored == key:
                 reused += 1
             else:
-                if t2v:
+                if t2v and source is None:
                     ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed, True)
                 else:
                     ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed, True)
@@ -307,7 +318,7 @@ class SceneRenderer:
                                    "lower VIDEO_T2V_RESOLUTION or WHOLE_SCENE_MAX_SECONDS.", scene.scene_number, request_len, got)
                 with open(key_file, "w") as fh:
                     fh.write(key)
-            if n == 0 and t2v and not _nonempty(wide_path):
+            if n == 0 and t2v and not continuing and not _nonempty(wide_path):
                 ctx.call(self.ff.extract_frame, raw, wide_path)
                 ctx.set_scene_image(wide_path)
             ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
@@ -335,6 +346,7 @@ class SceneRenderer:
         video_mode: Optional[str] = None,
         narrator: Optional[bool] = None,
         scene_seconds: Optional[int] = None,
+        prev_clip: Optional[str] = None,
     ) -> SceneResult:
         """video_mode: "i2v" (draw a keyframe with the image model, then animate it) or "t2v" (text-to-video, no
         image model). None = the server-wide default (settings.VIDEO_MODE)."""
@@ -346,7 +358,10 @@ class SceneRenderer:
         free_cam = pb.is_free_camera(settings.VIDEO_CAMERA_MOTION)
         narrator = bool(settings.NARRATOR_ENABLED if narrator is None else narrator)   # per-project choice wins
 
-        fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds)
+        # A scene that carries on from the previous one starts from that clip's last picture (same people, same place).
+        prev_clip = prev_clip if (getattr(scene, "continues_previous", False) and prev_clip and os.path.exists(prev_clip)) else None
+        prev_sig = f"{os.path.getsize(prev_clip)}:{int(os.path.getmtime(prev_clip))}" if prev_clip else ""
+        fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds, prev_sig)
         may_reuse = self._prepare_dir(scene_dir, fp)
         final_path = os.path.join(scene_dir, "scene_final.mp4")
         if may_reuse and _nonempty(final_path):
@@ -396,7 +411,7 @@ class SceneRenderer:
 
         if model_audio and (settings.SCENE_MODE or "shots").strip().lower() == "whole":
             whole = self._render_whole(scene, characters, style, cast, scene_dir, project_id, ctx,
-                                       segments, mode, on_screen, may_reuse, final_path, scene_seconds)
+                                       segments, mode, on_screen, may_reuse, final_path, scene_seconds, prev_clip)
             if whole is not None:
                 return whole
             logger.warning("Scene %s: whole-scene clip came back too short; falling back to shots.", scene.scene_number)
