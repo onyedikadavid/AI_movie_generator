@@ -21,7 +21,22 @@ def clamp_scene_seconds(value) -> Optional[int]:
         n = int(value)
     except (TypeError, ValueError):
         return None
-    return max(3, min(n, 30)) if n > 0 else None
+    return max(3, min(n, 120)) if n > 0 else None
+
+
+VIDEO_RESOLUTIONS = ("512x288", "640x352", "768x448", "960x544")
+
+
+def normalize_resolution(value) -> Optional[str]:
+    """One of the allowed 'WIDTHxHEIGHT' sizes (all 16:9, multiples of 32); anything else = None (server default)."""
+    v = str(value or "").strip().lower().replace("*", "x").replace(" ", "")
+    return v if v in VIDEO_RESOLUTIONS else None
+
+
+def normalize_scene_style(value) -> Optional[str]:
+    """'whole' | 'shots' | 'reuse'; anything else = None (use the SCENE_MODE setting)."""
+    v = str(value or "").strip().lower()
+    return v if v in ("whole", "shots", "reuse") else None
 
 
 def normalize_video_mode(value: Optional[str]) -> Optional[str]:
@@ -47,6 +62,8 @@ class ProjectCreate(BaseModel):
     # Leave empty for automatic.
     scene_count: Optional[int] = None
     scene_seconds: Optional[int] = None
+    video_resolution: Optional[str] = None
+    scene_style: Optional[str] = None
 
 
 class ContinueRequest(BaseModel):
@@ -60,6 +77,8 @@ class ProjectSettingsUpdate(BaseModel):
     video_mode: Optional[str] = None
     narrator_enabled: Optional[bool] = None
     scene_seconds: Optional[int] = None
+    video_resolution: Optional[str] = None
+    scene_style: Optional[str] = None
 
 
 class RunState(BaseModel):
@@ -102,6 +121,8 @@ class ProjectResponse(RunState):
     narrator_enabled: Optional[bool] = None
     scene_count: Optional[int] = None
     scene_seconds: Optional[int] = None
+    video_resolution: Optional[str] = None
+    scene_style: Optional[str] = None
     created_at: datetime
 
     class Config:

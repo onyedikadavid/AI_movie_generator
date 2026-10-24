@@ -35,12 +35,14 @@ class FakeModelVideo:
                         "-f", "lavfi", "-i", f"sine=f=220:d={secs}", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-shortest", path], check=True, capture_output=True)
 
-    def generate_text_clip(self, prompt, path, duration, seed=None, want_audio=None):
+    def generate_text_clip(self, prompt, path, duration, seed=None, want_audio=None, resolution=None):
+        self.seen_res = getattr(self, "seen_res", []) + [resolution]
         self.t2v.append((prompt, duration, want_audio))
         self._clip(path, duration, 960, 544)
         return path
 
-    def generate_clip(self, image, path, prompt, duration, seed=None, want_audio=False):
+    def generate_clip(self, image, path, prompt, duration, seed=None, want_audio=False, resolution=None):
+        self.seen_res = getattr(self, "seen_res", []) + [resolution]
         self.i2v.append((os.path.basename(image), prompt, duration, want_audio))
         self._clip(path, duration, 768, 512)
         return path
@@ -87,7 +89,9 @@ def main():
     for mode in ("t2v", "i2v"):
         tts, img, vid = FakeTTS(), FakeImage(), FakeModelVideo()
         r = SceneRenderer(img, vid, tts, ff)
-        res = r.render(scene(), chars, "Cinematic sci-fi", cast, os.path.join(tmp, "s_" + mode), "p1", FakeCtx(), video_mode=mode)
+        res = r.render(scene(), chars, "Cinematic sci-fi", cast, os.path.join(tmp, "s_" + mode), "p1", FakeCtx(), video_mode=mode,
+                       resolution="640x352")
+        assert vid.seen_res and all(x == "640x352" for x in vid.seen_res), ("project resolution must reach the video client", vid.seen_res)
         assert tts.lines == [], "model-voice mode must not call text-to-speech at all"
         reqs = vid.t2v if mode == "t2v" else vid.i2v
         prompts = [x[0] if mode == "t2v" else x[1] for x in reqs]

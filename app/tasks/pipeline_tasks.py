@@ -258,7 +258,7 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
     for i, sc in enumerate(result["scenes"]):
         turns = [t for t in (normalize_turn(t) for t in (sc.get("dialogue_turns") or [])) if (t.get("text") or "").strip()]
         try:
-            dur = max(2, min(int(float(sc.get("duration_seconds") or secs or 8)), 30))
+            dur = max(2, min(int(float(sc.get("duration_seconds") or secs or 8)), 120))
         except (TypeError, ValueError):
             dur = int(secs or 8)
         db.add(Scene(
@@ -361,10 +361,11 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     )
     if cast.write_back(characters):
         db.commit()
-    logger.info("Settings in effect: AUDIO_MODE=%s | SCENE_MODE=%s (%ss per scene) | CAMERA=%s | video mode=%s | narrator=%s",
-                settings.AUDIO_MODE, settings.SCENE_MODE, project.scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
+    logger.info("Settings in effect: AUDIO_MODE=%s | scene style=%s (%ss per scene) | CAMERA=%s | video mode=%s | narrator=%s | video size=%s",
+                settings.AUDIO_MODE, project.scene_style or settings.SCENE_MODE, project.scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
                 project.video_mode or settings.VIDEO_MODE,
-                project.narrator_enabled if project.narrator_enabled is not None else settings.NARRATOR_ENABLED)
+                project.narrator_enabled if project.narrator_enabled is not None else settings.NARRATOR_ENABLED,
+                project.video_resolution or settings.VIDEO_T2V_RESOLUTION)
     if (settings.AUDIO_MODE or "").strip().lower() != "model":
         logger.warning("AUDIO_MODE is '%s', so edge-tts voices are used. Set AUDIO_MODE=model in .env (and restart the "
                        "worker) to use the video model's own voices.", settings.AUDIO_MODE)
@@ -398,7 +399,8 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
         sctx = _SceneCtx(db, project, scene, ctl, i, total)
         try:
             result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode,
-                                     narrator=project.narrator_enabled, scene_seconds=project.scene_seconds, prev_clip=prev_clip)
+                                     narrator=project.narrator_enabled, scene_seconds=project.scene_seconds, prev_clip=prev_clip,
+                                     resolution=project.video_resolution, scene_style=project.scene_style)
         except RunStopped:
             safe_rollback(db)
             try:

@@ -202,6 +202,39 @@ class FFmpegService:
         ])
         return dst_path
 
+    def pingpong(self, src_path: str, dst_path: str) -> str:
+        """The clip played forward then backward: twice as long and it loops without a visible jump."""
+        _require_ffmpeg()
+        _run([
+            "ffmpeg", "-y", "-i", src_path,
+            "-filter_complex", "[0:v]split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
+            dst_path,
+        ])
+        return dst_path
+
+    def cut_from_base(self, loop_path: str, dst_path: str, start: float, duration: float, zoom: float, pan_x: float,
+                      pan_y: float, width: int, height: int, fps: int = 24, sharpen: float = 0.0) -> str:
+        """One shot of exactly `duration` seconds taken from a (looping) base clip: begins at `start`, optionally
+        punched in by `zoom` (1.0 = whole frame) towards the point pan_x/pan_y (0..1) so each cut looks different."""
+        _require_ffmpeg()
+        frames = max(1, int(round(duration * fps)))
+        vf = [f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos", f"crop={width}:{height}"]
+        if zoom and zoom > 1.01:
+            vf += [f"scale=trunc({width}*{zoom:.3f}/2)*2:trunc({height}*{zoom:.3f}/2)*2:flags=lanczos",
+                   f"crop={width}:{height}:(iw-ow)*{pan_x:.3f}:(ih-oh)*{pan_y:.3f}"]
+        vf += ["setsar=1", f"fps={fps}"]
+        if sharpen and sharpen > 0:
+            vf.append(f"unsharp=5:5:{sharpen:.2f}:5:5:0.0")
+        vf.append("format=yuv420p")
+        _run([
+            "ffmpeg", "-y", "-stream_loop", "-1", "-i", loop_path, "-ss", f"{max(0.0, start):.3f}",
+            "-vf", ",".join(vf), "-frames:v", str(frames), "-an",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-r", str(fps), "-movflags", "+faststart",
+            dst_path,
+        ])
+        return dst_path
+
     def normalize_clip(
         self,
         src_path: str,

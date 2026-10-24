@@ -19,6 +19,8 @@ from app.schemas.character import CharacterResponse, CharacterUpdate
 from app.schemas.project import (
     DeleteResult, ProjectDetailResponse, ProjectListItem, ProjectResponse, ProjectSettingsUpdate, QueueSnapshot,
     normalize_video_mode,
+    normalize_resolution,
+    normalize_scene_style,
     clamp_scene_count,
     ContinueRequest,
     clamp_scene_seconds,
@@ -53,6 +55,10 @@ def _project_out(db, p: Project, model=ProjectResponse):
     item = model.model_validate(p)
     if hasattr(item, "video_mode") and item.video_mode is None:
         item.video_mode = normalize_video_mode(settings.VIDEO_MODE) or "i2v"   # show the mode that will really be used
+    if hasattr(item, "scene_style") and item.scene_style is None:
+        item.scene_style = normalize_scene_style(settings.SCENE_MODE) or "shots"   # show what will really happen
+    if hasattr(item, "video_resolution") and item.video_resolution is None:
+        item.video_resolution = normalize_resolution(settings.VIDEO_T2V_RESOLUTION) or "960x544"   # what will really be used
     if hasattr(item, "scene_seconds") and item.scene_seconds is None:
         item.scene_seconds = int(settings.WHOLE_SCENE_MAX_SECONDS)   # automatic = the server default
     if hasattr(item, "narrator_enabled") and item.narrator_enabled is None:
@@ -74,6 +80,8 @@ async def create_project(
     narrator_enabled: Optional[bool] = Form(None),
     scene_count: Optional[str] = Form(None),
     scene_seconds: Optional[str] = Form(None),
+    video_resolution: Optional[str] = Form(None),
+    scene_style: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -94,6 +102,8 @@ async def create_project(
         narrator_enabled=narrator_enabled,
         scene_count=clamp_scene_count(scene_count),
         scene_seconds=clamp_scene_seconds(scene_seconds),
+        video_resolution=normalize_resolution(video_resolution),
+        scene_style=normalize_scene_style(scene_style),
     )
     db.add(new_project)
     await db.commit()
@@ -292,6 +302,27 @@ async def update_project_settings(project_id: str, payload: ProjectSettingsUpdat
             raise HTTPException(status_code=422, detail="video_mode must be 'i2v' (image first) or 't2v' (text-to-video).")
         if mode != project.video_mode:
             project.video_mode = mode
+            scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id))).scalars().all()
+            for sc in scenes:
+                if sc.render_status == "DONE":
+                    sc.render_status = "PENDING"
+    if "scene_style" in changes:
+        new_style = normalize_scene_style(changes["scene_style"])
+        if changes["scene_style"] and new_style is None:
+            raise HTTPException(status_code=422, detail="scene_style must be 'whole', 'shots' or 'reuse'.")
+        current = project.scene_style or normalize_scene_style(settings.SCENE_MODE) or "shots"
+        if new_style and new_style != current:
+            project.scene_style = new_style
+            scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id))).scalars().all()
+            for sc in scenes:
+                if sc.render_status == "DONE":
+                    sc.render_status = "PENDING"
+    if "video_resolution" in changes:
+        res = normalize_resolution(changes["video_resolution"])
+        if changes["video_resolution"] and res is None:
+            raise HTTPException(status_code=422, detail="video_resolution must be one of: 512x288, 640x352, 768x448, 960x544.")
+        if res != project.video_resolution:
+            project.video_resolution = res
             scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id))).scalars().all()
             for sc in scenes:
                 if sc.render_status == "DONE":

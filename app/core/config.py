@@ -168,6 +168,10 @@ class Settings(BaseSettings):
     # 145 = 6 s, 193 = 8 s, 241 = ~10 s). Generation time and GPU memory grow quickly with length.
     SCENE_MODE: str = "shots"
     WHOLE_SCENE_MAX_SECONDS: float = 8.0
+    # SCENE_MODE=reuse: make ONE short clip per scene, cut every shot of the scene from it (different start, zoom
+    # and side), and lay the voices on top with text-to-speech. Much less GPU time; lips do not match the words.
+    # (The project's own choice in the UI wins over SCENE_MODE.) Length of that one clip:
+    REUSE_BASE_SECONDS: float = 6.0
     # False (default) = exactly ONE clip per scene: if the dialogue is longer than fits, the lines are shortened.
     # True = a long scene may be split between lines into several clips.
     WHOLE_SCENE_SPLIT: bool = False

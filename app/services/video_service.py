@@ -166,6 +166,7 @@ class VideoGenerationService:
         duration: float,
         seed: int = None,
         want_audio: bool = False,
+        resolution: str = None,
     ) -> str:
         """Image-to-video: render one short clip (<= ~5 s) that starts from `image_path`.
         want_audio=True also returns the model's own sound (its voices + effects) inside the mp4."""
@@ -178,6 +179,8 @@ class VideoGenerationService:
             "fps": str(settings.VIDEO_FPS),
             "with_audio": "1" if want_audio else "",
         }
+        width, height = self._size(resolution)
+        data["width"], data["height"] = str(width), str(height)
         if seed is not None:
             data["seed"] = str(int(seed))
         # The image is sent as file BYTES (the GPU is on another machine and can't read this disk).
@@ -187,16 +190,25 @@ class VideoGenerationService:
         atomic_write(output_path, self._post(data, files, image_bytes))
         return output_path
 
+    @staticmethod
+    def _size(resolution: str = None):
+        """(width, height) from a project's 'WxH' choice, else the VIDEO_T2V_RESOLUTION setting, else 960x544."""
+        for cand in (resolution, settings.VIDEO_T2V_RESOLUTION):
+            try:
+                w, h = (int(v) for v in str(cand).lower().split("x"))
+                if w >= 256 and h >= 144:
+                    return w, h
+            except Exception:  # noqa: BLE001
+                continue
+        return 960, 544
+
     def generate_text_clip(self, prompt: str, output_path: str, duration: float, seed: int = None,
-                           want_audio: bool = None) -> str:
+                           want_audio: bool = None, resolution: str = None) -> str:
         """Text-to-video: render one short clip from the prompt alone (no start image).
         want_audio=None -> follow AUDIO_MODE (the model's sound is wanted in 'hybrid' and 'model' modes)."""
         if want_audio is None:
             want_audio = (settings.AUDIO_MODE or "").lower() in ("hybrid", "model")
-        try:
-            width, height = (int(v) for v in settings.VIDEO_T2V_RESOLUTION.lower().split("x"))
-        except Exception:  # noqa: BLE001
-            width, height = 960, 544
+        width, height = self._size(resolution)
         data = {
             "mode": "t2v",
             # Ask the server to include the model's own sound (background only in 'hybrid', voices too in 'model').

@@ -31,6 +31,8 @@ STATEMENTS = [
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS narrator_enabled BOOLEAN",
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS scene_count INTEGER",
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS scene_seconds INTEGER",
+    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS video_resolution VARCHAR",
+    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS scene_style VARCHAR",
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS resume_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE scripts ADD COLUMN IF NOT EXISTS story_text TEXT",
     "ALTER TABLE scripts ADD COLUMN IF NOT EXISTS story_hook TEXT",

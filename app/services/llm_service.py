@@ -183,7 +183,7 @@ class LLMService:
             if not sc.get("visual_description"):
                 sc["visual_description"] = sc.get("image_prompt") or sc.get("location") or "A scene from the story."
             try:
-                sc["duration_seconds"] = max(2, min(int(float(sc.get("duration_seconds") or 5)), 20))
+                sc["duration_seconds"] = max(2, min(int(float(sc.get("duration_seconds") or 5)), 120))
             except (TypeError, ValueError):
                 sc["duration_seconds"] = 5
             if not isinstance(sc.get("characters_present"), list):

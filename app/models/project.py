@@ -59,6 +59,11 @@ class Project(Base):
     # Chosen in the UI. None = automatic (the script writer decides the number of scenes; scene length = server default).
     scene_count = Column(Integer, nullable=True)
     scene_seconds = Column(Integer, nullable=True)
+    # Video size the video model renders at, "WIDTHxHEIGHT" (smaller = much faster). None = VIDEO_T2V_RESOLUTION.
+    video_resolution = Column(String, nullable=True)
+    # How a scene is made: "whole" (one clip, the model speaks), "shots" (a clip per shot), "reuse" (one clip cut into
+    # all shots, voices added on top). NULL = the SCENE_MODE setting.
+    scene_style = Column(String, nullable=True)
     # A pending 'continue the story' request (read by the worker, then cleared).
     continue_prompt = Column(Text, nullable=True)
     continue_scenes = Column(Integer, nullable=True)
