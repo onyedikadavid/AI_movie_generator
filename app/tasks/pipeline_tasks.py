@@ -163,7 +163,8 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
         db, ctl,
         lambda: asyncio.run(
             llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
-                                         scene_count=project.scene_count, scene_seconds=project.scene_seconds)
+                                         scene_count=project.scene_count, scene_seconds=project.scene_seconds,
+                                         scene_style=project.scene_style or settings.SCENE_MODE)
         )
     )
     ctl.checkpoint()
@@ -203,6 +204,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
             sound_design=(sc.sound_design or None),
             dialogue_turns=turns or None,
             characters_present=list(sc.characters_present or []) or None,
+            continues_previous=bool(getattr(sc, "continues_previous", None)) and sc.scene_number > 1,
             render_status="PENDING",
         ))
 

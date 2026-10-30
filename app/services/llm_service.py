@@ -82,7 +82,7 @@ class LLMService:
                 )
             return response.json().get("response", "{}")
 
-    async def _story_bible(self, prompt: str, genre_hint=None, tone_hint=None) -> dict:
+    async def _story_bible(self, prompt: str, genre_hint=None, tone_hint=None, words=(150, 350)) -> dict:
         """Step 1 of the script: the model reads the idea, states what the story IS and WRITES THE FULL STORY (hook
         first, beginning-middle-end) before any scene exists. Best effort - on failure the scenes are written from the
         prompt alone. Returns the analysis keys plus "story"."""
@@ -104,7 +104,7 @@ class LLMService:
           "ending": "how it ends",
           "message": "the meaning / feeling the viewer is left with",
           "hook": "the opening hook, one or two sentences",
-          "story": "the complete story, 150 to 350 words, in short paragraphs, written in present tense, hook first, ending last"}}
+          "story": "the complete story, {words[0]} to {words[1]} words, in short paragraphs, written in present tense, hook first, ending last"}}
         Story idea: {prompt}
         Respond ONLY with raw JSON.
         """
@@ -136,7 +136,7 @@ class LLMService:
             problems.append("no characters were listed")
         return problems
 
-    async def _complete_scenes(self, parsed_data: dict, genre_hint, tone_hint, visual_style_hint, secs: int) -> dict:
+    async def _complete_scenes(self, parsed_data: dict, genre_hint, tone_hint, visual_style_hint, secs: int, compact: bool = False) -> dict:
         """Writes each scene's dialogue and cleans up the model's output (shared by the first script and by
         story continuations). `parsed_data` needs "characters" (everyone who may appear) and "scenes"."""
         # Step B: character-to-character dialogue for scenes with 2+ people.
@@ -169,7 +169,7 @@ class LLMService:
                 continue
             try:
                 scene["dialogue_turns"] = await self.agent_service.simulate_interaction(
-                    char_a, char_b, goal, turns=(2 if secs <= 5 else 3 if secs <= 9 else 4) if (settings.SCENE_MODE or '').lower() == 'whole' else 4, kids=kids
+                    char_a, char_b, goal, turns=(2 if secs <= 5 else 3 if secs <= 9 else 4) if (compact or (settings.SCENE_MODE or '').lower() == 'whole') else 4, kids=kids
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)
@@ -295,6 +295,159 @@ class LLMService:
             "scenes": completed["scenes"],
         }
 
+    # ------------------------------------------------------------------ full film
+    async def _film_beats(self, prompt: str, story: str, n: int, secs: int) -> list:
+        """Splits the story into exactly `n` consecutive beats - one per continuous clip of the film. Long films are
+        planned in groups so each model call stays small."""
+        beats: list = []
+        group = 25
+        while len(beats) < n:
+            a, b = len(beats) + 1, min(n, len(beats) + group)
+            before = ("Beats just before these: " + " / ".join(beats[-3:])) if beats else ""
+            ask = f"""
+        You are planning a film that will be made of {n} consecutive continuous shots of about {secs} seconds each.
+        Write beats {a} to {b} of {n} (the film runs from beat 1 to beat {n}). Each beat is ONE concrete, filmable sentence:
+        what the viewer sees happen in that stretch. Every beat follows from the one before it. Beat 1 is the HOOK;
+        beat {n} is the clear ending. {before}
+        Cover this part of the story: from about {round(100 * (a - 1) / n)}% to {round(100 * b / n)}% of the whole story.
+        Return JSON exactly like {{"beats": ["beat {a} ...", "..."]}} with EXACTLY {b - a + 1} strings.
+        Story idea: {prompt}
+        Full story: {story or prompt}
+        Respond ONLY with raw JSON.
+        """
+            got = []
+            try:
+                data = self._parse_json(await self._generate(ask))
+                items = data.get("beats") if isinstance(data, dict) else data
+                got = [str(x).strip() for x in (items or []) if str(x).strip()]
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Film outline %s-%s failed (%s).", a, b, e)
+            want = b - a + 1
+            if len(got) < want:
+                logger.warning("Film outline gave %s of %s beats for %s-%s; filling the gap.", len(got), want, a, b)
+                filler = got[-1] if got else (beats[-1] if beats else prompt)
+                got += [f"The story carries on: {filler}"] * (want - len(got))
+            beats += got[:want]
+        return beats
+
+    async def _generate_film_script(self, prompt, genre_hint, tone_hint, visual_style_hint, n, secs, style_constraints) -> ScriptDecompositionSchema:
+        """One prompt -> a film of `n` continuous parts. The story is written once, split into `n` beats, then the
+        scenes are written a few at a time (so even a long film never needs one giant answer). Every scene is a
+        part of ~`secs` seconds that normally carries on from the last frame of the one before."""
+        story_words = max(150, min(n * 25, 900))
+        bible = await self._story_bible(prompt, genre_hint, tone_hint, words=(story_words, story_words + 150))
+        story_text = bible.pop("story", "") if bible else ""
+        beats = await self._film_beats(prompt, story_text, n, secs)
+        bible_text = ""
+        if bible:
+            bible_text = "\n        STORY BIBLE (the film MUST follow it):\n" + "".join(f"        - {k}: {v}\n" for k, v in bible.items() if v)
+        if story_text:
+            bible_text += "\n        THE FULL STORY:\n        " + story_text.replace("\n", "\n        ") + "\n"
+
+        head: dict = {}
+        characters: list = []
+        scenes: list = []
+        batch, empty = 5, 0
+        while len(scenes) < n:
+            start = len(scenes) + 1
+            todo = beats[len(scenes): len(scenes) + batch]
+            first = not scenes
+            cast = "\n".join(
+                f"        - {c['name']} ({c.get('gender') or '?'}, {c.get('age_group') or '?'}): {c.get('description') or ''} | LOOK: {c.get('appearance_prompt') or ''}"
+                for c in characters)
+            recap = "\n".join(f"        Scene {sc['scene_number']} [{sc.get('location') or ''}]: {sc.get('visual_description') or ''}" for sc in scenes[-4:])
+            beat_lines = "\n".join(f"        {start + i}. {b}" for i, b in enumerate(todo))
+            if first:
+                head_json = ('"title": "A short, catchy title", "genre": "...", "tone": "...", "visual_style": "...",\n'
+                             '            "characters": [{"name": "...", "description": "Role and personality in one or two sentences.", '
+                             '"appearance_prompt": "Concrete and reusable in every scene: age, build, skin tone, hair, face, clothing. Never mention the story here.", '
+                             '"gender": "male or female", "age_group": "child, teen, adult or elder"}],')
+            else:
+                head_json = ('"new_characters": [{"name": "...", "description": "...", "appearance_prompt": "...", '
+                             '"gender": "male or female", "age_group": "child, teen, adult or elder"}],')
+            cast_block = ("CHARACTERS (names and looks are FIXED - reuse them exactly):\n" + cast) if cast else "Invent the characters the story needs."
+            recap_block = ("PREVIOUS SCENES:\n" + recap) if recap else ""
+            hook_rule = "Scene 1 opens on the HOOK." if first else ""
+            plural = "S" if len(todo) != 1 else ""
+            ask = f"""
+        You are a screenwriter writing part of a {n}-part film that will be filmed as ONE long video made of consecutive
+        continuous clips of about {secs} seconds each. Write scenes {start} to {start + len(todo) - 1}.
+        {bible_text}
+        {cast_block}
+        {recap_block}
+
+        WRITE EXACTLY {len(todo)} SCENE{plural}, one per beat, in this order:
+{beat_lines}
+
+        RULES
+        1. Each scene shows ONLY its beat and fits {secs} seconds. The film continues after these scenes, so do not end it
+           unless the beat says so. {hook_rule}
+        2. "continues_previous": true when the camera simply carries on from the previous scene - the same moment, the same
+           place, or a flowing transition (for example a character flying up into a new world); false ONLY for a clear
+           cut to a new place or time. Scene 1 is always false. In a film most scenes should be true.
+        3. Same characters, names and looks in every scene. Add a new character only if the story truly needs one.
+        4. Every scene must make sense to a viewer who has not read the story.
+        {style_constraints}
+        Return JSON exactly like this:
+        {{
+            {head_json}
+            "scenes": [
+                {{
+                    "scene_number": {start},
+                    "story_beat": "One sentence: what happens and why it matters.",
+                    "continues_previous": false,
+                    "location": "...",
+                    "visual_description": "What we see, concrete and filmable.",
+                    "image_prompt": "Detailed standalone text-to-image prompt for the first frame.",
+                    "narration_text": "One or two SHORT narrator sentences (under 25 words), never a character's own words.",
+                    "characters_present": ["Name1"],
+                    "motion_prompt": "Cinematic camera direction plus what the people DO.",
+                    "sound_design": "Background sounds, 6 to 14 words, no speech, no music.",
+                    "duration_seconds": {secs}
+                }}
+            ]
+        }}
+        Respond ONLY with raw JSON.
+        """
+            try:
+                data = self._parse_json(await self._generate(ask))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Film scenes %s-%s failed (%s).", start, start + len(todo) - 1, e)
+                data = {}
+            got = [sc for sc in (data.get("scenes") or []) if isinstance(sc, dict)] if isinstance(data, dict) else []
+            if first and isinstance(data, dict):
+                head = {k: data.get(k) for k in ("title", "genre", "tone", "visual_style")}
+                characters = [c for c in (data.get("characters") or []) if isinstance(c, dict) and str(c.get("name", "")).strip()]
+            elif isinstance(data, dict):
+                known = {c["name"].strip().lower() for c in characters}
+                characters += [c for c in (data.get("new_characters") or [])
+                               if isinstance(c, dict) and str(c.get("name", "")).strip() and str(c["name"]).strip().lower() not in known]
+            if not got or (first and not characters):
+                empty += 1
+                if empty >= 3:
+                    raise RuntimeError("The story writer could not write the film. Try again, or ask for fewer parts.")
+                continue
+            empty = 0
+            got = got[: len(todo)]
+            for i, sc in enumerate(got):
+                sc["scene_number"] = start + i
+                sc["continues_previous"] = bool(sc.get("continues_previous")) and (start + i) > 1
+                sc["duration_seconds"] = secs
+            done = await self._complete_scenes({"characters": characters, "scenes": got}, genre_hint, tone_hint,
+                                               visual_style_hint, secs, compact=True)
+            scenes += done["scenes"]
+            characters = done["characters"]
+            logger.info("Film script: %s of %s scenes written.", len(scenes), n)
+
+        data = {
+            "title": head.get("title") or "Untitled film", "genre": head.get("genre") or genre_hint or "",
+            "tone": head.get("tone") or tone_hint or "", "visual_style": head.get("visual_style") or visual_style_hint or "",
+            "characters": characters, "scenes": scenes,
+            "story": story_text or None, "hook": (bible or {}).get("hook") or None,
+            "story_outline": {k: v for k, v in (bible or {}).items() if k != "hook"} or None,
+        }
+        return ScriptDecompositionSchema(**data)
+
     async def generate_script_structure(
         self,
         prompt: str,
@@ -304,6 +457,7 @@ class LLMService:
         narrator: bool = None,
         scene_count: int = None,
         scene_seconds: int = None,
+        scene_style: str = None,
     ) -> ScriptDecompositionSchema:
         """
         Generates full script breakdown utilizing AgentService for character interactions.
@@ -340,6 +494,10 @@ class LLMService:
         # Stage 1: UNDERSTAND the story. The model first reads the prompt and writes a short "story bible" (what it is
         # about, who wants what, what stands in the way, how it ends, and a hook). Stage 2 then builds the scenes
         # from that bible, so the film has one clear line from beginning to end instead of loosely related pictures.
+        compact = (scene_style or "").lower() in ("whole", "film")   # short single-clip scenes: fewer spoken turns
+        if (scene_style or "").lower() == "film" and scene_count and int(scene_count) >= 2:
+            return await self._generate_film_script(prompt, genre_hint, tone_hint, visual_style_hint, int(scene_count),
+                                                    int(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS), style_constraints)
         n_words = len((prompt or "").split())
         if scene_count:
             count_rule = (f"Write EXACTLY {int(scene_count)} scenes - no more, no fewer. Spread the whole story "
@@ -435,7 +593,7 @@ class LLMService:
             if isinstance(sc, dict):
                 sc["scene_number"] = i
 
-        parsed_data = await self._complete_scenes(parsed_data, genre_hint, tone_hint, visual_style_hint, secs)
+        parsed_data = await self._complete_scenes(parsed_data, genre_hint, tone_hint, visual_style_hint, secs, compact=compact)
 
         parsed_data["story"] = story_text or None
         parsed_data["hook"] = (bible or {}).get("hook") or None

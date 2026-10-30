@@ -73,6 +73,15 @@ def main():
         assert (vid3.t2v or vid3.i2v), "a new resolution must render new footage"
         print(f"OK {mode}: new resolution renders new footage")
 
+    # "film" renders each scene as ONE whole clip spoken by the model (no text-to-speech), like "whole".
+    settings.WHOLE_SCENE_MAX_SECONDS = 20.0
+    tts, img, vid = FakeTTS(), FakeImage(), FakeModelVideo()
+    vid.cap = 481
+    res = SceneRenderer(img, vid, tts, ff).render(scene(), chars, "Cinematic sci-fi", cast, os.path.join(root, "film", "scene_1"), "p1",
+                                                  FakeCtx(), video_mode="t2v", scene_seconds=20, scene_style="film")
+    assert len(vid.t2v) == 1 and not tts.lines, (len(vid.t2v), tts.lines)
+    print("OK film: one whole clip per scene, spoken by the model")
+
     shutil.rmtree(root, ignore_errors=True)
     print("\nALL REUSE-FOOTAGE CHECKS PASSED")
 

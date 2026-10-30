@@ -309,7 +309,7 @@ async def update_project_settings(project_id: str, payload: ProjectSettingsUpdat
     if "scene_style" in changes:
         new_style = normalize_scene_style(changes["scene_style"])
         if changes["scene_style"] and new_style is None:
-            raise HTTPException(status_code=422, detail="scene_style must be 'whole', 'shots' or 'reuse'.")
+            raise HTTPException(status_code=422, detail="scene_style must be 'whole', 'shots', 'reuse' or 'film'.")
         current = project.scene_style or normalize_scene_style(settings.SCENE_MODE) or "shots"
         if new_style and new_style != current:
             project.scene_style = new_style

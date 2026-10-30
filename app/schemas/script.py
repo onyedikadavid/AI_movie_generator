@@ -53,6 +53,10 @@ class SceneSchema(BaseModel):
         default=None,
         description="Background sounds and effects heard in this scene (no speech, no music), e.g. 'distant gunfire, helicopter overhead, panicked crowd'.",
     )
+    continues_previous: Optional[bool] = Field(
+        default=None,
+        description="True if the camera simply carries on from the previous scene (same moment), False for a cut.",
+    )
     dialogue_turns: List[DialogueTurn] = Field(
         default_factory=list,
         description="Ordered list of back-and-forth dialogue turns spoken by characters in this scene."

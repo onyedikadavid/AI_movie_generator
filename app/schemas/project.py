@@ -13,7 +13,7 @@ def clamp_scene_count(value) -> Optional[int]:
         n = int(value)
     except (TypeError, ValueError):
         return None
-    return max(1, min(n, 20)) if n > 0 else None
+    return max(1, min(n, 200)) if n > 0 else None
 
 
 def clamp_scene_seconds(value) -> Optional[int]:
@@ -34,9 +34,9 @@ def normalize_resolution(value) -> Optional[str]:
 
 
 def normalize_scene_style(value) -> Optional[str]:
-    """'whole' | 'shots' | 'reuse'; anything else = None (use the SCENE_MODE setting)."""
+    """'whole' | 'shots' | 'reuse' | 'film'; anything else = None (use the SCENE_MODE setting)."""
     v = str(value or "").strip().lower()
-    return v if v in ("whole", "shots", "reuse") else None
+    return v if v in ("whole", "shots", "reuse", "film") else None
 
 
 def normalize_video_mode(value: Optional[str]) -> Optional[str]:

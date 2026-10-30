@@ -361,7 +361,8 @@ class SceneRenderer:
         mode = (video_mode or settings.VIDEO_MODE or "i2v").strip().lower()
         mode = "t2v" if mode == "t2v" else "i2v"
         style_mode = (scene_style or settings.SCENE_MODE or "shots").strip().lower()   # per-project choice wins
-        style_mode = style_mode if style_mode in ("whole", "shots", "reuse") else "shots"
+        style_mode = style_mode if style_mode in ("whole", "shots", "reuse", "film") else "shots"
+        whole_mode = style_mode in ("whole", "film")   # "film" = whole scenes that carry on from one another
         reuse = style_mode == "reuse"
         # Reused footage has no speech of its own, so the voices are always recorded by text-to-speech.
         model_audio = (settings.AUDIO_MODE or "voices").strip().lower() == "model" and not reuse
@@ -380,7 +381,7 @@ class SceneRenderer:
             return SceneResult(final_path, wide, total, 0, 0)
 
         on_screen = self._characters_on_screen(scene, characters)
-        segments = self._segments(scene, cast, model_audio, narrator, whole=(style_mode == "whole"))
+        segments = self._segments(scene, cast, model_audio, narrator, whole=whole_mode)
 
         # ---------------------------------------------------------- 1. voices
         ctx.stage(STAGE_AUDIO, 0.02, "Preparing the lines" if model_audio else "Recording voices")
@@ -423,7 +424,7 @@ class SceneRenderer:
             return self._render_reuse(scene, characters, style, cast, scene_dir, project_id, ctx, segments, shots, total,
                                       mode, on_screen, scene_seconds, prev_clip, prev_sig, resolution, final_path, reused)
 
-        if model_audio and style_mode == "whole":
+        if model_audio and whole_mode:
             whole = self._render_whole(scene, characters, style, cast, scene_dir, project_id, ctx,
                                        segments, mode, on_screen, may_reuse, final_path, scene_seconds, prev_clip, resolution)
             if whole is not None:
