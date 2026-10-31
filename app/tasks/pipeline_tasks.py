@@ -1,5 +1,7 @@
 import os
 import asyncio
+import hashlib
+import json
 import logging
 import shutil
 import time
@@ -7,6 +9,7 @@ import uuid
 
 from celery.signals import worker_ready
 from sqlalchemy import delete, select
+from sqlalchemy.exc import DBAPIError
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
@@ -17,6 +20,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.script import Script
 from app.models.character import Character
 from app.models.scene import Scene
+from app.schemas.script import ScriptDecompositionSchema
 
 from app.services import run_control as rc
 from app.services.run_control import RunControl, RunStopped
@@ -159,16 +163,60 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
 
     llm = LLMService()
     prompt, genre, tone, vstyle = project.raw_prompt, project.requested_genre, project.requested_tone, project.requested_visual_style
-    script_schema = _call(
-        db, ctl,
-        lambda: asyncio.run(
-            llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
-                                         scene_count=project.scene_count, scene_seconds=project.scene_seconds,
-                                         scene_style=project.scene_style or settings.SCENE_MODE)
+    # A long script (a full film can take 15+ minutes to write) is kept on disk, so if saving it fails or the task is
+    # retried, the same request reuses it instead of writing it all again.
+    scene_style = project.scene_style or settings.SCENE_MODE
+    cache_key = hashlib.sha1(json.dumps(
+        ["script-v1", prompt, genre, tone, vstyle, project.scene_count, project.scene_seconds, scene_style], default=str).encode()).hexdigest()
+    cache_file = os.path.join(settings.STORAGE_DIR, "projects", pid, "script_cache.json")
+    script_schema = None
+    try:
+        if os.path.exists(cache_file):
+            cached = json.load(open(cache_file, encoding="utf-8"))
+            if cached.get("key") == cache_key:
+                script_schema = ScriptDecompositionSchema.model_validate(cached["script"])
+                logger.info("Project %s: reusing the script written earlier for this exact request.", pid)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Couldn't read the saved script (%s) - writing it again.", e)
+    if script_schema is None:
+        script_schema = _call(
+            db, ctl,
+            lambda: asyncio.run(
+                llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
+                                             scene_count=project.scene_count, scene_seconds=project.scene_seconds,
+                                             scene_style=scene_style)
+            )
         )
-    )
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as fh:
+                json.dump({"key": cache_key, "script": script_schema.model_dump(mode="json")}, fh)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Couldn't save a copy of the script (%s).", e)
     ctl.checkpoint()
 
+    # Saving to the database must never throw away a script that took many minutes to write: a dropped connection
+    # (hosted Postgres, flaky network) is retried on a fresh one.
+    for attempt in range(1, 5):
+        try:
+            _save_script(db, pid, script_schema)
+            try:
+                os.remove(cache_file)   # saved: the next run writes a fresh script
+            except OSError:
+                pass
+            return
+        except DBAPIError as e:
+            logger.warning("Saving the script failed (attempt %s/4): %s", attempt, str(e).splitlines()[0][:160])
+            safe_rollback(db)
+            if attempt == 4:
+                raise
+            time.sleep(3 * attempt)
+            ctl.checkpoint()
+
+
+def _save_script(db, pid: str, script_schema) -> None:
+    """Replaces the project's characters/scenes/script with a freshly written one (one transaction)."""
+    project = db.get(Project, pid)
     # Re-running (Retry / Resume after a failed breakdown) replaces earlier output.
     db.execute(delete(Scene).where(Scene.project_id == pid))
     db.execute(delete(Character).where(Character.project_id == pid))
