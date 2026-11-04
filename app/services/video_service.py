@@ -56,28 +56,6 @@ class VideoGenerationService:
             h.update(hashlib.sha1(image_bytes).digest())
         return h.hexdigest()
 
-    _limit_cache = (0.0, None)
-
-    def server_max_seconds(self):
-        """Longest clip the video server will really make (it reports max_frames on /health), or None if it
-        can't be asked. Used so a scene is planned to fit ONE clip instead of being cut off by the server."""
-        at, val = VideoGenerationService._limit_cache
-        if time.time() - at < 60:
-            return val
-        val = None
-        try:
-            url = resolve_url(KEY_WAN_API_URL, settings.WAN_API_URL)
-            base = url.split("/v1/")[0].rstrip("/")
-            resp = self._send("get", base + "/health", timeout=httpx.Timeout(20.0, connect=10.0), attempts=1)
-            info = resp.json()
-            frames, fps = int(info.get("max_frames") or 0), int(info.get("fps") or 24)
-            if frames > 8:
-                val = (frames - 1) / float(fps)
-        except Exception as e:  # noqa: BLE001 - an older server has no max_frames; just don't plan around it
-            logger.info("Could not read the video server's clip limit (%s).", e)
-        VideoGenerationService._limit_cache = (time.time(), val)
-        return val
-
     def _post(self, data: dict, files=None, image_bytes: bytes = None) -> bytes:
         """Ask the video server for one clip; returns the MP4 bytes."""
         # Resolved fresh on every call - picks up a restarted notebook's new URL.
@@ -166,10 +144,12 @@ class VideoGenerationService:
         duration: float,
         seed: int = None,
         want_audio: bool = False,
-        resolution: str = None,
+        audio_path: str = None,
     ) -> str:
-        """Image-to-video: render one short clip (<= ~5 s) that starts from `image_path`.
-        want_audio=True also returns the model's own sound (its voices + effects) inside the mp4."""
+        """Image-to-video: render one short clip that starts from `image_path`.
+        want_audio=True also returns the model's own sound (its voices + effects) inside the mp4.
+        audio_path: for audio-driven models (MultiTalk / InfiniteTalk / Hunyuan Avatar) - the audio the face is animated
+        to. The server then makes the clip as long as that audio."""
         if not os.path.exists(image_path):
             raise RuntimeError(f"Keyframe image not found at {image_path}; cannot generate video.")
         data = {
@@ -179,36 +159,32 @@ class VideoGenerationService:
             "fps": str(settings.VIDEO_FPS),
             "with_audio": "1" if want_audio else "",
         }
-        width, height = self._size(resolution)
-        data["width"], data["height"] = str(width), str(height)
         if seed is not None:
             data["seed"] = str(int(seed))
         # The image is sent as file BYTES (the GPU is on another machine and can't read this disk).
         with open(image_path, "rb") as fh:
             image_bytes = fh.read()
         files = {"image": (os.path.basename(image_path), image_bytes, "image/png")}
+        if audio_path:
+            if not os.path.exists(audio_path):
+                raise RuntimeError(f"Audio for the shot not found at {audio_path}; cannot generate the talking clip.")
+            with open(audio_path, "rb") as fh:
+                audio_bytes = fh.read()
+            files["audio"] = (os.path.basename(audio_path), audio_bytes, "audio/wav")
+            data["audio_sha1"] = hashlib.sha1(audio_bytes).hexdigest()   # part of the job key: other audio = other job
         atomic_write(output_path, self._post(data, files, image_bytes))
         return output_path
 
-    @staticmethod
-    def _size(resolution: str = None):
-        """(width, height) from a project's 'WxH' choice, else the VIDEO_T2V_RESOLUTION setting, else 960x544."""
-        for cand in (resolution, settings.VIDEO_T2V_RESOLUTION):
-            try:
-                w, h = (int(v) for v in str(cand).lower().split("x"))
-                if w >= 256 and h >= 144:
-                    return w, h
-            except Exception:  # noqa: BLE001
-                continue
-        return 960, 544
-
     def generate_text_clip(self, prompt: str, output_path: str, duration: float, seed: int = None,
-                           want_audio: bool = None, resolution: str = None) -> str:
+                           want_audio: bool = None) -> str:
         """Text-to-video: render one short clip from the prompt alone (no start image).
         want_audio=None -> follow AUDIO_MODE (the model's sound is wanted in 'hybrid' and 'model' modes)."""
         if want_audio is None:
             want_audio = (settings.AUDIO_MODE or "").lower() in ("hybrid", "model")
-        width, height = self._size(resolution)
+        try:
+            width, height = (int(v) for v in settings.VIDEO_T2V_RESOLUTION.lower().split("x"))
+        except Exception:  # noqa: BLE001
+            width, height = 960, 544
         data = {
             "mode": "t2v",
             # Ask the server to include the model's own sound (background only in 'hybrid', voices too in 'model').

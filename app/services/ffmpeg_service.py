@@ -1,7 +1,8 @@
 import os
 import shutil
 import subprocess
-from typing import List, Optional, Sequence
+import re
+from typing import List, Optional, Sequence, Tuple
 
 
 def _require_ffmpeg():
@@ -202,39 +203,6 @@ class FFmpegService:
         ])
         return dst_path
 
-    def pingpong(self, src_path: str, dst_path: str) -> str:
-        """The clip played forward then backward: twice as long and it loops without a visible jump."""
-        _require_ffmpeg()
-        _run([
-            "ffmpeg", "-y", "-i", src_path,
-            "-filter_complex", "[0:v]split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0[v]",
-            "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
-            dst_path,
-        ])
-        return dst_path
-
-    def cut_from_base(self, loop_path: str, dst_path: str, start: float, duration: float, zoom: float, pan_x: float,
-                      pan_y: float, width: int, height: int, fps: int = 24, sharpen: float = 0.0) -> str:
-        """One shot of exactly `duration` seconds taken from a (looping) base clip: begins at `start`, optionally
-        punched in by `zoom` (1.0 = whole frame) towards the point pan_x/pan_y (0..1) so each cut looks different."""
-        _require_ffmpeg()
-        frames = max(1, int(round(duration * fps)))
-        vf = [f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos", f"crop={width}:{height}"]
-        if zoom and zoom > 1.01:
-            vf += [f"scale=trunc({width}*{zoom:.3f}/2)*2:trunc({height}*{zoom:.3f}/2)*2:flags=lanczos",
-                   f"crop={width}:{height}:(iw-ow)*{pan_x:.3f}:(ih-oh)*{pan_y:.3f}"]
-        vf += ["setsar=1", f"fps={fps}"]
-        if sharpen and sharpen > 0:
-            vf.append(f"unsharp=5:5:{sharpen:.2f}:5:5:0.0")
-        vf.append("format=yuv420p")
-        _run([
-            "ffmpeg", "-y", "-stream_loop", "-1", "-i", loop_path, "-ss", f"{max(0.0, start):.3f}",
-            "-vf", ",".join(vf), "-frames:v", str(frames), "-an",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-r", str(fps), "-movflags", "+faststart",
-            dst_path,
-        ])
-        return dst_path
-
     def normalize_clip(
         self,
         src_path: str,
@@ -268,11 +236,6 @@ class FFmpegService:
 
         cmd = ["ffmpeg", "-y", "-i", src_path]
         if self.has_audio(src_path):
-            # If the model's voice runs longer than its picture, hold the last frame until the speech ends instead of
-            # cutting the speech off ("-shortest" below would otherwise trim the audio to the picture).
-            a_len, v_len = self.stream_duration(src_path, "a"), self.stream_duration(src_path, "v")
-            if v_len > 0 and a_len > v_len + 0.05:
-                vf.insert(len(vf) - 1, f"tpad=stop_mode=clone:stop_duration={a_len - v_len + 0.1:.3f}")
             # Per-clip loudness levelling keeps the voices at a similar volume from shot to shot.
             af = "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,aformat=channel_layouts=stereo,apad"
             cmd += ["-vf", ",".join(vf), "-af", af, "-map", "0:v:0", "-map", "0:a:0"]
@@ -287,24 +250,47 @@ class FFmpegService:
         _run(cmd)
         return dst_path
 
-    # ------------------------------------------------------------------ hybrid audio
-    def extract_last_frame(self, video_path: str, image_path: str) -> str:
-        """Saves (nearly) the last picture of a video - the starting point of a scene that carries straight on."""
+    # ------------------------------------------------------------------ speech completeness
+    def _mean_volume(self, media_path: str, tail_seconds: Optional[float] = None) -> Optional[float]:
+        """Mean loudness (dB) of a file's audio - of the whole clip, or only its last `tail_seconds`. None if there is
+        no audio or ffmpeg cannot tell."""
         _require_ffmpeg()
-        _run(["ffmpeg", "-y", "-sseof", "-0.15", "-i", video_path, "-frames:v", "1", "-q:v", "2", image_path])
-        if not os.path.exists(image_path) or os.path.getsize(image_path) < 500:
-            _run(["ffmpeg", "-y", "-i", video_path, "-vf", "reverse", "-frames:v", "1", "-q:v", "2", image_path])
-        return image_path
-
-    def stream_duration(self, media_path: str, kind: str) -> float:
-        """Length of just the video ('v') or audio ('a') stream; 0.0 if it can't be read."""
+        cmd = ["ffmpeg", "-hide_banner", "-nostats"]
+        if tail_seconds:
+            cmd += ["-sseof", f"-{float(tail_seconds):.3f}"]
+        cmd += ["-i", media_path, "-vn", "-af", "volumedetect", "-f", "null", "-"]
         try:
-            out = _run(["ffprobe", "-v", "error", "-select_streams", f"{kind}:0", "-show_entries", "stream=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1", media_path]).stdout.strip().split()
-            return float(out[0]) if out else 0.0
-        except Exception:  # noqa: BLE001
-            return 0.0
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError:
+            return None
+        m = re.search(r"mean_volume:\s*(-?[0-9.]+|-inf)\s*dB", proc.stderr or "")
+        if not m:
+            return None
+        return -120.0 if m.group(1) == "-inf" else float(m.group(1))
 
+    def tail_speech_active(self, media_path: str, window: float = 0.30, margin_db: float = 14.0) -> Tuple[bool, Optional[float], Optional[float]]:
+        """Heuristic 'was this line cut off?': True when the clip's last `window` seconds are still about as loud as
+        the clip overall - a finished line leaves a quiet tail (room tone), a cut-off one ends mid-word.
+        Returns (active, overall_dB, tail_dB). Clips with (almost) no sound, or no audio, return False - there is
+        nothing to compare, and generating again would not help."""
+        if not self.has_audio(media_path):
+            return False, None, None
+        overall = self._mean_volume(media_path)
+        tail = self._mean_volume(media_path, window)
+        if overall is None or tail is None or overall < -45.0:
+            return False, overall, tail
+        return (tail >= overall - float(margin_db)), overall, tail
+
+    def cut_audio(self, src_path: str, start: float, duration: float, out_wav: str) -> str:
+        """A slice of an audio file as 16 kHz mono WAV (what the audio-driven video models listen to)."""
+        _require_ffmpeg()
+        _run([
+            "ffmpeg", "-y", "-ss", f"{max(0.0, start):.3f}", "-t", f"{max(0.1, duration):.3f}", "-i", src_path,
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_wav,
+        ])
+        return out_wav
+
+    # ------------------------------------------------------------------ hybrid audio
     def has_audio(self, media_path: str) -> bool:
         """True if the file has a usable audio stream."""
         if shutil.which("ffprobe") is None:

@@ -32,7 +32,6 @@ class CharacterSchema(BaseModel):
 
 class SceneSchema(BaseModel):
     scene_number: int = Field(..., description="Sequential index of the scene starting at 1.")
-    story_beat: Optional[str] = Field(default=None, description="What this scene does for the story (hook, setup, turning point, ending...).")
     duration_seconds: int = Field(default=5, description="Estimated duration of the scene in seconds.")
     location: str = Field(default="", description="Setting or background environment for the scene.")
     visual_description: str = Field(..., description="Detailed visual action and layout of the scene.")
@@ -53,10 +52,6 @@ class SceneSchema(BaseModel):
         default=None,
         description="Background sounds and effects heard in this scene (no speech, no music), e.g. 'distant gunfire, helicopter overhead, panicked crowd'.",
     )
-    continues_previous: Optional[bool] = Field(
-        default=None,
-        description="True if the camera simply carries on from the previous scene (same moment), False for a cut.",
-    )
     dialogue_turns: List[DialogueTurn] = Field(
         default_factory=list,
         description="Ordered list of back-and-forth dialogue turns spoken by characters in this scene."
@@ -70,9 +65,6 @@ class ScriptDecompositionSchema(BaseModel):
     visual_style: str = Field(..., description="Consistent visual aesthetics and lighting style.")
     characters: List[CharacterSchema] = Field(..., description="List of characters participating in the project.")
     scenes: List[SceneSchema] = Field(..., description="Sequential breakdown of scenes.")
-    story: Optional[str] = Field(default=None, description="The full story written from the user's idea (hook first, clear beginning-middle-end).")
-    hook: Optional[str] = None
-    story_outline: Optional[dict] = None
 
 
 # --- FastAPI Database Request/Response Schemas ---
@@ -82,9 +74,6 @@ class ScriptBase(BaseModel):
     tone: Optional[str] = None
     visual_style: Optional[str] = None
     full_text: Optional[str] = None
-    story_text: Optional[str] = None
-    story_hook: Optional[str] = None
-    story_outline: Optional[dict] = None
 
 class ScriptCreate(ScriptBase):
     pass

@@ -19,7 +19,6 @@ class SceneBase(BaseModel):
     image_prompt: str
     motion_prompt: Optional[str] = None
     sound_design: Optional[str] = None
-    continues_previous: Optional[bool] = None
 
 
 class SceneCreate(SceneBase):
@@ -35,7 +34,6 @@ class SceneUpdate(BaseModel):
     image_prompt: Optional[str] = None
     motion_prompt: Optional[str] = None
     sound_design: Optional[str] = None
-    continues_previous: Optional[bool] = None
     dialogue_turns: Optional[List[DialogueTurnOut]] = None
 
 

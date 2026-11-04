@@ -28,7 +28,6 @@ import hashlib
 import json
 import logging
 import os
-import zlib
 import re
 import shutil
 from dataclasses import dataclass
@@ -93,11 +92,10 @@ class SceneRenderer:
         chosen = [c for c in characters if c.name.strip().lower() in present]
         return chosen or list(characters)
 
-    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str, narrator: bool = False, scene_seconds=None, prev_sig: str = "", resolution=None, style_mode: str = "shots") -> str:
-        reuse = style_mode == "reuse"
+    def _fingerprint(self, scene, characters: Sequence, style: str, cast: VoiceCast, video_mode: str) -> str:
         blob = json.dumps(
             {
-                "v": 5,
+                "v": 6,
                 "img": scene.image_prompt,
                 "motion": scene.motion_prompt,
                 "vis": scene.visual_description,
@@ -114,12 +112,12 @@ class SceneRenderer:
                 "camera": settings.VIDEO_CAMERA_MOTION,
                 "interp": settings.VIDEO_INTERPOLATE,
                 "mode": video_mode,
-                "narrator": bool(narrator),
-                "continues": prev_sig,
-                "scenemode": [style_mode, float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)],
+                "narrator": bool(settings.NARRATOR_ENABLED),
                 "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None), settings.MODEL_VOICE_MAX_WORDS],
-                "t2vres": resolution or settings.VIDEO_T2V_RESOLUTION,
-                "reuse": [bool(reuse), settings.REUSE_BASE_SECONDS] if reuse else False,
+                "t2vres": settings.VIDEO_T2V_RESOLUTION,
+                "speech": [settings.MODEL_VOICE_WPS, settings.VIDEO_MAX_CLIP_SECONDS, settings.SPEECH_COMPLETE_CHECK,
+                           settings.SPEECH_RETRY_EXTRA_SECONDS, settings.SPEECH_MAX_RETRIES, settings.SPEECH_TAIL_MARGIN_DB],
+                "driven": settings.VIDEO_AUDIO_DRIVEN,
             },
             sort_keys=True,
             default=str,
@@ -142,27 +140,24 @@ class SceneRenderer:
             f.write(fingerprint)
         return reusable
 
-    def _segments(self, scene, cast: VoiceCast, model_audio: bool = False, narrator: bool = False, whole: Optional[bool] = None) -> List[Segment]:
+    def _segments(self, scene, cast: VoiceCast, model_audio: bool = False) -> List[Segment]:
         # Each line is first split into ACTION (performed on screen) and WORDS (the only thing ever spoken).
         turns = []
         for raw in (scene.dialogue_turns or []):
             t = normalize_turn(raw)
             if clean_for_tts(t.get("text", ""), t.get("speaker", "")):
                 turns.append(t)
-        narrator_on = bool(narrator)
+        narrator_on = bool(settings.NARRATOR_ENABLED)
         if not narrator_on:
             # Characters only: nothing is spoken by a narrator, not even lines the script labelled "Narrator".
             turns = [t for t in turns if not is_narrator((t.get("speaker") or "").strip())]
         narration = clean_for_tts(scene.narration_text or "") if narrator_on else ""
-        if whole is None:
-            whole = (settings.SCENE_MODE or "shots").strip().lower() == "whole"
-        chunk_words = 60 if whole else settings.MODEL_VOICE_MAX_WORDS   # whole scene: lines stay whole
         segments: List[Segment] = []
 
         def add(speaker: str, kind: str, text: str, expression: str = "", action: str = "") -> None:
             if model_audio:
                 # The video model speaks the line inside one clip: split long lines at sentence ends.
-                for n, piece in enumerate(chunk_speech(text, chunk_words) or [text]):
+                for n, piece in enumerate(chunk_speech(text, settings.MODEL_VOICE_MAX_WORDS) or [text]):
                     segments.append(Segment(index=len(segments), speaker=speaker, kind=kind, text=piece,
                                             expression=expression, action=action if n == 0 else ""))
             else:
@@ -170,11 +165,7 @@ class SceneRenderer:
                                         expression=expression, action=action))
 
         if narration:
-            if model_audio:
-                n_words = settings.MODEL_NARRATION_WORDS * (3 if whole else 1) * (1 if turns else 2)
-            else:
-                n_words = 22 if turns else 45
-            add(NARRATOR_NAME, "narration", limit_words(narration, n_words))
+            add(NARRATOR_NAME, "narration", limit_words(narration, 22 if turns else 45))
         for t in turns:
             speaker = (t.get("speaker") or "").strip() or "Character"
             if is_narrator(speaker):
@@ -196,147 +187,6 @@ class SceneRenderer:
             member = next((c for c in characters if c.name.strip().lower() == m.name.strip().lower()), None)
         return member
 
-    # ------------------------------------------------------- whole-scene mode
-    def _whole_parts(self, segments: List[Segment], cap: float) -> List[List[Segment]]:
-        """Groups consecutive lines into the fewest pieces that each fit in `cap` seconds (a line is never cut)."""
-        parts: List[List[Segment]] = []
-        cur: List[Segment] = []
-        used = 0.0
-        for seg in segments:
-            if seg.kind == "ambient":
-                continue
-            need = seg.duration + 0.5
-            if cur and used + need > cap - 0.8:
-                parts.append(cur)
-                cur, used = [], 0.0
-            cur.append(seg)
-            used += need
-        if cur:
-            parts.append(cur)
-        return parts
-
-    @staticmethod
-    def _fit_to_clip(spoken: List[Segment], cap: float, scene_number) -> None:
-        """One clip must hold the whole scene: shorten the lines (each keeps its start) until they fit."""
-        def need() -> float:
-            return sum(sg.duration + 0.5 for sg in spoken) * 1.25 + 1.8
-        ratio = 1.0
-        original = need()
-        while spoken and need() > cap and ratio > 0.2:
-            ratio -= 0.1
-            for sg in spoken:
-                words = len(sg.text.split())
-                sg.text = limit_words(sg.text, max(3, int(words * ratio)))
-                sg.duration = estimate_speech_seconds(sg.text)
-        if spoken and abs(need() - original) > 0.01:
-            logger.warning("Scene %s: the dialogue (%.1f s) is longer than one %.1f s clip, so lines were shortened to "
-                           "fit. Shorten the lines in the editor, or raise LTX_MAX_FRAMES / WHOLE_SCENE_MAX_SECONDS.",
-                           scene_number, original, cap)
-
-    def _render_whole(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, mode,
-                      on_screen, may_reuse, final_path, scene_seconds=None, prev_clip=None, resolution=None):
-        """One clip per scene (or per `WHOLE_SCENE_MAX_SECONDS` piece of a long one). Returns None when the server
-        could only render a fraction of the requested length, so the caller can use the shot-by-shot path."""
-        W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
-        cap = float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)   # the project's own choice wins over .env
-        server_cap = getattr(self.video, "server_max_seconds", lambda: None)()
-        if server_cap and server_cap < cap:
-            logger.warning("Scene %s: the video server only makes %.1f s clips (LTX_MAX_FRAMES), below "
-                           "the %.0f s you asked for. Raise LTX_MAX_FRAMES in the Kaggle launch cell for longer scenes.",
-                           scene.scene_number, server_cap, cap)
-            cap = server_cap
-        spoken = [sg for sg in segments if sg.kind != "ambient"]
-        if settings.WHOLE_SCENE_SPLIT:
-            parts = self._whole_parts(segments, cap) or [[]]
-        else:
-            self._fit_to_clip(spoken, cap, scene.scene_number)
-            parts = [spoken]
-        t2v = mode == "t2v"
-        wide_path = os.path.join(scene_dir, "keyframe.png")
-        ctx.stage(STAGE_AUDIO, 0.05, "Preparing the scene")
-        source = None
-        continuing = bool(prev_clip)
-        if continuing:
-            # Carry on from the previous scene: its last frame is the first picture (works in both modes, no image model).
-            ctx.stage(STAGE_IMAGES, 0.10, "Carrying on from the previous scene")
-            start_frame = os.path.join(scene_dir, "start_frame.png")
-            if not (may_reuse and _nonempty(start_frame)):
-                ctx.call(self.ff.extract_last_frame, prev_clip, start_frame)
-            wide_path = start_frame
-            ctx.set_scene_image(start_frame)
-            source = start_frame
-        elif not t2v:
-            ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
-            if not (may_reuse and _nonempty(wide_path)):
-                ctx.checkpoint()
-                ctx.call(
-                    self.image.generate_image,
-                    pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
-                    wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"),
-                )
-            ctx.set_scene_image(wide_path)
-            source = wide_path
-        fitted: List[str] = []
-        reused = 0
-        for n, part in enumerate(parts):
-            ctx.checkpoint()
-            ctx.stage(STAGE_VIDEOS, 0.35 + 0.55 * n / len(parts), f"Generating the scene ({n + 1}/{len(parts)})")
-            beats = []
-            for seg in part:
-                member = self._character_for(seg.speaker, cast, characters) if seg.kind == "dialogue" else None
-                beats.append({
-                    "kind": seg.kind, "speaker": seg.speaker, "expression": seg.expression, "action": seg.action,
-                    "speech": seg.text, "voice_desc": cast.voice_description(seg.speaker),
-                })
-            talk = sum(sg.duration + 0.5 for sg in part)
-            # Real speech is slower than the estimate and starts a moment after the clip begins; the server also rounds
-            # the length DOWN to 8k+1 frames. Ask for generous room so the last line is never cut off.
-            request_len = min(max(talk * 1.25 + 1.8, 4.0), cap)
-            prompt = pb.whole_scene_prompt(
-                beats, on_screen, scene.location, scene.visual_description, style, scene.motion_prompt,
-                getattr(scene, "sound_design", None), start_image=bool(continuing or (source and n > 0)),
-            )
-            seed = _seed(project_id, scene.scene_number, "whole", n)
-            raw = os.path.join(scene_dir, f"whole_{n}_raw.mp4")
-            fit = os.path.join(scene_dir, f"whole_{n}.mp4")
-            key = hashlib.sha1(
-                f"whole|{mode}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(source or '')}".encode()
-            ).hexdigest()
-            key_file = raw + ".key"
-            stored = open(key_file).read().strip() if os.path.exists(key_file) else None
-            if may_reuse and _nonempty(raw) and stored == key:
-                reused += 1
-            else:
-                if t2v and source is None:
-                    ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed, True, resolution=resolution)
-                else:
-                    ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed, True, resolution=resolution)
-                got = self.ff.get_duration(raw)
-                if got < 0.8 * request_len:
-                    if settings.WHOLE_SCENE_FALLBACK:
-                        for f in (raw, key_file):
-                            if os.path.exists(f):
-                                os.remove(f)
-                        return None
-                    logger.warning("Scene %s: asked for %.1f s but the server returned %.1f s (GPU memory). Keeping it; "
-                                   "lower VIDEO_T2V_RESOLUTION or WHOLE_SCENE_MAX_SECONDS.", scene.scene_number, request_len, got)
-                with open(key_file, "w") as fh:
-                    fh.write(key)
-            if n == 0 and t2v and not continuing and not _nonempty(wide_path):
-                ctx.call(self.ff.extract_frame, raw, wide_path)
-                ctx.set_scene_image(wide_path)
-            ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
-            fitted.append(fit)
-        ctx.checkpoint()
-        ctx.stage(STAGE_ASSEMBLE, 0.93, "Finishing the scene")
-        if len(fitted) == 1:
-            shutil.copyfile(fitted[0], final_path)
-        else:
-            self.ff.concatenate_videos(fitted, final_path, "aac")
-        total = self.ff.get_duration(final_path)
-        ctx.stage(STAGE_ASSEMBLE, 1.0, "Scene done")
-        return SceneResult(final_path, wide_path, total, len(fitted), reused)
-
     # ------------------------------------------------------------------ main
     def render(
         self,
@@ -348,11 +198,6 @@ class SceneRenderer:
         project_id: str,
         ctx,
         video_mode: Optional[str] = None,
-        narrator: Optional[bool] = None,
-        scene_seconds: Optional[int] = None,
-        prev_clip: Optional[str] = None,
-        resolution: Optional[str] = None,
-        scene_style: Optional[str] = None,
     ) -> SceneResult:
         """video_mode: "i2v" (draw a keyframe with the image model, then animate it) or "t2v" (text-to-video, no
         image model). None = the server-wide default (settings.VIDEO_MODE)."""
@@ -360,19 +205,10 @@ class SceneRenderer:
         reused = 0
         mode = (video_mode or settings.VIDEO_MODE or "i2v").strip().lower()
         mode = "t2v" if mode == "t2v" else "i2v"
-        style_mode = (scene_style or settings.SCENE_MODE or "shots").strip().lower()   # per-project choice wins
-        style_mode = style_mode if style_mode in ("whole", "shots", "reuse", "film") else "shots"
-        whole_mode = style_mode in ("whole", "film")   # "film" = whole scenes that carry on from one another
-        reuse = style_mode == "reuse"
-        # Reused footage has no speech of its own, so the voices are always recorded by text-to-speech.
-        model_audio = (settings.AUDIO_MODE or "voices").strip().lower() == "model" and not reuse
+        model_audio = (settings.AUDIO_MODE or "voices").strip().lower() == "model"
         free_cam = pb.is_free_camera(settings.VIDEO_CAMERA_MOTION)
-        narrator = bool(settings.NARRATOR_ENABLED if narrator is None else narrator)   # per-project choice wins
 
-        # A scene that carries on from the previous one starts from that clip's last picture (same people, same place).
-        prev_clip = prev_clip if (getattr(scene, "continues_previous", False) and prev_clip and os.path.exists(prev_clip)) else None
-        prev_sig = f"{os.path.getsize(prev_clip)}:{int(os.path.getmtime(prev_clip))}" if prev_clip else ""
-        fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds, prev_sig, resolution, style_mode)
+        fp = self._fingerprint(scene, characters, style, cast, mode)
         may_reuse = self._prepare_dir(scene_dir, fp)
         final_path = os.path.join(scene_dir, "scene_final.mp4")
         if may_reuse and _nonempty(final_path):
@@ -381,7 +217,7 @@ class SceneRenderer:
             return SceneResult(final_path, wide, total, 0, 0)
 
         on_screen = self._characters_on_screen(scene, characters)
-        segments = self._segments(scene, cast, model_audio, narrator, whole=whole_mode)
+        segments = self._segments(scene, cast, model_audio)
 
         # ---------------------------------------------------------- 1. voices
         ctx.stage(STAGE_AUDIO, 0.02, "Preparing the lines" if model_audio else "Recording voices")
@@ -419,17 +255,6 @@ class SceneRenderer:
             hard_max_len=settings.VIDEO_MAX_CLIP_SECONDS + 1.2,
             one_per_segment=model_audio,
         )
-
-        if reuse:
-            return self._render_reuse(scene, characters, style, cast, scene_dir, project_id, ctx, segments, shots, total,
-                                      mode, on_screen, scene_seconds, prev_clip, prev_sig, resolution, final_path, reused)
-
-        if model_audio and whole_mode:
-            whole = self._render_whole(scene, characters, style, cast, scene_dir, project_id, ctx,
-                                       segments, mode, on_screen, may_reuse, final_path, scene_seconds, prev_clip, resolution)
-            if whole is not None:
-                return whole
-            logger.warning("Scene %s: whole-scene clip came back too short; falling back to shots.", scene.scene_number)
 
         t2v = mode == "t2v"
         # Hybrid sound = the video model's own background sound mixed under the pipeline's voices.
@@ -485,6 +310,20 @@ class SceneRenderer:
             ctx.stage(STAGE_IMAGES, 0.35, "Keyframes ready")
 
 
+        # Audio-driven models (MultiTalk / InfiniteTalk / Hunyuan Avatar) animate a face to AUDIO: build the scene's voice track
+        # first so every shot can be given its own slice of it.
+        audio_driven = bool(settings.VIDEO_AUDIO_DRIVEN) and not model_audio
+        voices_wav = None
+        if audio_driven:
+            if t2v:
+                raise RuntimeError(
+                    "VIDEO_AUDIO_DRIVEN=true needs an image-first (i2v) project: the audio-driven video models animate a "
+                    "face from a picture. Switch the project to image-first, or set VIDEO_AUDIO_DRIVEN=false."
+                )
+            voices_wav = os.path.join(scene_dir, "voices.wav")
+            ctx.call(self.ff.build_audio_track, [x.audio_path for x in segments], [x.gap_after for x in segments],
+                     voices_wav, True, LEAD_IN)
+
         # ---------------------------------------------------------- 5. motion
         fitted: List[str] = []
         for sh in shots:
@@ -496,60 +335,61 @@ class SceneRenderer:
             )
             raw = os.path.join(scene_dir, f"shot_{sh.index}_raw.mp4")
             fit = os.path.join(scene_dir, f"shot_{sh.index}.mp4")
-            speech = sh.text if (model_audio and sh.kind in ("dialogue", "narration")) else ""
-            voice_desc = cast.voice_description(sh.speaker) if speech else ""
-            # Model voices need real room for the line plus a beat of breathing space; clips are capped by the server.
-            request_len = min(sh.duration + (0.8 if model_audio else 0.4), settings.VIDEO_MAX_CLIP_SECONDS)
-            if t2v:
-                member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
-                prompt = pb.text_video_prompt(
-                    sh.kind, sh.speaker, sh.expression, sh.action,
-                    getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
-                    on_screen, scene.location, scene.visual_description, style, sh.index,
-                    settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
-                    scene_motion=scene.motion_prompt, speech=speech, voice_desc=voice_desc, model_voice=model_audio,
-                )
-                # Same seed for the same character = the best-effort way to keep a similar face between shots.
-                seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
-                source = None
-            else:
-                source = keyframe_for_speaker.get(sh.speaker) or wide_path
-                prompt = pb.video_prompt(
-                    sh.kind, sh.speaker, sh.expression, sh.action,
-                    scene.motion_prompt, scene.visual_description, sh.index,
-                    settings.VIDEO_CAMERA_MOTION,
-                    speech=speech, voice_desc=voice_desc, sound_design=getattr(scene, "sound_design", None),
-                    model_voice=model_audio,
-                )
-                seed = _seed(project_id, scene.scene_number, sh.index, "clip")
-
-            # A finished clip is reused only if it was made from EXACTLY this request. (Reusing by shot number alone
-            # would put the wrong picture/speech in a slot whenever the shot plan shifts.) Clips from older versions
-            # have no key file and are kept as they are.
-            clip_key = hashlib.sha1(
-                f"{mode}|{model_audio}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(source or '')}".encode()
-            ).hexdigest()
-            key_file = raw + ".key"
-            stored_key = None
-            if os.path.exists(key_file):
-                try:
-                    stored_key = open(key_file).read().strip()
-                except OSError:
-                    stored_key = None
-            if may_reuse and _nonempty(raw) and (stored_key is None or stored_key == clip_key):
+            if may_reuse and _nonempty(raw):
                 reused += 1
             else:
+                speech = sh.text if (model_audio and sh.kind in ("dialogue", "narration")) else ""
+                voice_desc = cast.voice_description(sh.speaker) if speech else ""
+                # Model voices need real room for the line plus a beat of breathing space; clips are capped by the server.
+                request_len = min(
+                    sh.duration + (0.8 if model_audio else 0.4), settings.VIDEO_MAX_CLIP_SECONDS
+                )
+                shot_audio = None
+                if audio_driven:
+                    # The clip is exactly as long as the slice of voice it is animated to.
+                    shot_audio = os.path.join(scene_dir, f"shot_{sh.index}_audio.wav")
+                    ctx.call(self.ff.cut_audio, voices_wav, sh.start, sh.duration, shot_audio)
+                    request_len = max(1.0, sh.duration)
                 if t2v:
-                    if model_audio:
-                        ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed, True, resolution=resolution)
-                    else:
-                        ctx.call(self.video.generate_text_clip, prompt, raw, request_len, seed, resolution=resolution)
-                elif model_audio:
-                    ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed, True, resolution=resolution)
+                    member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
+                    prompt = pb.text_video_prompt(
+                        sh.kind, sh.speaker, sh.expression, sh.action,
+                        getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
+                        on_screen, scene.location, scene.visual_description, style, sh.index,
+                        settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
+                        scene_motion=scene.motion_prompt, speech=speech, voice_desc=voice_desc, model_voice=model_audio,
+                    )
+                    # Same seed for the same character = the best-effort way to keep a similar face between shots.
+                    base_seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
+                    source = None
                 else:
-                    ctx.call(self.video.generate_clip, source, raw, prompt, request_len, seed, resolution=resolution)
-                with open(key_file, "w") as fh:
-                    fh.write(clip_key)
+                    source = keyframe_for_speaker.get(sh.speaker) or wide_path
+                    prompt = pb.video_prompt(
+                        sh.kind, sh.speaker, sh.expression, sh.action,
+                        scene.motion_prompt, scene.visual_description, sh.index,
+                        settings.VIDEO_CAMERA_MOTION,
+                        speech=speech, voice_desc=voice_desc, sound_design=getattr(scene, "sound_design", None),
+                        model_voice=model_audio,
+                    )
+                    base_seed = _seed(project_id, scene.scene_number, sh.index, "clip")
+
+                def render(length: float, shift: int = 0, _t2v=t2v, _prompt=prompt, _seed0=base_seed, _src=source, _aud=shot_audio, _raw=raw):
+                    seed_now = _seed0 + shift
+                    if _t2v:
+                        if model_audio:
+                            ctx.call(self.video.generate_text_clip, _prompt, _raw, length, seed_now, True)
+                        else:
+                            ctx.call(self.video.generate_text_clip, _prompt, _raw, length, seed_now)
+                    elif _aud:
+                        ctx.call(self.video.generate_clip, _src, _raw, _prompt, length, seed_now, False, _aud)
+                    elif model_audio:
+                        ctx.call(self.video.generate_clip, _src, _raw, _prompt, length, seed_now, True)
+                    else:
+                        ctx.call(self.video.generate_clip, _src, _raw, _prompt, length, seed_now)
+
+                render(request_len)
+                if model_audio and speech and settings.SPEECH_COMPLETE_CHECK:
+                    self._finish_the_line(ctx, raw, request_len, render, sh.index)
             if t2v and sh.index == 0 and not _nonempty(wide_path):
                 # Thumbnail for the gallery: a frame from the first generated clip.
                 ctx.call(self.ff.extract_frame, raw, wide_path)
@@ -578,9 +418,10 @@ class SceneRenderer:
 
         ctx.stage(STAGE_ASSEMBLE, 0.93, "Mixing audio and picture")
         wav = os.path.join(scene_dir, "voices.wav")
-        self.ff.build_audio_track(
-            [s.audio_path for s in segments], [s.gap_after for s in segments], wav, lead_in=LEAD_IN,
-        )
+        if not (voices_wav and _nonempty(wav)):
+            self.ff.build_audio_track(
+                [s.audio_path for s in segments], [s.gap_after for s in segments], wav, lead_in=LEAD_IN,
+            )
         mixed_wav = wav
         if hybrid and ambience_parts:
             amb_all = os.path.join(scene_dir, "ambience.wav")
@@ -592,91 +433,46 @@ class SceneRenderer:
 
         return SceneResult(final_path, wide_path, total, len(shots), reused)
 
-    # ------------------------------------------------------------ reused footage
-    def _render_reuse(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, shots, total, mode,
-                      on_screen, scene_seconds, prev_clip, prev_sig, resolution, final_path, reused):
-        """ONE short clip per scene; every shot is cut from it (own start point, zoom and side) and the voices recorded
-        by text-to-speech are laid on top. The clip is kept in a folder that survives edits to the dialogue, so
-        changing or adding lines only records voices again - the footage is not generated a second time."""
-        W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
-        t2v = mode == "t2v"
-        cap = float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)
-        server_cap = getattr(self.video, "server_max_seconds", lambda: None)()
-        base_len = max(3.0, min(float(settings.REUSE_BASE_SECONDS), cap, float(server_cap or 1e9), total + 0.5))
-        sound = getattr(scene, "sound_design", None)
-        if t2v:
-            prompt = pb.text_video_prompt("ambient", "", "", "", "", on_screen, scene.location, scene.visual_description,
-                                          style, 0, settings.VIDEO_CAMERA_MOTION, sound, False, scene_motion=scene.motion_prompt)
-        else:
-            prompt = pb.video_prompt("ambient", "", "", "", scene.motion_prompt, scene.visual_description, 0,
-                                     settings.VIDEO_CAMERA_MOTION, sound_design=sound)
-        seed = _seed(project_id, scene.scene_number, "base")
-        foot_dir = os.path.join(os.path.dirname(scene_dir), "_footage")
-        os.makedirs(foot_dir, exist_ok=True)
-        base = os.path.join(foot_dir, f"{os.path.basename(scene_dir)}_base.mp4")
-        key_file = base + ".key"
-        key = hashlib.sha1(json.dumps([
-            "reuse", mode, prompt, round(base_len, 2), seed, resolution or settings.VIDEO_T2V_RESOLUTION, prev_sig,
-            None if t2v else (scene.image_prompt or scene.visual_description), style,
-        ], default=str).encode()).hexdigest()
-        stored = open(key_file).read().strip() if os.path.exists(key_file) else None
-        wide_path = os.path.join(scene_dir, "keyframe.png")
-
-        if _nonempty(base) and stored == key:
-            reused += 1
-            ctx.stage(STAGE_VIDEOS, 0.5, "Using the footage already made for this scene")
-        else:
-            source = None
-            if prev_clip:
-                ctx.stage(STAGE_IMAGES, 0.10, "Carrying on from the previous scene")
-                source = os.path.join(scene_dir, "start_frame.png")
-                ctx.call(self.ff.extract_last_frame, prev_clip, source)
-            elif not t2v:
-                ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
-                ctx.checkpoint()
-                ctx.call(self.image.generate_image,
-                         pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
-                         wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"))
-                source = wide_path
+    # ------------------------------------------------------------------ cut-off lines
+    def _finish_the_line(self, ctx, raw: str, length: float, render, shot_index: int) -> None:
+        """Model-voice mode: a clip whose voice is still going at its very last instant had its line cut off. Render it
+        again, longer (and with a fresh seed), up to settings.SPEECH_MAX_RETRIES times. Stops early if the server
+        cannot make a longer clip. A line that still seems cut off after that is logged, never silently dropped."""
+        extra = max(0.5, float(settings.SPEECH_RETRY_EXTRA_SECONDS))
+        margin = float(settings.SPEECH_TAIL_MARGIN_DB)
+        for attempt in range(1, max(0, int(settings.SPEECH_MAX_RETRIES)) + 1):
             ctx.checkpoint()
-            ctx.stage(STAGE_VIDEOS, 0.40, "Generating the scene footage (used for every shot)")
-            raw = base + ".tmp.mp4"
-            if source is None:
-                ctx.call(self.video.generate_text_clip, prompt, raw, base_len, seed, False, resolution=resolution)
-            else:
-                ctx.call(self.video.generate_clip, source, raw, prompt, base_len, seed, False, resolution=resolution)
-            os.replace(raw, base)
-            with open(key_file, "w") as fh:
-                fh.write(key)
-
-        if not _nonempty(wide_path):
-            ctx.call(self.ff.extract_frame, base, wide_path)
-        ctx.set_scene_image(wide_path)
-
-        got = max(self.ff.get_duration(base), 1.0)
-        loop = os.path.join(scene_dir, "base_loop.mp4")
-        ctx.call(self.ff.pingpong, base, loop)
-        fitted: List[str] = []
-        for sh in shots:
-            ctx.checkpoint()
-            ctx.stage(STAGE_VIDEOS, 0.60 + 0.30 * sh.index / len(shots), f"Cutting shot {sh.index + 1}/{len(shots)}")
-            fit = os.path.join(scene_dir, f"shot_{sh.index}.mp4")
-            start = (sh.index * 0.618 * got) % (2 * got)           # a different part of the footage for each cut
-            if sh.kind == "dialogue":
-                side = 0.3 if (zlib.crc32((sh.speaker or "").encode()) % 2) else 0.7  # each speaker keeps to one side of the frame
-                zoom, px = 1.28, side
-            else:
-                zoom, px = (1.0, 0.5) if sh.index % 2 == 0 else (1.12, 0.5)
-            ctx.call(self.ff.cut_from_base, loop, fit, start, sh.duration, zoom, px, 0.45, W, H, FPS, settings.OUTPUT_SHARPEN)
-            fitted.append(fit)
-
-        ctx.checkpoint()
-        ctx.stage(STAGE_ASSEMBLE, 0.93, "Mixing voices and picture")
-        wav = os.path.join(scene_dir, "voices.wav")
-        self.ff.build_audio_track([s.audio_path for s in segments], [s.gap_after for s in segments], wav, lead_in=LEAD_IN)
-        self.ff.assemble_scene(fitted, wav, final_path)
-        ctx.stage(STAGE_ASSEMBLE, 1.0, "Scene done")
-        return SceneResult(final_path, wide_path, total, len(shots), reused)
+            active, overall, tail = self.ff.tail_speech_active(raw, margin_db=margin)
+            if not active:
+                return
+            before = self.ff.get_duration(raw)
+            cap = getattr(self, "_clip_cap", None)      # learned earlier in this run: the server cannot go longer
+            if cap and before >= cap - 0.3:
+                logger.warning("Shot %d: the line may be cut off, but the video server's clip-length limit (~%.1f s) is reached. "
+                               "Shorten the line or lower MODEL_VOICE_MAX_WORDS.", shot_index + 1, cap)
+                return
+            length += extra
+            logger.warning(
+                "Shot %d: the spoken line seems to be cut off (last 0.3 s at %.1f dB vs %.1f dB overall) - "
+                "generating it again at %.1f s (try %d of %d).",
+                shot_index + 1, tail, overall, length, attempt, int(settings.SPEECH_MAX_RETRIES),
+            )
+            try:
+                os.remove(raw)
+            except OSError:
+                pass
+            render(length, attempt)
+            if self.ff.get_duration(raw) < before + 0.4:
+                self._clip_cap = max(before, self.ff.get_duration(raw))
+                logger.warning("Shot %d: the video server did not make a longer clip (its clip-length limit?) - keeping it.",
+                               shot_index + 1)
+                return
+        active, overall, tail = self.ff.tail_speech_active(raw, margin_db=margin)
+        if active:
+            logger.warning(
+                "Shot %d: the line may still be cut off after %d retries. Shorten the line, lower MODEL_VOICE_MAX_WORDS, "
+                "or raise the server's maximum clip length.", shot_index + 1, int(settings.SPEECH_MAX_RETRIES),
+            )
 
     # ------------------------------------------------------------------ misc
     def _silent_mp3(self, path: str, seconds: float) -> None:

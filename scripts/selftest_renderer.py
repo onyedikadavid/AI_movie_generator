@@ -71,7 +71,7 @@ class FakeVideo:
     def __init__(self):
         self.requests = []
 
-    def generate_clip(self, image, path, prompt, duration, seed=None, resolution=None):
+    def generate_clip(self, image, path, prompt, duration, seed=None):
         self.requests.append((os.path.basename(image), prompt, duration))
         frames = 8 * int(min(duration * 24, 121) // 8) + 1
         subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc2=s=768x512:r=24:d={frames / 24}",
@@ -85,7 +85,7 @@ class FakeVideoT2V(FakeVideo):
         self.text_requests = []
         self.with_audio = with_audio
 
-    def generate_text_clip(self, prompt, path, duration, seed=None, resolution=None):
+    def generate_text_clip(self, prompt, path, duration, seed=None):
         self.text_requests.append((prompt, duration, seed))
         frames = 8 * int(min(duration * 24, 121) // 8) + 1
         secs = frames / 24
@@ -148,7 +148,7 @@ def main():
     # close-ups were used for speaking shots
     assert any("closeup_obinna" in r_[0] for r_ in vid.requests) and any("closeup_daddy" in r_[0] for r_ in vid.requests), vid.requests
     assert any(r_[0] == "keyframe.png" for r_ in vid.requests), "narration shot should use the wide keyframe"
-    assert all(r_[2] <= 5.0 for r_ in vid.requests)
+    assert all(r_[2] <= settings.VIDEO_MAX_CLIP_SECONDS for r_ in vid.requests)
     assert len(img.prompts) == 3
     print("OK full render:", len(vid.requests), "video clips,", len(img.prompts), "images")
 

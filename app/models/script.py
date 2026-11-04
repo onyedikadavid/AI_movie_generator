@@ -12,9 +12,5 @@ class Script(Base):
     tone = Column(String, nullable=True)
     visual_style = Column(String, nullable=True)
     full_text = Column(Text, nullable=True)
-    # The story the script writer built from the user's idea (shown in the app), its hook, and its analysis.
-    story_text = Column(Text, nullable=True)
-    story_hook = Column(Text, nullable=True)
-    story_outline = Column(JSON, nullable=True)
 
     project = relationship("Project", back_populates="script")

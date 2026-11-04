@@ -13,7 +13,6 @@ import re
 from typing import Optional, Sequence
 
 from app.services.style_presets import is_cinematic, is_kids
-from app.services.voice_service import DEFAULT_ACTIONS
 
 _ANIMATED = re.compile(
     r"anim|cartoon|3d|pixar|disney|anime|manga|illustrat|comic|cel[- ]?shad|stylized|stylised|claymation|paint|watercolou?r|ghibli",
@@ -143,15 +142,98 @@ _CAMERA_CINEMATIC = [
 _QUALITY_FREE = "Natural, fluid, lifelike motion, cinematic movie look, sharp focus, consistent character appearance."
 
 
+# ---------------------------------------------------------------------------
+# Per-shot camera ("auto") and staged conversations
+#
+# Why: a rotating set of film moves ("tracking shot that follows the subject", "arc around the subject") told the
+# video model that the speaker was moving, so characters paced and walked while talking and never seemed to talk
+# TO each other. In "auto" mode a conversation gets a calm camera and characters who stay where they are, facing
+# each other (over-the-shoulder), while action beats and establishing shots still get a dynamic camera.
+# ---------------------------------------------------------------------------
+_ACTION_BEAT = re.compile(
+    r"\b(fall(?:s|ing)?|plung\w+|chas\w+|fight\w*|punch\w*|kick\w*|explo\w+|crash\w*|gunfire|shoot\w*|flee\w*|"
+    r"escap\w+|leap\w*|jump\w*|dive[sd]?|diving|rac(?:e|es|ed|ing)|skydiv\w+|parachut\w+|fly(?:ing)?|flies|storm\w*|"
+    r"collaps\w+|battle\w*|attack\w*|ambush\w*|sprint\w*|swerv\w+|burst\w*|stampede\w*|tumbl\w+)\b",
+    re.IGNORECASE,
+)
+_LOCOMOTION = re.compile(
+    r"\b(walk\w*|pac(?:e|es|ed|ing)|stroll\w*|strid(?:e|es|ing)|march\w*|wander\w*|roam\w*|run(?:s|ning)?|jog\w*|"
+    r"mov(?:es|ing) around|back and forth|up and down)\b",
+    re.IGNORECASE,
+)
+_CAMERA_DIALOGUE = [
+    "steady locked-off camera with a very slight natural drift, the background stays stable",
+    "very slow gentle push-in toward the speaker",
+    "steady camera with a barely perceptible handheld sway",
+]
+_CAMERA_ACTION = [
+    "fast dynamic tracking shot that follows the action",
+    "sweeping dramatic camera move with strong parallax and depth",
+    "energetic handheld camera with quick pans and whip-pan reframing",
+    "dramatic low-angle camera that rises and pulls back to reveal the whole environment",
+]
+
+
+def is_action_beat(*texts: Optional[str]) -> bool:
+    """True when the shot's own action / camera direction describes something high-energy (a fall, chase, fight...)."""
+    return any(t and _ACTION_BEAT.search(t) for t in texts)
+
+
+def strip_locomotion(action: str) -> str:
+    """A dialogue action that is about walking / pacing / running becomes empty (the speaker then just gestures)."""
+    return "" if (action and _LOCOMOTION.search(action)) else (action or "")
+
+
+def _is_auto(camera_mode: Optional[str]) -> bool:
+    return (camera_mode or "").strip().lower() == "auto"
+
+
+def stage_dialogue_bits(speaker: str, look: str, on_screen: Sequence, act: str, mood_txt: str) -> list:
+    """The prompt pieces for a speaking character who is TALKING TO someone: both stay put and face each other."""
+    me = (speaker or "").strip().lower()
+    others = [c for c in on_screen if getattr(c, "name", "").strip().lower() != me]
+    calm = strip_locomotion(act)
+    if others:
+        other = others[0]
+        o_look = clip_words(getattr(other, "appearance_prompt", "") or getattr(other, "description", ""), 18)
+        bits = [
+            (f"Over-the-shoulder medium shot of {speaker}, {look}" if look else f"Over-the-shoulder medium shot of {speaker}"),
+            f"{speaker} stands in one place facing {other.name} and talks to them directly, a real face-to-face conversation",
+            f"{other.name}{f' ({o_look})' if o_look else ''} is in the foreground, shoulder and side of the head visible, "
+            "listening and reacting",
+        ]
+    else:
+        bits = [
+            (f"Medium close-up of {speaker}, {look}" if look else f"Medium close-up of {speaker}"),
+            f"{speaker} stays in one place and speaks naturally, eyes on the person they are talking to just off camera",
+        ]
+    bits.append(perform(speaker, calm) if calm else "natural hand gestures and an expressive face")
+    bits.append(mood_txt)
+    bits.append("no walking, no pacing, the characters keep their positions")
+    return bits
+
+
 def is_free_camera(camera_mode: Optional[str]) -> bool:
     return (camera_mode or "model").strip().lower() not in ("static", "gentle")
 
 
-def camera_clause(camera_mode: Optional[str], shot_index: int, scene_motion: Optional[str] = None) -> str:
+def camera_clause(camera_mode: Optional[str], shot_index: int, scene_motion: Optional[str] = None,
+                  kind: str = "dialogue", action: str = "") -> str:
     """The camera sentence for one shot. 'static' / 'gentle' keep the old locked-off behaviour; anything else
     (default 'model') lets the camera move like in a normal film: the scene's own camera direction on its first
     shot, then a rotating set of classic moves so consecutive shots are not all the same."""
     mode = (camera_mode or "model").strip().lower()
+    if mode == "auto":
+        # Chosen shot by shot: action beats get a dynamic camera, conversations a calm one, everything else a film move.
+        motion_txt = clip_words(scene_motion, 26)
+        if is_action_beat(action, scene_motion):
+            base = _CAMERA_ACTION[shot_index % len(_CAMERA_ACTION)]
+            return f"Camera: {motion_txt}; {base}" if motion_txt else f"Camera: {base}"
+        if kind == "dialogue":
+            return "Camera: " + _CAMERA_DIALOGUE[shot_index % len(_CAMERA_DIALOGUE)]
+        if motion_txt and shot_index == 0:
+            return f"Camera: {motion_txt}"
+        return "Camera: " + _CAMERA_CINEMATIC[(shot_index + (1 if motion_txt else 0)) % len(_CAMERA_CINEMATIC)]
     if mode == "static":
         return _CAMERA_STATIC
     if mode == "gentle":
@@ -166,7 +248,7 @@ def perform(speaker: str, action: str) -> str:
     """'Kobi is tapping on the mixing board' from an action string such as 'Irritated Tapping on the mixing board'
     or 'turns away'. Gerund openers get 'is'; a leading mood word ('Irritated ...') becomes 'is irritated, ...'."""
     act = " ".join((action or "").split())
-    if not act or act.lower() in DEFAULT_ACTIONS:   # placeholder actions like "stands attentively" would freeze the character
+    if not act:
         return f"{speaker} moves and gestures naturally"
     words = [w.lower() if w[:1].isupper() and w.lower().endswith(("ing", "ed", "ly")) else w for w in act.split()]
     words[0] = words[0][:1].lower() + words[0][1:]
@@ -216,7 +298,8 @@ def video_prompt(
     `action` is performed by the character; `speech` (model-voice mode) is what they say - the two are kept apart.
     """
     free = is_free_camera(camera_mode)
-    camera = camera_clause(camera_mode, shot_index, scene_motion)
+    camera = camera_clause(camera_mode, shot_index, scene_motion, kind, action)
+    auto_calm = _is_auto(camera_mode) and kind == "dialogue" and not is_action_beat(action, scene_motion)
     motion = "" if free else ("" if (camera_mode or "").lower() == "static" else clip_words(scene_motion, 22))
     setting = clip_words(visual_description, 24)
     act = clip_words(action, 18)
@@ -224,7 +307,16 @@ def video_prompt(
     mood_txt = "" if mood.lower() in ("neutral", "dynamic expression", "") else f"{mood} expression"
 
     if kind == "dialogue":
-        if free:
+        if auto_calm:
+            calm = strip_locomotion(act)
+            bits = [perform(speaker, calm) if calm else f"{speaker} stays in place and gestures naturally while talking to the other character",
+                    mood_txt, "no walking, no pacing, the characters keep their positions"]
+            if model_voice and speech:
+                bits.append(speech_clause(speaker, speech, voice_desc, mood))
+            else:
+                bits.append("speaking, mouth moving naturally as they talk")
+            bits += [f"setting: {setting}" if setting else "", camera]
+        elif free:
             bits = [perform(speaker, act), mood_txt]
             if model_voice and speech:
                 bits.append(speech_clause(speaker, speech, voice_desc, mood))
@@ -295,18 +387,21 @@ def text_video_prompt(
     model_voice: bool = False,
 ) -> str:
     free = is_free_camera(camera_mode)
-    camera = camera_clause(camera_mode, shot_index, scene_motion)
+    camera = camera_clause(camera_mode, shot_index, scene_motion, kind, action)
+    staged = _is_auto(camera_mode) and kind == "dialogue" and not is_action_beat(action, scene_motion)
     place = clip_words(location, 10)
     setting = clip_words(visual_description, 26)
     act = clip_words(action, 18)
     mood = (expression or "").strip()
-    mood_txt = "" if mood.lower() in ("neutral", "dynamic expression", "") else f"with a {mood} expression"
+    mood_txt = "" if mood.lower() in ("neutral", "dynamic expression", "") else f"with {'an' if mood.strip()[:1].lower() in 'aeiou' else 'a'} {mood} expression"
 
     if kind == "dialogue":
         look = clip_words(speaker_look, 40)
         framing = "Medium shot" if free else "Medium close-up"
         bits = [f"{framing} of {speaker}, {look}".rstrip(", ") if look else f"{framing} of {speaker}"]
-        if free:
+        if staged:
+            bits = stage_dialogue_bits(speaker, look, on_screen, act, mood_txt)
+        elif free:
             bits.append(perform(speaker, act))
             bits.append(mood_txt)
         else:
@@ -341,61 +436,4 @@ def text_video_prompt(
         # The characters' voices are recorded separately by the pipeline, so ask the video model for
         # ONLY the background sound: no speech of its own (it would clash), no music.
         bits.append(_audio_clause(sound_design, "", False))
-    return ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip()).replace('". ', '" ') + "."
-
-
-
-def whole_scene_prompt(
-    beats: Sequence[dict],
-    on_screen: Sequence,
-    location: Optional[str],
-    visual_description: Optional[str],
-    style: Optional[str],
-    scene_motion: Optional[str] = None,
-    sound_design: Optional[str] = None,
-    start_image: bool = False,
-) -> str:
-    """ONE prompt for a whole scene (or a long part of one). Beats are in order; each is a dict with
-    kind ("dialogue"|"narration"), speaker, expression, action, speech, voice_desc.
-    LTX-2.x follows a flowing, chronological description: the place and cast first, then what happens in order,
-    with each spoken line in quotes next to who says it. Action is written as action, speech only in quotes."""
-    place = clip_words(location, 10)
-    setting = clip_words(visual_description, 40)
-    motion = clip_words(scene_motion, 26)
-    cast_bits = []
-    for c in list(on_screen)[:4]:
-        look = clip_words(getattr(c, "appearance_prompt", "") or getattr(c, "description", ""), 30)
-        cast_bits.append(f"{c.name}, {look}" if look else c.name)
-    lead = "Continuing the same shot" if start_image else (f"A film scene in {place}" if place else "A film scene")
-    steps = []
-    order = ["First", "Then", "Next", "After that", "Finally"]
-    spoken = 0
-    for i, b in enumerate(beats):
-        word = order[min(i, len(order) - 1)] if len(beats) > 1 else ""
-        speech = b.get("speech") or ""
-        if b.get("kind") == "narration":
-            line = speech_clause(b.get("speaker") or "Narrator", speech, b.get("voice_desc", ""), "", off_screen=True) if speech else ""
-        else:
-            who = b.get("speaker") or "A character"
-            act = perform(who, clip_words(b.get("action"), 18))
-            line = act
-            if speech:
-                line += ", and " + speech_clause(who, speech, b.get("voice_desc", ""), b.get("expression", ""))
-        if speech:
-            spoken += 1
-        if line:
-            steps.append(f"{word + ': ' if word else ''}{line}".strip())
-    bits = [lead, setting, ("Characters: " + "; ".join(cast_bits)) if cast_bits else ""]
-    bits += steps
-    camera = (f"Camera: {motion}, and it keeps moving like a real film, changing angle and framing to follow whoever is "
-              "speaking, with natural cuts between wide, medium and close-up shots") if motion else (
-              "Camera: moves like a real film, changing angle and framing to follow whoever is speaking, with natural "
-              "cuts between wide, medium and close-up shots")
-    bits += [camera, _t2v_style(style),
-             "Natural, fluid, lifelike motion, sharp focus, consistent character appearance throughout"]
-    if spoken:
-        bits.append("The scene runs until the last spoken line is completely finished, then holds for a moment")
-    cue = clip_words(sound_design, 22) or "natural ambient sound of the location"
-    bits.append(f"Audio: every spoken line is clearly audible, in the order given, and lip-synced, with {cue} quietly "
-                "underneath, no background music" if spoken else f"Audio: {cue}, no spoken dialogue, no background music")
     return ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip()).replace('". ', '" ') + "."

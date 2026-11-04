@@ -469,13 +469,21 @@ def normalize_turn(turn: dict) -> dict:
 
 
 # Speech pace of the video model's own voices (words per second) - used to size clips before they exist.
-_WORDS_PER_SECOND = 2.5
+_WORDS_PER_SECOND = 2.1
 
 
 def estimate_speech_seconds(text: str) -> float:
+    """Seconds a model-voice line needs. Deliberately generous: a clip that is a little too long costs nothing, a clip
+    that is too short cuts the line off. (Pace comes from settings.MODEL_VOICE_WPS; 2.1 words/s by default.)"""
+    wps = _WORDS_PER_SECOND
+    try:
+        from app.core.config import settings
+        wps = float(getattr(settings, "MODEL_VOICE_WPS", wps)) or wps
+    except Exception:  # noqa: BLE001 - self-tests run without the app settings
+        pass
     words = len((text or "").split())
-    pauses = sum(text.count(c) for c in ",;:") * 0.10 + sum(text.count(c) for c in ".!?") * 0.22 if text else 0.0
-    return round(max(0.8, words / _WORDS_PER_SECOND + pauses + 0.25), 2)
+    pauses = sum(text.count(c) for c in ",;:") * 0.12 + sum(text.count(c) for c in ".!?") * 0.30 if text else 0.0
+    return round(max(1.2, words / wps + pauses + 0.6), 2)
 
 
 def chunk_speech(text: str, max_words: int = 10) -> List[str]:
