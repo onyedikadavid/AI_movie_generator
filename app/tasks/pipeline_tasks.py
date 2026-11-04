@@ -28,7 +28,7 @@ from app.services.tts_service import TTSService
 from app.services.ffmpeg_service import FFmpegService
 from app.services.scene_renderer import SceneRenderer
 from app.services.voice_service import VoiceCast, normalize_age_group, normalize_gender, normalize_turn
-from app.services.media_storage import publish_file
+from app.services.media_storage import publish_file, publish_file_strict
 from app.services.style_presets import resolve_style
 
 logger = logging.getLogger(__name__)
@@ -349,7 +349,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     master = os.path.join(project_root, "final_master_video.mp4")
     _call(db, ctl, ff.concatenate_videos, finals, master, "aac")
     _set(db, project, progress_pct=97, stage_detail="Uploading the final video")
-    url = _call(db, ctl, publish_file, master, f"projects/{pid}/final_master_video.mp4")
+    url = _call(db, ctl, publish_file_strict, master, f"projects/{pid}/final_master_video.mp4")
 
     warnings = list(dict.fromkeys(tts.warnings))
     project.final_video_path = url
