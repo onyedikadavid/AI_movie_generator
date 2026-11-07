@@ -56,13 +56,13 @@ def check_prompts():
 
 
 class CutoffVideo:
-    """A fake model whose voice needs 9.0 s: any shorter clip has the voice still going at its last instant."""
-    NEED = 9.0
+    """A fake model whose voice needs 5.5 s: any shorter clip has the voice still going at its last instant."""
+    NEED = 5.5
 
     def __init__(self):
         self.t2v = []
 
-    def generate_text_clip(self, prompt, path, duration, seed=None, want_audio=None):
+    def generate_text_clip(self, prompt, path, duration, seed=None, want_audio=None, resolution=None):
         self.t2v.append((prompt, round(duration, 2), seed))
         secs = round(duration, 2)
         voice = min(secs, self.NEED)
@@ -78,7 +78,7 @@ class DrivenVideo:
     def __init__(self):
         self.calls = []
 
-    def generate_clip(self, image, path, prompt, duration, seed=None, want_audio=False, audio_path=None):
+    def generate_clip(self, image, path, prompt, duration, seed=None, want_audio=False, resolution=None, audio_path=None):
         self.calls.append((duration, audio_path, os.path.exists(audio_path) if audio_path else False))
         secs = duration
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc2=s=768x512:r=24:d={secs}",
@@ -108,7 +108,7 @@ def main():
     assert retried, f"a clip that ends mid-voice must be generated again: {by_prompt}"
     for d in retried:
         assert d == sorted(d) and d[-1] > d[0], d
-        assert d[-1] >= CutoffVideo.NEED - 0.01 or d[-1] >= settings.VIDEO_MAX_CLIP_SECONDS, d
+        assert d[-1] >= CutoffVideo.NEED or len(d) == settings.SPEECH_MAX_RETRIES + 1, d   # finished, or retries used up
     print("OK cut-off line: clip lengths tried per shot ->", [d for d in by_prompt.values()])
 
     settings.SPEECH_COMPLETE_CHECK = False

@@ -1,5 +1,7 @@
 import os
 import asyncio
+import hashlib
+import json
 import logging
 import shutil
 import time
@@ -7,6 +9,7 @@ import uuid
 
 from celery.signals import worker_ready
 from sqlalchemy import delete, select
+from sqlalchemy.exc import DBAPIError
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
@@ -17,6 +20,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.script import Script
 from app.models.character import Character
 from app.models.scene import Scene
+from app.schemas.script import ScriptDecompositionSchema
 
 from app.services import run_control as rc
 from app.services.run_control import RunControl, RunStopped
@@ -28,7 +32,7 @@ from app.services.tts_service import TTSService
 from app.services.ffmpeg_service import FFmpegService
 from app.services.scene_renderer import SceneRenderer
 from app.services.voice_service import VoiceCast, normalize_age_group, normalize_gender, normalize_turn
-from app.services.media_storage import publish_file, publish_file_strict
+from app.services.media_storage import publish_file
 from app.services.style_presets import resolve_style
 
 logger = logging.getLogger(__name__)
@@ -159,14 +163,60 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
 
     llm = LLMService()
     prompt, genre, tone, vstyle = project.raw_prompt, project.requested_genre, project.requested_tone, project.requested_visual_style
-    script_schema = _call(
-        db, ctl,
-        lambda: asyncio.run(
-            llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle)
+    # A long script (a full film can take 15+ minutes to write) is kept on disk, so if saving it fails or the task is
+    # retried, the same request reuses it instead of writing it all again.
+    scene_style = project.scene_style or settings.SCENE_MODE
+    cache_key = hashlib.sha1(json.dumps(
+        ["script-v1", prompt, genre, tone, vstyle, project.scene_count, project.scene_seconds, scene_style], default=str).encode()).hexdigest()
+    cache_file = os.path.join(settings.STORAGE_DIR, "projects", pid, "script_cache.json")
+    script_schema = None
+    try:
+        if os.path.exists(cache_file):
+            cached = json.load(open(cache_file, encoding="utf-8"))
+            if cached.get("key") == cache_key:
+                script_schema = ScriptDecompositionSchema.model_validate(cached["script"])
+                logger.info("Project %s: reusing the script written earlier for this exact request.", pid)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Couldn't read the saved script (%s) - writing it again.", e)
+    if script_schema is None:
+        script_schema = _call(
+            db, ctl,
+            lambda: asyncio.run(
+                llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
+                                             scene_count=project.scene_count, scene_seconds=project.scene_seconds,
+                                             scene_style=scene_style)
+            )
         )
-    )
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as fh:
+                json.dump({"key": cache_key, "script": script_schema.model_dump(mode="json")}, fh)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Couldn't save a copy of the script (%s).", e)
     ctl.checkpoint()
 
+    # Saving to the database must never throw away a script that took many minutes to write: a dropped connection
+    # (hosted Postgres, flaky network) is retried on a fresh one.
+    for attempt in range(1, 5):
+        try:
+            _save_script(db, pid, script_schema)
+            try:
+                os.remove(cache_file)   # saved: the next run writes a fresh script
+            except OSError:
+                pass
+            return
+        except DBAPIError as e:
+            logger.warning("Saving the script failed (attempt %s/4): %s", attempt, str(e).splitlines()[0][:160])
+            safe_rollback(db)
+            if attempt == 4:
+                raise
+            time.sleep(3 * attempt)
+            ctl.checkpoint()
+
+
+def _save_script(db, pid: str, script_schema) -> None:
+    """Replaces the project's characters/scenes/script with a freshly written one (one transaction)."""
+    project = db.get(Project, pid)
     # Re-running (Retry / Resume after a failed breakdown) replaces earlier output.
     db.execute(delete(Scene).where(Scene.project_id == pid))
     db.execute(delete(Character).where(Character.project_id == pid))
@@ -177,6 +227,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
     db.add(Script(
         project_id=pid, genre=script_schema.genre, tone=script_schema.tone,
         visual_style=script_schema.visual_style, full_text=project.raw_prompt,
+        story_text=script_schema.story, story_hook=script_schema.hook, story_outline=script_schema.story_outline,
     ))
 
     for ch in script_schema.characters:
@@ -201,6 +252,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
             sound_design=(sc.sound_design or None),
             dialogue_turns=turns or None,
             characters_present=list(sc.characters_present or []) or None,
+            continues_previous=bool(getattr(sc, "continues_previous", None)) and sc.scene_number > 1,
             render_status="PENDING",
         ))
 
@@ -209,6 +261,78 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
     project.progress_pct = 0
     project.total_scenes = len(script_schema.scenes)
     db.commit()
+
+
+def _continue_body(db, project: Project, ctl: RunControl) -> None:
+    """Writes the next scene(s) of an existing story. Existing characters (looks, voices) and finished scenes are
+    left exactly as they are; the new scenes are added as PENDING and the project returns to review."""
+    pid = project.id
+    scenes = db.execute(select(Scene).where(Scene.project_id == pid).order_by(Scene.scene_number)).scalars().all()
+    characters = db.execute(select(Character).where(Character.project_id == pid)).scalars().all()
+    script = db.execute(select(Script).where(Script.project_id == pid)).scalars().first()
+    if not scenes:
+        raise RuntimeError("This project has no scenes yet, so there is nothing to continue.")
+
+    direction, count = project.continue_prompt or "", project.continue_scenes or 1
+    _set(db, project, status=ProjectStatus.GENERATING_SCRIPT, stage_detail="Writing the next part of the story")
+
+    cast = [{"name": c.name, "description": c.description, "appearance_prompt": c.appearance_prompt,
+             "gender": c.gender, "age_group": c.age_group} for c in characters]
+    recap = [{
+        "scene_number": sc.scene_number, "location": sc.location, "visual_description": sc.visual_description,
+        "lines": " / ".join(f"{t.get('speaker')}: {t.get('text')}" for t in (sc.dialogue_turns or [])[:4]),
+    } for sc in scenes]
+    story = (script.story_text if script and script.story_text else None) or project.raw_prompt or ""
+    genre = project.requested_genre or (script.genre if script else None)
+    tone = project.requested_tone or (script.tone if script else None)
+    vstyle = project.requested_visual_style or (script.visual_style if script else None)
+    secs = project.scene_seconds
+    llm = LLMService()
+    result = _call(
+        db, ctl,
+        lambda: asyncio.run(llm.continue_story(
+            story, cast, recap, direction=direction, scene_count=count, scene_seconds=secs,
+            genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
+        ))
+    )
+    ctl.checkpoint()
+
+    for ch in result["new_characters"]:
+        db.add(Character(
+            project_id=pid, name=str(ch["name"]).strip(), description=ch.get("description") or ch.get("appearance_prompt") or "",
+            appearance_prompt=ch.get("appearance_prompt") or ch.get("description") or "",
+            gender=normalize_gender(ch.get("gender")), age_group=normalize_age_group(ch.get("age_group")),
+        ))
+
+    next_number = max(sc.scene_number for sc in scenes) + 1
+    for i, sc in enumerate(result["scenes"]):
+        turns = [t for t in (normalize_turn(t) for t in (sc.get("dialogue_turns") or [])) if (t.get("text") or "").strip()]
+        try:
+            dur = max(2, min(int(float(sc.get("duration_seconds") or secs or 8)), 120))
+        except (TypeError, ValueError):
+            dur = int(secs or 8)
+        db.add(Scene(
+            project_id=pid, scene_number=next_number + i, duration_seconds=dur,
+            location=sc.get("location") or "", visual_description=sc.get("visual_description") or "A scene from the story.",
+            narration_text=sc.get("narration_text") or None,
+            image_prompt=(sc.get("image_prompt") or "").strip() or sc.get("visual_description") or "A scene from the story.",
+            motion_prompt=sc.get("motion_prompt") or "", sound_design=(sc.get("sound_design") or None),
+            dialogue_turns=turns or None, characters_present=list(sc.get("characters_present") or []) or None,
+            continues_previous=bool(sc.get("continues_previous")), render_status="PENDING",
+        ))
+
+    if script is not None and result["story_addition"]:
+        script.story_text = ((script.story_text or "").rstrip() + "\n\n" + result["story_addition"]).strip()
+    project.continue_prompt = project.continue_scenes = None
+    project.status = ProjectStatus.SCRIPT_READY
+    project.stage_detail = None
+    project.total_scenes = len(scenes) + len(result["scenes"])
+    db.commit()
+
+
+@celery_app.task(bind=True)
+def run_story_continuation(self, project_id: str, run_token: str = None):
+    _execute(project_id, run_token, ProjectStatus.GENERATING_SCRIPT, _continue_body)
 
 
 @celery_app.task(bind=True)
@@ -287,6 +411,14 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     )
     if cast.write_back(characters):
         db.commit()
+    logger.info("Settings in effect: AUDIO_MODE=%s | scene style=%s (%ss per scene) | CAMERA=%s | video mode=%s | narrator=%s | video size=%s",
+                settings.AUDIO_MODE, project.scene_style or settings.SCENE_MODE, project.scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
+                project.video_mode or settings.VIDEO_MODE,
+                project.narrator_enabled if project.narrator_enabled is not None else settings.NARRATOR_ENABLED,
+                project.video_resolution or settings.VIDEO_T2V_RESOLUTION)
+    if (settings.AUDIO_MODE or "").strip().lower() != "model":
+        logger.warning("AUDIO_MODE is '%s', so edge-tts voices are used. Set AUDIO_MODE=model in .env (and restart the "
+                       "worker) to use the video model's own voices.", settings.AUDIO_MODE)
     logger.info("Voice cast (%s): %s | narrator=%s", cast.region, [(m.name, m.voice_id) for m in cast.members], cast.narrator_voice)
 
     tts, ff = TTSService(), FFmpegService()
@@ -311,9 +443,14 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
             scene.render_status = "RENDERING"
             db.commit()
 
+        prev_clip = None
+        if getattr(scene, "continues_previous", False) and i > 0:
+            prev_clip = os.path.join(project_root, f"scene_{scenes[i - 1].scene_number}", "scene_final.mp4")
         sctx = _SceneCtx(db, project, scene, ctl, i, total)
         try:
-            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode)
+            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode,
+                                     narrator=project.narrator_enabled, scene_seconds=project.scene_seconds, prev_clip=prev_clip,
+                                     resolution=project.video_resolution, scene_style=project.scene_style)
         except RunStopped:
             safe_rollback(db)
             try:
@@ -332,7 +469,9 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
                 safe_rollback(db)
             raise
 
-        scene.video_path = result.final_path
+        # Publish the finished scene so it can be played and downloaded on its own (falls back to the local path).
+        scene.video_path = _call(db, ctl, publish_file, result.final_path,
+                                 f"projects/{pid}/scene_{scene.scene_number}/scene_final.mp4")
         wav = os.path.join(scene_dir, "voices.wav")
         scene.audio_path = wav if os.path.exists(wav) else None   # model-voice mode has no separate voice track
         scene.render_status = "DONE"
@@ -349,7 +488,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     master = os.path.join(project_root, "final_master_video.mp4")
     _call(db, ctl, ff.concatenate_videos, finals, master, "aac")
     _set(db, project, progress_pct=97, stage_detail="Uploading the final video")
-    url = _call(db, ctl, publish_file_strict, master, f"projects/{pid}/final_master_video.mp4")
+    url = _call(db, ctl, publish_file, master, f"projects/{pid}/final_master_video.mp4")
 
     warnings = list(dict.fromkeys(tts.warnings))
     project.final_video_path = url

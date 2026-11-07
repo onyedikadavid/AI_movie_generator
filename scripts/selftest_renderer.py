@@ -71,7 +71,7 @@ class FakeVideo:
     def __init__(self):
         self.requests = []
 
-    def generate_clip(self, image, path, prompt, duration, seed=None):
+    def generate_clip(self, image, path, prompt, duration, seed=None, resolution=None):
         self.requests.append((os.path.basename(image), prompt, duration))
         frames = 8 * int(min(duration * 24, 121) // 8) + 1
         subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc2=s=768x512:r=24:d={frames / 24}",
@@ -85,7 +85,7 @@ class FakeVideoT2V(FakeVideo):
         self.text_requests = []
         self.with_audio = with_audio
 
-    def generate_text_clip(self, prompt, path, duration, seed=None):
+    def generate_text_clip(self, prompt, path, duration, seed=None, resolution=None):
         self.text_requests.append((prompt, duration, seed))
         frames = 8 * int(min(duration * 24, 121) // 8) + 1
         secs = frames / 24

@@ -389,7 +389,7 @@ def _load(db: Session, project_id: str) -> Project:
 
 
 def _enqueue(db: Session, p: Project, kind: str, fresh: bool) -> Project:
-    from app.tasks.pipeline_tasks import run_asset_pipeline, run_script_breakdown  # lazy: avoids a circular import
+    from app.tasks.pipeline_tasks import run_asset_pipeline, run_script_breakdown, run_story_continuation  # lazy: avoids a circular import
 
     had_progress = (p.progress_pct or 0) > 0 or p.status in (ProjectStatus.PAUSED, ProjectStatus.FAILED, ProjectStatus.CANCELLED)
     p.run_token = uuid.uuid4().hex
@@ -415,12 +415,15 @@ def _enqueue(db: Session, p: Project, kind: str, fresh: bool) -> Project:
             p.resume_count = (p.resume_count or 0) + 1
         elif fresh:
             p.resume_count = 0
+    elif kind == "continue":
+        pass   # keeps the finished scenes and their progress; only the new scenes get written
     else:
         p.progress_pct, p.current_scene, p.total_scenes = 0, None, None
     db.commit()
 
     try:
-        task = (run_script_breakdown if kind == "script" else run_asset_pipeline).delay(p.id, p.run_token)
+        runner = {"script": run_script_breakdown, "continue": run_story_continuation}.get(kind, run_asset_pipeline)
+        task = runner.delay(p.id, p.run_token)
     except Exception as e:  # noqa: BLE001 - Redis/broker unreachable
         logger.error("Couldn't queue project %s: %s", p.id, e)
         p.status, p.run_token, p.stage_detail = ProjectStatus.FAILED, None, "Couldn't be queued"
@@ -450,6 +453,23 @@ def start_generation(db: Session, project_id: str, fresh: Optional[bool] = None)
     if not has_scenes:
         return _enqueue(db, p, "script", fresh=False)
     return _enqueue(db, p, "assets", fresh=bool(fresh))
+
+
+def start_continuation(db: Session, project_id: str, prompt: Optional[str], scene_count: Optional[int]) -> Project:
+    """'Continue the story': the worker writes the next scene(s) with the same characters and adds them to the
+    project. Nothing already rendered is touched; the new scenes are reviewed and generated like any others."""
+    p = _load(db, project_id)
+    if p.status in BUSY_STATUSES:
+        raise ActionError(409, "Wait for the project to finish (or pause it) before continuing the story.")
+    if p.status not in _START_FROM:
+        raise ActionError(409, f"The story can't be continued yet (status: {p.status.value}).")
+    has_scenes = db.execute(select(Scene.id).limit(1).where(Scene.project_id == p.id)).first() is not None
+    if not has_scenes:
+        raise ActionError(409, "This project has no scenes yet - write the script first.")
+    p.continue_prompt = (prompt or "").strip() or None
+    p.continue_scenes = max(1, min(int(scene_count), 6)) if scene_count else 1
+    db.commit()
+    return _enqueue(db, p, "continue", fresh=False)
 
 
 def resume(db: Session, project_id: str) -> Project:

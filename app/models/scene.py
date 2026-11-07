@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Text, Integer, ForeignKey, JSON
+from sqlalchemy import Boolean, Column, String, Text, Integer, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -32,6 +32,9 @@ class Scene(Base):
 
     # PENDING -> RENDERING -> DONE (or FAILED). Lets the UI show per-scene
     # progress and lets a resumed run skip scenes that are already finished.
+    # True = this scene carries on the previous one (same place, same people): it starts from that scene's last frame.
+    continues_previous = Column(Boolean, nullable=True)
+
     render_status = Column(String, default="PENDING", nullable=False, server_default="PENDING")
 
     project = relationship("Project", back_populates="scenes")

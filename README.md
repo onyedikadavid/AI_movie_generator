@@ -1,22 +1,77 @@
-## v2.13: complete spoken lines, real conversations, audio-driven video models
+## v2.26: complete spoken lines, real conversations, audio-driven video models (on top of v2.25)
 
-**Spoken lines were being cut off.** Three causes, three fixes:
-- The clip length was a guess (2.5 words/s, capped at 5 s). Now `MODEL_VOICE_WPS=2.1`, a bigger safety margin, and `VIDEO_MAX_CLIP_SECONDS=8` / `MODEL_VOICE_MAX_WORDS=13` by default (lines are split less often and less mid-sentence).
-- After every model-voice clip the backend listens to the last 0.3 s. A voice still going at the very end means the line was cut: the clip is generated again, longer (`SPEECH_COMPLETE_CHECK`, `SPEECH_RETRY_EXTRA_SECONDS`, `SPEECH_MAX_RETRIES`). This is a loudness heuristic on the clip's own audio, not speech recognition; tune `SPEECH_TAIL_MARGIN_DB` if it fires too often or too rarely. If the server cannot make a longer clip, the backend logs a warning and keeps the clip.
-- The LTX notebook used to shorten clips silently when the GPU ran out of memory and to round the length down. `ltx23_wan2gp_api_server_kaggle_v5.ipynb` fails with a clear message instead (`LTX_STRICT_LENGTH=1`) and rounds up.
+**Spoken lines were being cut off.** v2.25 already holds the last frame until a line finishes; the model's own voice could still be cut by the clip ending. Three fixes:
+- Clip length is no longer a guess at 2.5 words/s: `MODEL_VOICE_WPS=2.1`, a bigger safety margin, and `VIDEO_MAX_CLIP_SECONDS=8` by default (match your notebook's `LTX_MAX_FRAMES`).
+- After every model-voice clip - in "Shot by shot" AND "Whole scene" mode - the backend listens to the last 0.3 s. A voice still going at the very end means the line was cut: the clip is generated again, longer (`SPEECH_COMPLETE_CHECK`, `SPEECH_RETRY_EXTRA_SECONDS`, `SPEECH_MAX_RETRIES`), never longer than the video server reports on `/health`, and if the longer render fails the first clip is kept. This is a loudness heuristic on the clip's own audio, not speech recognition; tune `SPEECH_TAIL_MARGIN_DB` if it fires too often or too rarely.
+- `ltx23_wan2gp_api_server_kaggle_v5.ipynb` no longer shortens a clip silently when the GPU runs out of memory (`LTX_STRICT_LENGTH=1`: it fails with a clear message instead) and rounds the length up instead of down.
 
-**Characters walked around while talking.** `VIDEO_CAMERA_MOTION=auto` (new default) chooses the camera shot by shot: a conversation gets a calm camera and characters who stay in place and face each other (over-the-shoulder, the listener visible in the foreground, "no walking, no pacing"); an action beat (a fall, a chase, a fight, an explosion...) or an establishing shot gets a dynamic camera. Walking/pacing/running in a dialogue action is dropped unless the shot is an action beat. `model`, `gentle` and `static` still work exactly as before.
+**Characters walked around while talking.** `VIDEO_CAMERA_MOTION=auto` (new default) chooses the camera shot by shot. A conversation gets a calm camera and characters who stay in place and face each other (over-the-shoulder, the listener in the foreground, "no walking, no pacing"); a whole-scene conversation gets steady shot/reverse-shot coverage; an action beat (a fall, a chase, a fight, an explosion...) or an establishing shot keeps a dynamic camera. Walking/pacing/running in a dialogue action is dropped unless the shot is an action beat. `model`, `gentle` and `static` work exactly as before.
 
-**Audio-driven video models** (WanGP MultiTalk / InfiniteTalk / Hunyuan Avatar) do not make a voice: they animate a face to an audio file. Set `AUDIO_MODE=voices`, `VIDEO_AUDIO_DRIVEN=true` and use an image-first project. Each shot is sent its own slice of the scene's voice track and the clip is exactly as long as the slice, so words cannot be cut off. The final sound is still the pipeline's own voices. Models that make their own voices (LTX-2.3, Wan 2.2 Ovi, MiniMax H3) use `AUDIO_MODE=model`.
+**Audio-driven video models** (WanGP MultiTalk / InfiniteTalk / Hunyuan Avatar) do not make a voice: they animate a face to an audio file. Set `AUDIO_MODE=voices`, `VIDEO_AUDIO_DRIVEN=true`, use an image-first project and "Shot by shot". Each shot is sent its own slice of the scene's voice track and the clip is exactly as long as the slice, so words cannot be cut off. The final sound is the pipeline's own voices. Models that make their own voices (LTX-2.3, Wan 2.2 Ovi, MiniMax H3) use `AUDIO_MODE=model`.
 
-New self-test: `python scripts/selftest_dialogue_and_speech.py`. (Changing these settings changes the scene fingerprint, so existing scenes re-render once.)
+Notebook servers now report `max_frames` and `fps` on `/health` (all of them), so the backend plans scene length around what the model can really make.
+
+New self-test: `python scripts/selftest_dialogue_and_speech.py`. Changing these settings changes the scene fingerprint, so existing scenes re-render once.
+
+## One clip per scene (SCENE_MODE=whole)
+
+    AUDIO_MODE=model
+    SCENE_MODE=whole
+    WHOLE_SCENE_MAX_SECONDS=8
+
+Each scene is ONE generation: one prompt with the place, cast, every action and quoted line in order, and a moving camera.
+- The backend asks the Kaggle server for its real limit (`max_frames` on /health) and never asks for more. Set
+  `LTX_MAX_FRAMES` in the Kaggle launch cell: 121 = ~5 s, 241 = ~10 s, 361 = ~15 s (needs the v4 notebook).
+- If the dialogue is longer than the clip can hold, the lines are shortened (a warning in the worker log says so).
+  `WHOLE_SCENE_SPLIT=true` allows splitting a long scene between lines instead.
+- A clip the server returned shorter than asked (GPU memory) is kept; `WHOLE_SCENE_FALLBACK=true` redoes it shot by shot.
+- Finished clips are cached per exact prompt (`whole_N_raw.mp4.key`).
+
+## Clip length (why scenes were ~2 s)
+
+Clip length is set by the Kaggle server, not the backend: `LTX_MAX_FRAMES` in the launch cell (24 fps): 121 = 5 s,
+145 = 6 s, 193 = 8 s. A server started with a small value (your log showed 65 frames = 2.7 s) makes every scene that
+short and squeezes the dialogue, which sounds rushed. Set it to 193 and keep `WHOLE_SCENE_MAX_SECONDS=8`. Longer clips
+need more GPU memory and time; if the server runs out of memory it retries shorter (the worker log says so), and
+`VIDEO_T2V_RESOLUTION=768x448` gives it more room.
+
+## Script writer
+
+The full story (hook, structure) is saved with the script and shown in the app ("The story" card on the review and player screens).
+
+The prompt is first analysed (logline, main character, problem, turning point, ending, message, hook). The scenes are
+then written from that analysis: scene 1 is a hook, the middle escalates, the last scene resolves, and the story stays
+faithful to the prompt. A script with fewer than 3 scenes or no hook/ending is sent back once for a fix.
+
+## Scene count, scene length, downloads (set in the app)
+
+New Project screen: *Number of scenes* (empty = the script writer decides, usually 3-8 depending on the story) and
+*Seconds per scene* (empty = `WHOLE_SCENE_MAX_SECONDS`). Seconds can be changed later on the review screen. The video
+server's own maximum (`LTX_MAX_FRAMES`) still applies. Text-to-video never draws images; only "Image first" does.
+Every finished scene is uploaded on its own (Scenes list on the player page, Download button).
+
+## Continue the story
+
+Player page -> *Continue the story*: describe what happens next (or leave it empty), pick how many new scenes, press the
+button. The writer gets the story so far, the scenes so far and every character with their exact look, and adds new
+scenes after the last one (new characters only if the story needs them). Finished scenes and existing characters are
+never changed; the project goes back to review, and *Generate* renders only the new scenes, then re-joins the film.
+Consistency: character looks and voices are reused verbatim. A new scene marked *Carry on from the previous scene*
+starts from the previous clip's last picture (works in text-to-video and image-first mode, needs SCENE_MODE=whole),
+which keeps people and place identical. A scene that is a normal cut starts fresh from text/keyframe, so a face can
+still drift a little - true face locking needs a reference-image model (IP-Adapter) in the image notebook.
+
+## Narrator on/off
+
+Now a per-project switch (New Project screen and the review screen). `NARRATOR_ENABLED` in .env is only the default
+for projects that never touched it. Switching it re-renders the scenes on the next run.
 
 ## Model voices, free camera, and the image-vs-text switch
 
 **Voices.** `AUDIO_MODE=model` (the default) makes the video model (LTX-2.3) speak the lines itself - no edge-tts. Each line is written
 into the clip's prompt as `Kobi says in an adult male voice with a Nigerian accent: "..."`, with the character's gender, age and
 accent taken from the Cast screen so a voice stays similar between shots. Every spoken line is its own clip (long lines are split at
-sentence ends, `MODEL_VOICE_MAX_WORDS=9`) and clips keep their natural length, so lips stay in sync. Works in both modes (text-to-video
+sentence ends, `MODEL_VOICE_MAX_WORDS=10`) and clips keep their natural length, so lips stay in sync. Works in both modes (text-to-video
 and image-first). To go back to edge-tts: `AUDIO_MODE=voices` (or `hybrid`).
 
 **Action vs. words.** A dialogue line may hold both, e.g. `Irritated Tapping on the mixing board... "What's with this distortion?"`.

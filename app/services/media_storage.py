@@ -1,7 +1,5 @@
 import logging
 import mimetypes
-import os
-import time
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -37,19 +35,12 @@ def _upload_cloudinary(local_path: str, key: str) -> str:
     # Cloudinary wants a public_id without the file extension - it appends
     # its own based on the detected resource type (image vs video).
     public_id = key.rsplit(".", 1)[0]
-    big = os.path.getsize(local_path) > 20 * 1024 * 1024
-    if big:
-        # Chunked upload: survives flaky connections far better than one long POST
-        # (a single 100 MB POST is what died with "ConnectionAbortedError 10053").
-        result = cloudinary.uploader.upload_large(
-            local_path, public_id=public_id, resource_type="video",
-            overwrite=True, chunk_size=6 * 1024 * 1024, timeout=600,
-        )
-    else:
-        result = cloudinary.uploader.upload(
-            local_path, public_id=public_id, resource_type="auto",
-            overwrite=True, timeout=600,
-        )
+    result = cloudinary.uploader.upload(
+        local_path,
+        public_id=public_id,
+        resource_type="auto",  # auto-detects image vs video
+        overwrite=True,
+    )
     return result["secure_url"]
 
 
@@ -66,31 +57,6 @@ def _upload_s3(local_path: str, key: str) -> str:
     content_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
     client.upload_file(local_path, settings.S3_BUCKET, key, ExtraArgs={"ContentType": content_type})
     return f"{settings.S3_PUBLIC_BASE_URL.rstrip('/')}/{key}"
-
-
-def _is_url(v: str) -> bool:
-    return v.startswith("http://") or v.startswith("https://")
-
-
-def publish_file_strict(local_path: str, key: str, attempts: int = 5) -> str:
-    """Like publish_file but retries with back-off and RAISES if a remote backend is
-    configured and every attempt fails. Used for the final video, where silently keeping
-    a local path gives a player stuck at 0:00."""
-    if not (_cloudinary_configured() or _s3_configured()):
-        return local_path
-    last = None
-    for i in range(attempts):
-        try:
-            if _cloudinary_configured():
-                return _upload_cloudinary(local_path, key)
-            return _upload_s3(local_path, key)
-        except Exception as e:  # noqa: BLE001
-            last = e
-            wait = min(60, 5 * (2 ** i))
-            logger.warning("Upload of %s failed (attempt %d/%d): %s - retrying in %ds",
-                           key, i + 1, attempts, e, wait)
-            time.sleep(wait)
-    raise RuntimeError(f"Could not upload {key} after {attempts} attempts: {last}")
 
 
 def publish_file(local_path: str, key: str) -> str:

@@ -8,6 +8,37 @@ from app.schemas.character import CharacterResponse
 from app.schemas.scene import SceneResponse
 
 
+def clamp_scene_count(value) -> Optional[int]:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(n, 200)) if n > 0 else None
+
+
+def clamp_scene_seconds(value) -> Optional[int]:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(3, min(n, 120)) if n > 0 else None
+
+
+VIDEO_RESOLUTIONS = ("512x288", "640x352", "768x448", "960x544")
+
+
+def normalize_resolution(value) -> Optional[str]:
+    """One of the allowed 'WIDTHxHEIGHT' sizes (all 16:9, multiples of 32); anything else = None (server default)."""
+    v = str(value or "").strip().lower().replace("*", "x").replace(" ", "")
+    return v if v in VIDEO_RESOLUTIONS else None
+
+
+def normalize_scene_style(value) -> Optional[str]:
+    """'whole' | 'shots' | 'reuse' | 'film'; anything else = None (use the SCENE_MODE setting)."""
+    v = str(value or "").strip().lower()
+    return v if v in ("whole", "shots", "reuse", "film") else None
+
+
 def normalize_video_mode(value: Optional[str]) -> Optional[str]:
     """'t2v' / 'i2v' (also accepts friendly spellings); anything else = None (use the server default)."""
     v = (value or "").strip().lower().replace("_", "-")
@@ -26,11 +57,28 @@ class ProjectCreate(BaseModel):
     visual_style: Optional[str] = None
     # "i2v" (image model first, then animate) or "t2v" (text-to-video). None = server default.
     video_mode: Optional[str] = None
+    # True/False = narrator voice-over on/off for this project. None = server default.
+    narrator_enabled: Optional[bool] = None
+    # Leave empty for automatic.
+    scene_count: Optional[int] = None
+    scene_seconds: Optional[int] = None
+    video_resolution: Optional[str] = None
+    scene_style: Optional[str] = None
+
+
+class ContinueRequest(BaseModel):
+    """What should happen next. Both fields are optional: no prompt = the writer continues naturally."""
+    prompt: Optional[str] = None
+    scene_count: Optional[int] = None
 
 
 class ProjectSettingsUpdate(BaseModel):
     """Per-project generation settings, editable on the review screen before (re)generating."""
     video_mode: Optional[str] = None
+    narrator_enabled: Optional[bool] = None
+    scene_seconds: Optional[int] = None
+    video_resolution: Optional[str] = None
+    scene_style: Optional[str] = None
 
 
 class RunState(BaseModel):
@@ -70,6 +118,11 @@ class ProjectResponse(RunState):
     raw_prompt: Optional[str]
     final_video_path: Optional[str]
     video_mode: Optional[str] = None
+    narrator_enabled: Optional[bool] = None
+    scene_count: Optional[int] = None
+    scene_seconds: Optional[int] = None
+    video_resolution: Optional[str] = None
+    scene_style: Optional[str] = None
     created_at: datetime
 
     class Config:
