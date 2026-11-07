@@ -71,8 +71,10 @@ class VideoGenerationService:
             resp = self._send("get", base + "/health", timeout=httpx.Timeout(20.0, connect=10.0), attempts=1)
             info = resp.json()
             frames, fps = int(info.get("max_frames") or 0), int(info.get("fps") or 24)
-            if frames > 8:
+            if frames > 8:                                   # LTX notebook: reports frames
                 val = (frames - 1) / float(fps)
+            elif float(info.get("max_seconds") or 0) > 0:    # Ovi / MiniMax H3 / MultiTalk / Hunyuan notebooks: report seconds
+                val = float(info["max_seconds"])
         except Exception as e:  # noqa: BLE001 - an older server has no max_frames; just don't plan around it
             logger.info("Could not read the video server's clip limit (%s).", e)
         VideoGenerationService._limit_cache = (time.time(), val)
