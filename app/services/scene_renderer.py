@@ -31,6 +31,8 @@ import os
 import zlib
 import re
 import shutil
+import dataclasses
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -47,6 +49,8 @@ from app.services.voice_service import (
     limit_words,
     merge_actions,
     normalize_turn,
+    limit_sentences,
+    speech_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,11 +101,12 @@ class SceneRenderer:
         reuse = style_mode == "reuse"
         blob = json.dumps(
             {
-                "v": 6,
+                "v": 9,
                 "img": scene.image_prompt,
                 "motion": scene.motion_prompt,
                 "vis": scene.visual_description,
                 "loc": scene.location,
+                "place": [getattr(scene, "place_key", ""), getattr(scene, "place_text", "")],
                 "narr": scene.narration_text,
                 "dur": scene.duration_seconds,
                 "turns": scene.dialogue_turns,
@@ -119,10 +124,12 @@ class SceneRenderer:
                 "scenemode": [style_mode, float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)],
                 "audio": [settings.AUDIO_MODE, settings.AMBIENCE_VOLUME, getattr(scene, "sound_design", None), settings.MODEL_VOICE_MAX_WORDS],
                 "t2vres": resolution or settings.VIDEO_T2V_RESOLUTION,
+                "reuse": [bool(reuse), settings.REUSE_BASE_SECONDS] if reuse else False,
                 "speech": [settings.MODEL_VOICE_WPS, settings.VIDEO_MAX_CLIP_SECONDS, settings.SPEECH_COMPLETE_CHECK,
                            settings.SPEECH_RETRY_EXTRA_SECONDS, settings.SPEECH_MAX_RETRIES, settings.SPEECH_TAIL_MARGIN_DB],
                 "driven": settings.VIDEO_AUDIO_DRIVEN,
-                "reuse": [bool(reuse), settings.REUSE_BASE_SECONDS] if reuse else False,
+                "staging": [settings.CONVERSATION_STAGING, "sit2"],
+                "complete": ["whole-split", settings.SPEECH_FALLBACK_TTS],
             },
             sort_keys=True,
             default=str,
@@ -159,7 +166,7 @@ class SceneRenderer:
         narration = clean_for_tts(scene.narration_text or "") if narrator_on else ""
         if whole is None:
             whole = (settings.SCENE_MODE or "shots").strip().lower() == "whole"
-        chunk_words = 60 if whole else settings.MODEL_VOICE_MAX_WORDS   # whole scene: lines stay whole
+        chunk_words = 60 if whole else self._max_words()   # whole scene: lines stay whole, long ones are split into more clips later
         segments: List[Segment] = []
 
         def add(speaker: str, kind: str, text: str, expression: str = "", action: str = "") -> None:
@@ -177,14 +184,14 @@ class SceneRenderer:
                 n_words = settings.MODEL_NARRATION_WORDS * (3 if whole else 1) * (1 if turns else 2)
             else:
                 n_words = 22 if turns else 45
-            add(NARRATOR_NAME, "narration", limit_words(narration, n_words))
+            add(NARRATOR_NAME, "narration", limit_sentences(narration, n_words))
         for t in turns:
             speaker = (t.get("speaker") or "").strip() or "Character"
             if is_narrator(speaker):
                 kind, speaker = "narration", NARRATOR_NAME
             else:
                 kind = "dialogue"
-            add(speaker, kind, limit_words(clean_for_tts(t.get("text", ""), speaker), 40),
+            add(speaker, kind, limit_sentences(clean_for_tts(t.get("text", ""), speaker), 60),
                 t.get("expression") or "", t.get("action") or "")
         if not segments:
             segments.append(Segment(index=0, speaker=NARRATOR_NAME, kind="ambient"))
@@ -200,41 +207,125 @@ class SceneRenderer:
         return member
 
     # ------------------------------------------------------- whole-scene mode
+    # ------------------------------------------------------------- clip sizing
+    def _clip_limit(self) -> float:
+        """The longest clip the video server really makes: the smaller of VIDEO_MAX_CLIP_SECONDS and what the server
+        itself reports (LTX_MAX_FRAMES). A line is planned to fit in this - never longer than the server can speak."""
+        lim = float(settings.VIDEO_MAX_CLIP_SECONDS)
+        srv = getattr(self.video, "server_max_seconds", lambda: None)()
+        if srv:
+            lim = min(lim, float(srv))
+        return lim
+
+    def _retry_limit(self, extra: float) -> float:
+        """How long a retry may ask for: the server's real limit when it reports one; otherwise a little beyond
+        VIDEO_MAX_CLIP_SECONDS (the server may allow more than the planning cap - a clip that does not get longer is
+        noticed after the first retry)."""
+        srv = getattr(self.video, "server_max_seconds", lambda: None)()
+        if srv:
+            return float(srv)
+        return float(settings.VIDEO_MAX_CLIP_SECONDS) + extra * max(1, int(settings.SPEECH_MAX_RETRIES))
+
+    def _max_words(self) -> int:
+        """Most words one clip can carry: room for the speech at the expected pace plus a lead-in and a tail."""
+        wps = float(settings.MODEL_VOICE_WPS) or 2.1
+        fit = int(max(0.0, self._clip_limit() - 1.8) * wps)
+        return max(4, min(int(settings.MODEL_VOICE_MAX_WORDS), fit))
+
+    @staticmethod
+    def _talk_seconds(part: Sequence[Segment]) -> float:
+        return sum(speech_seconds(sg.text) + 0.45 for sg in part if sg.kind != "ambient")
+
+    @staticmethod
+    def _fits(talk: float, cap: float) -> bool:
+        """Does this much speech fit in ONE clip of `cap` seconds? (Lenient: the clip is asked for generously and a line
+        that still overruns is caught by the completion check, so lines are not split before they have to be.)"""
+        return talk * 1.05 + 0.8 <= cap
+
+    @staticmethod
+    def _request_len(talk: float, cap: float) -> float:
+        """Clip length to ask for: the speech plus 15 % (voices run slower than estimated) plus a lead-in. If the line
+        still is not finished the clip is generated again, longer, or the scene is split (see _render_whole)."""
+        return min(max(talk * 1.15 + 1.2, 3.0), cap)
+
+    def _split_text(self, seg: Segment, parts_wanted: int = 2) -> List[Segment]:
+        """Splits ONE line into complete pieces at sentence / clause ends (never mid-phrase)."""
+        words = len(seg.text.split())
+        if words < 6:
+            return [seg]
+        pieces = chunk_speech(seg.text, max(3, -(-words // parts_wanted)))
+        if len(pieces) < 2:
+            return [seg]
+        out = []
+        for n, piece in enumerate(pieces):
+            out.append(dataclasses.replace(seg, text=piece, action=seg.action if n == 0 else "",
+                                           duration=round(speech_seconds(piece) + 0.6, 2)))
+            out[-1].splits = getattr(seg, "splits", 0) + 1
+        return out
+
     def _whole_parts(self, segments: List[Segment], cap: float) -> List[List[Segment]]:
-        """Groups consecutive lines into the fewest pieces that each fit in `cap` seconds (a line is never cut)."""
-        parts: List[List[Segment]] = []
-        cur: List[Segment] = []
-        used = 0.0
+        """Groups consecutive lines into the fewest pieces that each fit in ONE clip of `cap` seconds. A line is never
+        shortened: one that cannot fit on its own is split at sentence / clause ends into several clips."""
+        spoken: List[Segment] = []
         for seg in segments:
             if seg.kind == "ambient":
                 continue
-            need = seg.duration + 0.5
-            if cur and used + need > cap - 0.8:
+            while not self._fits(self._talk_seconds([seg]), cap) and len(seg.text.split()) >= 6 \
+                    and getattr(seg, "splits", 0) < 3:
+                pieces = self._split_text(seg)
+                if len(pieces) < 2:
+                    break
+                spoken.extend(pieces[:-1])
+                seg = pieces[-1]
+            spoken.append(seg)
+        parts: List[List[Segment]] = []
+        cur: List[Segment] = []
+        for seg in spoken:
+            if cur and not self._fits(self._talk_seconds(cur + [seg]), cap):
                 parts.append(cur)
-                cur, used = [], 0.0
+                cur = []
             cur.append(seg)
-            used += need
         if cur:
             parts.append(cur)
         return parts
 
+    def _split_part(self, part: List[Segment], queue: "deque") -> bool:
+        """A clip whose last line is still cut off after the retries: give the last line its own, shorter clip
+        (several lines), or cut a single long line into two complete pieces. True if the queue was changed."""
+        if len(part) > 1:
+            queue.appendleft(part[-1:])
+            queue.appendleft(part[:-1])
+            return True
+        seg = part[0]
+        if getattr(seg, "splits", 0) >= 3:
+            return False
+        pieces = self._split_text(seg)
+        if len(pieces) < 2:
+            return False
+        for piece in reversed(pieces):
+            queue.appendleft([piece])
+        return True
+
     @staticmethod
-    def _fit_to_clip(spoken: List[Segment], cap: float, scene_number) -> None:
-        """One clip must hold the whole scene: shorten the lines (each keeps its start) until they fit."""
-        def need() -> float:
-            return sum(sg.duration + 0.5 for sg in spoken) * 1.25 + 1.8
-        ratio = 1.0
-        original = need()
-        while spoken and need() > cap and ratio > 0.2:
-            ratio -= 0.1
-            for sg in spoken:
-                words = len(sg.text.split())
-                sg.text = limit_words(sg.text, max(3, int(words * ratio)))
-                sg.duration = estimate_speech_seconds(sg.text)
-        if spoken and abs(need() - original) > 0.01:
-            logger.warning("Scene %s: the dialogue (%.1f s) is longer than one %.1f s clip, so lines were shortened to "
-                           "fit. Shorten the lines in the editor, or raise LTX_MAX_FRAMES / WHOLE_SCENE_MAX_SECONDS.",
-                           scene_number, original, cap)
+    def _place(scene) -> str:
+        """The place as the story bible describes it (same words every time it comes back); else the scene's own text."""
+        return getattr(scene, "place_text", None) or scene.location or ""
+
+    def _dub_with_tts(self, ctx, raw: str, seg: Segment, cast: VoiceCast) -> None:
+        """Last resort for a line the video model keeps cutting off: the pipeline's own voice says the WHOLE line over
+        the clip (the picture is held on its last frame if the voice runs longer). Lips will not match, meaning does."""
+        wav = raw + ".line.mp3"
+        dubbed = raw + ".dub.mp4"
+        profile = cast.profile(seg.speaker, seg.expression, seg.action, seg.text)
+        ctx.call(self.tts.synthesize, seg.text, profile, wav, seg.speaker)
+        ctx.call(self.ff.dub_clip, raw, wav, dubbed)
+        os.replace(dubbed, raw)
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
+        logger.warning("The video model kept cutting off \"%s\" - the line is now spoken by the pipeline's own voice so "
+                       "it is heard in full.", seg.text[:60])
 
     def _render_whole(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, mode,
                       on_screen, may_reuse, final_path, scene_seconds=None, prev_clip=None, resolution=None):
@@ -248,12 +339,10 @@ class SceneRenderer:
                            "the %.0f s you asked for. Raise LTX_MAX_FRAMES in the Kaggle launch cell for longer scenes.",
                            scene.scene_number, server_cap, cap)
             cap = server_cap
-        spoken = [sg for sg in segments if sg.kind != "ambient"]
-        if settings.WHOLE_SCENE_SPLIT:
-            parts = self._whole_parts(segments, cap) or [[]]
-        else:
-            self._fit_to_clip(spoken, cap, scene.scene_number)
-            parts = [spoken]
+        parts = self._whole_parts(segments, cap) or [[]]
+        if len(parts) > 1:
+            logger.info("Scene %s: the dialogue needs %d clips of up to %.1f s (nothing is shortened).",
+                        scene.scene_number, len(parts), cap)
         t2v = mode == "t2v"
         wide_path = os.path.join(scene_dir, "keyframe.png")
         ctx.stage(STAGE_AUDIO, 0.05, "Preparing the scene")
@@ -274,16 +363,22 @@ class SceneRenderer:
                 ctx.checkpoint()
                 ctx.call(
                     self.image.generate_image,
-                    pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
-                    wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"),
+                    pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style, getattr(scene, "place_desc", "")),
+                    wide_path, pb.image_negative(style), None, None, _seed(project_id, getattr(scene, "place_key", "") or scene.scene_number, "wide"),
                 )
             ctx.set_scene_image(wide_path)
             source = wide_path
         fitted: List[str] = []
         reused = 0
-        for n, part in enumerate(parts):
+        queue = deque(parts)
+        planned = len(parts)
+        n = 0
+        chain_sig = ""
+        while queue:
+            part = queue.popleft()
             ctx.checkpoint()
-            ctx.stage(STAGE_VIDEOS, 0.35 + 0.55 * n / len(parts), f"Generating the scene ({n + 1}/{len(parts)})")
+            planned = max(planned, n + 1 + len(queue))
+            ctx.stage(STAGE_VIDEOS, 0.35 + 0.55 * n / planned, f"Generating the scene ({n + 1}/{planned})")
             beats = []
             for seg in part:
                 member = self._character_for(seg.speaker, cast, characters) if seg.kind == "dialogue" else None
@@ -291,35 +386,37 @@ class SceneRenderer:
                     "kind": seg.kind, "speaker": seg.speaker, "expression": seg.expression, "action": seg.action,
                     "speech": seg.text, "voice_desc": cast.voice_description(seg.speaker),
                 })
-            talk = sum(sg.duration + 0.5 for sg in part)
-            # Real speech is slower than the estimate and starts a moment after the clip begins; the server also rounds
-            # the length DOWN to 8k+1 frames. Ask for generous room so the last line is never cut off.
-            request_len = min(max(talk * 1.25 + 1.8, 4.0), cap)
+            talk = self._talk_seconds(part)
+            request_len = self._request_len(talk, cap)
+            # A later piece of the scene carries on from the last picture of the piece before it.
+            part_source = source
+            if n > 0 and fitted:
+                part_source = os.path.join(scene_dir, f"whole_{n}_start.png")
+                ctx.call(self.ff.extract_last_frame, fitted[-1], part_source)
             prompt = pb.whole_scene_prompt(
-                beats, on_screen, scene.location, scene.visual_description, style, scene.motion_prompt,
-                getattr(scene, "sound_design", None), start_image=bool(continuing or (source and n > 0)),
-                camera_mode=settings.VIDEO_CAMERA_MOTION,
+                beats, on_screen, self._place(scene), scene.visual_description, style, scene.motion_prompt,
+                getattr(scene, "sound_design", None), start_image=bool(continuing or (n > 0 and part_source)),
             )
             seed = _seed(project_id, scene.scene_number, "whole", n)
             raw = os.path.join(scene_dir, f"whole_{n}_raw.mp4")
             fit = os.path.join(scene_dir, f"whole_{n}.mp4")
             key = hashlib.sha1(
-                f"whole|{mode}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(source or '')}".encode()
+                f"whole|{mode}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(part_source or '')}|{chain_sig}".encode()
             ).hexdigest()
             key_file = raw + ".key"
             stored = open(key_file).read().strip() if os.path.exists(key_file) else None
+
+            def render(length: float, shift: int = 0, _prompt=prompt, _seed0=seed, _src=part_source, _raw=raw):
+                seed_now = _seed0 + shift
+                if t2v and _src is None:
+                    ctx.call(self.video.generate_text_clip, _prompt, _raw, length, seed_now, True, resolution=resolution)
+                else:
+                    ctx.call(self.video.generate_clip, _src, _raw, _prompt, length, seed_now, True, resolution=resolution)
+
             if may_reuse and _nonempty(raw) and stored == key:
                 reused += 1
             else:
-                def render_whole(length: float, shift: int = 0, _prompt=prompt, _seed0=seed, _src=source, _raw=raw):
-                    if t2v and _src is None:
-                        ctx.call(self.video.generate_text_clip, _prompt, _raw, length, _seed0 + shift, True, resolution=resolution)
-                    else:
-                        ctx.call(self.video.generate_clip, _src, _raw, _prompt, length, _seed0 + shift, True, resolution=resolution)
-
-                render_whole(request_len)
-                if settings.SPEECH_COMPLETE_CHECK and any(sg.kind in ("dialogue", "narration") and sg.text for sg in part):
-                    self._finish_the_line(ctx, raw, request_len, render_whole, n, limit=cap)
+                render(request_len)
                 got = self.ff.get_duration(raw)
                 if got < 0.8 * request_len:
                     if settings.WHOLE_SCENE_FALLBACK:
@@ -329,6 +426,20 @@ class SceneRenderer:
                         return None
                     logger.warning("Scene %s: asked for %.1f s but the server returned %.1f s (GPU memory). Keeping it; "
                                    "lower VIDEO_T2V_RESOLUTION or WHOLE_SCENE_MAX_SECONDS.", scene.scene_number, request_len, got)
+                # Was the last line finished? If not: generate again, longer; then give it a clip of its own; then
+                # (last resort) say it with the pipeline's own voice. A line is never left cut off.
+                if settings.SPEECH_COMPLETE_CHECK and any(sg.text for sg in part):
+                    complete = self._finish_the_line(ctx, raw, request_len, render, n, "Scene part")
+                    if not complete:
+                        if self._split_part(part, queue):
+                            logger.warning("Scene %s: the last line did not fit, so the scene is split into more clips "
+                                           "(nothing is cut).", scene.scene_number)
+                            for f in (raw, key_file):
+                                if os.path.exists(f):
+                                    os.remove(f)
+                            continue
+                        if settings.SPEECH_FALLBACK_TTS and len(part) == 1:
+                            self._dub_with_tts(ctx, raw, part[0], cast)
                 with open(key_file, "w") as fh:
                     fh.write(key)
             if n == 0 and t2v and not continuing and not _nonempty(wide_path):
@@ -336,6 +447,8 @@ class SceneRenderer:
                 ctx.set_scene_image(wide_path)
             ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
             fitted.append(fit)
+            chain_sig = key
+            n += 1
         ctx.checkpoint()
         ctx.stage(STAGE_ASSEMBLE, 0.93, "Finishing the scene")
         if len(fitted) == 1:
@@ -413,7 +526,7 @@ class SceneRenderer:
                 if may_reuse and _nonempty(seg.audio_path):
                     reused += 1
                 else:
-                    profile = cast.profile(seg.speaker, seg.expression, seg.action)
+                    profile = cast.profile(seg.speaker, seg.expression, seg.action, seg.text)
                     ctx.call(self.tts.synthesize, seg.text, profile, seg.audio_path, seg.speaker)
                 seg.duration = self.ff.get_duration(seg.audio_path)
             if not model_audio:
@@ -460,8 +573,8 @@ class SceneRenderer:
                 ctx.checkpoint()
                 ctx.call(
                     self.image.generate_image,
-                    pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
-                    wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"),
+                    pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style, getattr(scene, "place_desc", "")),
+                    wide_path, pb.image_negative(style), None, None, _seed(project_id, getattr(scene, "place_key", "") or scene.scene_number, "wide"),
                 )
             ctx.set_scene_image(wide_path)
 
@@ -487,7 +600,7 @@ class SceneRenderer:
                         ctx.checkpoint()
                         ctx.call(
                             self.image.generate_image,
-                            pb.closeup_prompt(member, expression, scene.location, style, free_cam),
+                            pb.closeup_prompt(member, expression, self._place(scene), style, free_cam),
                             path, pb.image_negative(style), None, None, _seed(project_id, member.name, "face"),
                         )
                     keyframe_for_speaker[name] = path
@@ -501,13 +614,12 @@ class SceneRenderer:
         if audio_driven:
             if t2v:
                 raise RuntimeError(
-                    "VIDEO_AUDIO_DRIVEN=true needs an image-first project: the audio-driven video models animate a "
+                    "VIDEO_AUDIO_DRIVEN=true needs an image-first (i2v) project: the audio-driven video models animate a "
                     "face from a picture. Switch the project to image-first, or set VIDEO_AUDIO_DRIVEN=false."
                 )
             voices_wav = os.path.join(scene_dir, "voices.wav")
             ctx.call(self.ff.build_audio_track, [x.audio_path for x in segments], [x.gap_after for x in segments],
                      voices_wav, True, LEAD_IN)
-        server_cap = getattr(self.video, "server_max_seconds", lambda: None)()   # longest clip the video server can make
 
         # ---------------------------------------------------------- 5. motion
         fitted: List[str] = []
@@ -523,26 +635,25 @@ class SceneRenderer:
             speech = sh.text if (model_audio and sh.kind in ("dialogue", "narration")) else ""
             voice_desc = cast.voice_description(sh.speaker) if speech else ""
             # Model voices need real room for the line plus a beat of breathing space; clips are capped by the server.
-            request_len = min(sh.duration + (0.8 if model_audio else 0.4), settings.VIDEO_MAX_CLIP_SECONDS)
-            shot_audio, shot_audio_sig = None, ""
+            request_len = min(sh.duration + (0.8 if model_audio else 0.4), self._clip_limit())
+            shot_audio = None
             if audio_driven:
                 # The clip is exactly as long as the slice of voice it is animated to.
                 shot_audio = os.path.join(scene_dir, f"shot_{sh.index}_audio.wav")
                 ctx.call(self.ff.cut_audio, voices_wav, sh.start, sh.duration, shot_audio)
                 request_len = max(1.0, sh.duration)
-                with open(shot_audio, "rb") as fh:
-                    shot_audio_sig = hashlib.sha1(fh.read()).hexdigest()[:12]
             if t2v:
                 member = self._character_for(sh.speaker, cast, characters) if sh.kind == "dialogue" else None
                 prompt = pb.text_video_prompt(
                     sh.kind, sh.speaker, sh.expression, sh.action,
                     getattr(member, "appearance_prompt", "") or getattr(member, "description", "") if member else "",
-                    on_screen, scene.location, scene.visual_description, style, sh.index,
+                    on_screen, self._place(scene), scene.visual_description, style, sh.index,
                     settings.VIDEO_CAMERA_MOTION, getattr(scene, "sound_design", None), hybrid,
                     scene_motion=scene.motion_prompt, speech=speech, voice_desc=voice_desc, model_voice=model_audio,
+                    dialogue_text=sh.text if sh.kind == "dialogue" else "",
                 )
                 # Same seed for the same character = the best-effort way to keep a similar face between shots.
-                seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, scene.scene_number, "wide")
+                base_seed = _seed(project_id, sh.speaker, "face") if sh.kind == "dialogue" else _seed(project_id, getattr(scene, "place_key", "") or scene.scene_number, "wide")
                 source = None
             else:
                 source = keyframe_for_speaker.get(sh.speaker) or wide_path
@@ -551,15 +662,15 @@ class SceneRenderer:
                     scene.motion_prompt, scene.visual_description, sh.index,
                     settings.VIDEO_CAMERA_MOTION,
                     speech=speech, voice_desc=voice_desc, sound_design=getattr(scene, "sound_design", None),
-                    model_voice=model_audio,
+                    model_voice=model_audio, dialogue_text=sh.text if sh.kind == "dialogue" else "",
                 )
-                seed = _seed(project_id, scene.scene_number, sh.index, "clip")
+                base_seed = _seed(project_id, scene.scene_number, sh.index, "clip")
 
             # A finished clip is reused only if it was made from EXACTLY this request. (Reusing by shot number alone
             # would put the wrong picture/speech in a slot whenever the shot plan shifts.) Clips from older versions
             # have no key file and are kept as they are.
             clip_key = hashlib.sha1(
-                f"{mode}|{model_audio}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(source or '')}|{shot_audio_sig}".encode()
+                f"{mode}|{model_audio}|{audio_driven}|{prompt}|{request_len:.2f}|{base_seed}|{os.path.basename(source or '')}".encode()
             ).hexdigest()
             key_file = raw + ".key"
             stored_key = None
@@ -571,7 +682,7 @@ class SceneRenderer:
             if may_reuse and _nonempty(raw) and (stored_key is None or stored_key == clip_key):
                 reused += 1
             else:
-                def render(length: float, shift: int = 0, _t2v=t2v, _prompt=prompt, _seed0=seed, _src=source,
+                def render(length: float, shift: int = 0, _t2v=t2v, _prompt=prompt, _seed0=base_seed, _src=source,
                            _aud=shot_audio, _raw=raw):
                     seed_now = _seed0 + shift
                     if _t2v:
@@ -589,7 +700,8 @@ class SceneRenderer:
 
                 render(request_len)
                 if model_audio and speech and settings.SPEECH_COMPLETE_CHECK:
-                    self._finish_the_line(ctx, raw, request_len, render, sh.index, limit=server_cap)
+                    if not self._finish_the_line(ctx, raw, request_len, render, sh.index) and settings.SPEECH_FALLBACK_TTS:
+                        self._dub_with_tts(ctx, raw, sh, cast)
                 with open(key_file, "w") as fh:
                     fh.write(clip_key)
             if t2v and sh.index == 0 and not _nonempty(wide_path):
@@ -648,7 +760,7 @@ class SceneRenderer:
         base_len = max(3.0, min(float(settings.REUSE_BASE_SECONDS), cap, float(server_cap or 1e9), total + 0.5))
         sound = getattr(scene, "sound_design", None)
         if t2v:
-            prompt = pb.text_video_prompt("ambient", "", "", "", "", on_screen, scene.location, scene.visual_description,
+            prompt = pb.text_video_prompt("ambient", "", "", "", "", on_screen, self._place(scene), scene.visual_description,
                                           style, 0, settings.VIDEO_CAMERA_MOTION, sound, False, scene_motion=scene.motion_prompt)
         else:
             prompt = pb.video_prompt("ambient", "", "", "", scene.motion_prompt, scene.visual_description, 0,
@@ -678,8 +790,8 @@ class SceneRenderer:
                 ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
                 ctx.checkpoint()
                 ctx.call(self.image.generate_image,
-                         pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style),
-                         wide_path, pb.image_negative(style), None, None, _seed(project_id, scene.scene_number, "wide"))
+                         pb.keyframe_prompt(scene.image_prompt or scene.visual_description, on_screen, style, getattr(scene, "place_desc", "")),
+                         wide_path, pb.image_negative(style), None, None, _seed(project_id, getattr(scene, "place_key", "") or scene.scene_number, "wide"))
                 source = wide_path
             ctx.checkpoint()
             ctx.stage(STAGE_VIDEOS, 0.40, "Generating the scene footage (used for every shot)")
@@ -722,59 +834,49 @@ class SceneRenderer:
         return SceneResult(final_path, wide_path, total, len(shots), reused)
 
     # ------------------------------------------------------------------ cut-off lines
-    def _finish_the_line(self, ctx, raw: str, length: float, render, shot_index: int, limit: Optional[float] = None) -> None:
+    def _finish_the_line(self, ctx, raw: str, length: float, render, shot_index: int, label: str = "Shot") -> bool:
         """Model-voice mode: a clip whose voice is still going at its very last instant had its line cut off. Render it
-        again, longer (and with a fresh seed), up to settings.SPEECH_MAX_RETRIES times - never longer than `limit` (what
-        the video server can make). If the longer render fails, the earlier clip is kept. A line that still seems cut off
-        after that is logged, never silently dropped."""
+        again, longer (and with a fresh seed), up to settings.SPEECH_MAX_RETRIES times. Stops early if the server
+        cannot make a longer clip. A line that still seems cut off after that is logged, never silently dropped."""
         extra = max(0.5, float(settings.SPEECH_RETRY_EXTRA_SECONDS))
         margin = float(settings.SPEECH_TAIL_MARGIN_DB)
         for attempt in range(1, max(0, int(settings.SPEECH_MAX_RETRIES)) + 1):
             ctx.checkpoint()
             active, overall, tail = self.ff.tail_speech_active(raw, margin_db=margin)
             if not active:
-                return
+                return True
             before = self.ff.get_duration(raw)
             cap = getattr(self, "_clip_cap", None)      # learned earlier in this run: the server cannot go longer
-            new_len = length + extra
-            if limit:
-                new_len = min(new_len, float(limit))
-            if (cap and before >= cap - 0.3) or new_len < length + 0.4:
-                logger.warning("Shot %d: the line may be cut off, but the video server's clip-length limit (~%.1f s) is reached. "
-                               "Raise LTX_MAX_FRAMES in the notebook, or shorten the line / lower MODEL_VOICE_MAX_WORDS.",
-                               shot_index + 1, float(limit or cap or before))
-                return
+            if cap and before >= cap - 0.3:
+                logger.warning("%s %d: the line may be cut off, but the video server's clip-length limit (~%.1f s) is reached.",
+                               label, shot_index + 1, cap)
+                return False
+            limit = self._retry_limit(extra)
+            if length >= limit - 0.1:
+                logger.warning("%s %d: the line may be cut off and this clip is already as long as the video server can make "
+                               "(%.1f s) - not generating it again.", label, shot_index + 1, limit)
+                return False
+            length = min(length + extra, limit)
             logger.warning(
-                "Shot %d: the spoken line seems to be cut off (last 0.3 s at %.1f dB vs %.1f dB overall) - "
+                "%s %d: the spoken line seems to be cut off (last 0.3 s at %.1f dB vs %.1f dB overall) - "
                 "generating it again at %.1f s (try %d of %d).",
-                shot_index + 1, tail, overall, new_len, attempt, int(settings.SPEECH_MAX_RETRIES),
+                label, shot_index + 1, tail, overall, length, attempt, int(settings.SPEECH_MAX_RETRIES),
             )
-            backup = raw + ".prev"
-            shutil.copyfile(raw, backup)
             try:
                 os.remove(raw)
-                render(new_len, attempt)
-            except Exception as e:  # noqa: BLE001 - the earlier clip is usable; do not lose the whole scene over a retry
-                if type(e).__name__ == "RunStopped":     # the user pressed Stop: never swallow that
-                    shutil.move(backup, raw)
-                    raise
-                logger.warning("Shot %d: generating the longer clip failed (%s); keeping the first one.", shot_index + 1, e)
-                shutil.move(backup, raw)
-                return
-            if os.path.exists(backup):
-                os.remove(backup)
-            length = new_len
+            except OSError:
+                pass
+            render(length, attempt)
             if self.ff.get_duration(raw) < before + 0.4:
                 self._clip_cap = max(before, self.ff.get_duration(raw))
-                logger.warning("Shot %d: the video server did not make a longer clip (its clip-length limit?) - keeping it.",
-                               shot_index + 1)
-                return
+                logger.warning("%s %d: the video server did not make a longer clip (its clip-length limit?).",
+                               label, shot_index + 1)
+                return not self.ff.tail_speech_active(raw, margin_db=margin)[0]
         active, overall, tail = self.ff.tail_speech_active(raw, margin_db=margin)
         if active:
-            logger.warning(
-                "Shot %d: the line may still be cut off after %d retries. Shorten the line, lower MODEL_VOICE_MAX_WORDS, "
-                "or raise the video server's maximum clip length.", shot_index + 1, int(settings.SPEECH_MAX_RETRIES),
-            )
+            logger.warning("%s %d: the line may still be cut off after %d retries.", label, shot_index + 1,
+                           int(settings.SPEECH_MAX_RETRIES))
+        return not active
 
     # ------------------------------------------------------------------ misc
     def _silent_mp3(self, path: str, seconds: float) -> None:

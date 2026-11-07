@@ -20,6 +20,7 @@ class SceneBase(BaseModel):
     motion_prompt: Optional[str] = None
     sound_design: Optional[str] = None
     continues_previous: Optional[bool] = None
+    location_id: Optional[str] = None   # the scene bible entry (place) this scene is set in
 
 
 class SceneCreate(SceneBase):
@@ -36,6 +37,7 @@ class SceneUpdate(BaseModel):
     motion_prompt: Optional[str] = None
     sound_design: Optional[str] = None
     continues_previous: Optional[bool] = None
+    location_id: Optional[str] = None
     dialogue_turns: Optional[List[DialogueTurnOut]] = None
 
 

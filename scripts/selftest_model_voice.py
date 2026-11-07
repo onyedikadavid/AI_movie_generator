@@ -17,6 +17,8 @@ sys.path.insert(0, HERE)
 
 from selftest_renderer import FakeCtx, FakeImage, FakeTTS  # noqa: E402
 from app.core.config import settings  # noqa: E402
+settings.SPEECH_COMPLETE_CHECK = False   # this test uses synthetic tones; the cut-off check has its own test (selftest_dialogue_and_speech)
+settings.CONVERSATION_STAGING = "walk"
 from app.services.ffmpeg_service import FFmpegService  # noqa: E402
 from app.services.scene_renderer import SceneRenderer  # noqa: E402
 from app.services.voice_service import VoiceCast, split_dialogue  # noqa: E402
@@ -76,7 +78,6 @@ def main():
                 gender="male", age_group="adult", voice_id=None)]
     cast = VoiceCast(chars, "ng", "", texts=["Nollywood sound engineer"])
     settings.NARRATOR_ENABLED = False
-    settings.SPEECH_COMPLETE_CHECK = False   # this test counts clip requests; its fake clips keep a tone to the very end
     settings.AUDIO_MODE, settings.VIDEO_CAMERA_MOTION = "model", "model"
 
     # --- the splitter on the real screenshot lines ----------------------------------------------------
@@ -167,29 +168,24 @@ def main():
         assert len(reqs) == n, "finished scene is reused"
         print("OK whole scene (%s): 1 generation, %.1fs, lines in order" % (mode, res.duration))
         print("   prompt:", pr[:420])
-    # DEFAULT: a scene longer than the cap is still ONE generation - the lines are shortened to fit
+    # A scene longer than one clip is SPLIT into more clips - lines are never shortened or cut mid-sentence
     big = scene(); big.dialogue_turns = [{"speaker": "Kobi", "text": "This is line number %d, and it has a handful of words in it." % i, "action": "pacing"} for i in range(8)]
     vid = FakeModelVideo(); vid.cap = 289
     settings.WHOLE_SCENE_MAX_SECONDS = 12.0
     res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(big, chars, "Cinematic", cast, os.path.join(tmp, "big"), "p1", FakeCtx(), video_mode="t2v")
-    assert len(vid.t2v) == 1 and vid.t2v[0][1] <= 12.01, [(round(d_, 1)) for _, d_, _ in vid.t2v]
-    print("OK long scene -> still ONE generation of %.1f s (lines shortened to fit)" % vid.t2v[0][1])
-    # a server that only makes 2.7 s clips is respected (asked via /health) - still one generation
+    allp = " ".join(p for p, _, _ in vid.t2v) + " ".join(p for _, p, _, _ in vid.i2v)
+    assert len(vid.t2v) + len(vid.i2v) >= 2 and all(d_ <= 12.01 for _, d_, _ in vid.t2v), [(round(d_, 1)) for _, d_, _ in vid.t2v]
+    for i in range(8):
+        assert "This is line number %d, and it has a handful of words in it." % i in allp, "line %d was cut" % i
+    print("OK long scene -> %d clips, every word of all 8 lines is still there (nothing shortened)" % (len(vid.t2v) + len(vid.i2v)))
+    # a server that only makes 2.7 s clips is respected (asked via /health); the scene is split, never cut
     class Limited(FakeModelVideo):
         def server_max_seconds(self):
             return 64 / 24.0
     vid = Limited(); vid.cap = 65
     res = SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(scene(), chars, "Cinematic", cast, os.path.join(tmp, "lim"), "p1", FakeCtx(), video_mode="t2v")
-    assert len(vid.t2v) == 1 and vid.t2v[0][1] <= 2.7, vid.t2v[0][1]
-    print("OK server limit 2.7 s -> one generation of %.1f s" % vid.t2v[0][1])
-    # optional: allow splitting
-    settings.WHOLE_SCENE_SPLIT = True
-    vid = FakeModelVideo(); vid.cap = 289
-    settings.WHOLE_SCENE_MAX_SECONDS = 12.0
-    SceneRenderer(FakeImage(), vid, FakeTTS(), ff).render(big, chars, "Cinematic", cast, os.path.join(tmp, "split"), "p1", FakeCtx(), video_mode="t2v")
-    assert 2 <= len(vid.t2v) <= 8 and all(d_ <= 12.01 for _, d_, _ in vid.t2v)
-    print("OK WHOLE_SCENE_SPLIT=true -> %d pieces of <= 12 s" % len(vid.t2v))
-    settings.WHOLE_SCENE_SPLIT = False
+    assert all(d_ <= 2.7 for _, d_, _ in vid.t2v + [(a, c, b) for a, _, c, b in vid.i2v]), vid.t2v
+    print("OK server limit 2.7 s -> %d clips, none longer than the server can make" % (len(vid.t2v) + len(vid.i2v)))
     # truncated clip: kept by default (never generate twice); fallback to shots only if asked
     settings.WHOLE_SCENE_MAX_SECONDS = 30.0
     vid = FakeModelVideo(); vid.cap = 121

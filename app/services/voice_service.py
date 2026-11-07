@@ -296,9 +296,12 @@ def emotion_prosody(expression: str = "", action: str = "") -> tuple:
     return (0, 0, 0)
 
 
-def profile_for(member: CastMember, expression: str = "", action: str = "") -> VoiceProfile:
+def profile_for(member: CastMember, expression: str = "", action: str = "", line: str = "", scene: str = "") -> VoiceProfile:
+    from app.services.delivery import analyze
+    from app.services.prompt_builder import detect_situation
     a_rate, a_pitch, a_vol = _AGE_PROSODY.get(member.age_group, (0, 0, 0))
-    e_rate, e_pitch, e_vol = emotion_prosody(expression, action)
+    d = analyze(expression, action, line, detect_situation(action, scene), scene)
+    e_rate, e_pitch, e_vol = d.prosody() if (d.volume or d.pitch or d.pace) else emotion_prosody(expression, action)
     return VoiceProfile(
         voice=member.voice_id,
         gender=member.gender,
@@ -472,6 +475,51 @@ def normalize_turn(turn: dict) -> dict:
 _WORDS_PER_SECOND = 2.1
 
 
+def limit_sentences(text: str, max_words: int = 40) -> str:
+    """Like limit_words, but a spoken line is NEVER cut in the middle of a sentence or clause (that is what turned
+    'this fruit is gotten from an apple tree' into 'this fruit is gotten from.'). Over the limit, it keeps whole
+    sentences; if the first sentence alone is too long it keeps whole clauses; if there is no boundary at all it
+    keeps the line complete rather than cutting a word off."""
+    text = (text or "").strip()
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    sentences = re.findall(r"[^.!?\u2026]+(?:[.!?\u2026]+|$)", text)
+    kept = ""
+    for sent in sentences:
+        cand = (kept + " " + sent.strip()).strip()
+        if len(cand.split()) > max_words:
+            break
+        kept = cand
+    if kept:
+        return kept
+    clauses = re.split(r"(?<=[,;:])\s+", text)
+    kept = ""
+    for cl in clauses:
+        cand = (kept + " " + cl).strip()
+        if len(cand.split()) > max_words:
+            break
+        kept = cand
+    if kept:
+        return kept.rstrip(",;:- ") + "."
+    return text
+
+
+def speech_seconds(text: str) -> float:
+    """Seconds the words themselves take to say (no safety padding): words / MODEL_VOICE_WPS plus a short beat at each
+    comma / full stop."""
+    wps = _WORDS_PER_SECOND
+    try:
+        from app.core.config import settings
+        wps = float(getattr(settings, "MODEL_VOICE_WPS", wps)) or wps
+    except Exception:  # noqa: BLE001
+        pass
+    t = text or ""
+    words = len(t.split())
+    pauses = sum(t.count(c) for c in ",;:") * 0.12 + sum(t.count(c) for c in ".!?") * 0.30
+    return words / wps + pauses
+
+
 def estimate_speech_seconds(text: str) -> float:
     """Seconds a model-voice line needs. Deliberately generous: a clip that is a little too long costs nothing, a clip
     that is too short cuts the line off. (Pace comes from settings.MODEL_VOICE_WPS; 2.1 words/s by default.)"""
@@ -573,10 +621,10 @@ class VoiceCast:
             self._extras[key] = cast[-1]
         return self._extras[key]
 
-    def profile(self, speaker: str, expression: str = "", action: str = "") -> VoiceProfile:
+    def profile(self, speaker: str, expression: str = "", action: str = "", line: str = "", scene: str = "") -> VoiceProfile:
         if is_narrator(speaker):
             return narrator_profile(self.region, self.narrator_voice, expression)
-        return profile_for(self.member_for(speaker), expression, action)
+        return profile_for(self.member_for(speaker), expression, action, line, scene)
 
     def voice_description(self, speaker: str) -> str:
         """Plain-English description of a speaker's voice, written into the video prompt so the video model's

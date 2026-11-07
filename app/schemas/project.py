@@ -6,6 +6,7 @@ from app.models.project import ProjectStatus
 from app.schemas.script import ScriptResponse
 from app.schemas.character import CharacterResponse
 from app.schemas.scene import SceneResponse
+from app.schemas.location import LocationResponse
 
 
 def clamp_scene_count(value) -> Optional[int]:
@@ -133,6 +134,7 @@ class ProjectDetailResponse(ProjectResponse):
     """Full shape used by the review/edit and player views."""
     script: Optional[ScriptResponse] = None
     characters: List[CharacterResponse] = []
+    locations: List[LocationResponse] = []
     scenes: List[SceneResponse] = []
 
     class Config:

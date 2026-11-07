@@ -46,6 +46,13 @@ STATEMENTS = [
     "ALTER TABLE characters ADD COLUMN IF NOT EXISTS gender VARCHAR",
     "ALTER TABLE characters ADD COLUMN IF NOT EXISTS age_group VARCHAR",
     "ALTER TABLE characters ADD COLUMN IF NOT EXISTS voice_id VARCHAR",
+    "ALTER TABLE characters ADD COLUMN IF NOT EXISTS core_look TEXT",
+    "ALTER TABLE characters ADD COLUMN IF NOT EXISTS outfit TEXT",
+    "ALTER TABLE characters ADD COLUMN IF NOT EXISTS outfits JSON",
+    """CREATE TABLE IF NOT EXISTS locations (
+        id VARCHAR PRIMARY KEY, project_id VARCHAR NOT NULL REFERENCES projects(id), key VARCHAR NOT NULL,
+        name VARCHAR NOT NULL, description TEXT NOT NULL DEFAULT '', reference_image_path VARCHAR)""",
+    "ALTER TABLE scenes ADD COLUMN IF NOT EXISTS location_id VARCHAR REFERENCES locations(id) ON DELETE SET NULL",
     """CREATE TABLE IF NOT EXISTS pipeline_lease (
         id INTEGER PRIMARY KEY, project_id VARCHAR, holder VARCHAR, heartbeat_at TIMESTAMP WITH TIME ZONE)""",
     "INSERT INTO pipeline_lease (id) VALUES (1) ON CONFLICT (id) DO NOTHING",

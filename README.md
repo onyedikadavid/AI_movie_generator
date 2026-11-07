@@ -1,18 +1,3 @@
-## v2.26: complete spoken lines, real conversations, audio-driven video models (on top of v2.25)
-
-**Spoken lines were being cut off.** v2.25 already holds the last frame until a line finishes; the model's own voice could still be cut by the clip ending. Three fixes:
-- Clip length is no longer a guess at 2.5 words/s: `MODEL_VOICE_WPS=2.1`, a bigger safety margin, and `VIDEO_MAX_CLIP_SECONDS=8` by default (match your notebook's `LTX_MAX_FRAMES`).
-- After every model-voice clip - in "Shot by shot" AND "Whole scene" mode - the backend listens to the last 0.3 s. A voice still going at the very end means the line was cut: the clip is generated again, longer (`SPEECH_COMPLETE_CHECK`, `SPEECH_RETRY_EXTRA_SECONDS`, `SPEECH_MAX_RETRIES`), never longer than the video server reports on `/health`, and if the longer render fails the first clip is kept. This is a loudness heuristic on the clip's own audio, not speech recognition; tune `SPEECH_TAIL_MARGIN_DB` if it fires too often or too rarely.
-- `ltx23_wan2gp_api_server_kaggle_v5.ipynb` no longer shortens a clip silently when the GPU runs out of memory (`LTX_STRICT_LENGTH=1`: it fails with a clear message instead) and rounds the length up instead of down.
-
-**Characters walked around while talking.** `VIDEO_CAMERA_MOTION=auto` (new default) chooses the camera shot by shot. A conversation gets a calm camera and characters who stay in place and face each other (over-the-shoulder, the listener in the foreground, "no walking, no pacing"); a whole-scene conversation gets steady shot/reverse-shot coverage; an action beat (a fall, a chase, a fight, an explosion...) or an establishing shot keeps a dynamic camera. Walking/pacing/running in a dialogue action is dropped unless the shot is an action beat. `model`, `gentle` and `static` work exactly as before.
-
-**Audio-driven video models** (WanGP MultiTalk / InfiniteTalk / Hunyuan Avatar) do not make a voice: they animate a face to an audio file. Set `AUDIO_MODE=voices`, `VIDEO_AUDIO_DRIVEN=true`, use an image-first project and "Shot by shot". Each shot is sent its own slice of the scene's voice track and the clip is exactly as long as the slice, so words cannot be cut off. The final sound is the pipeline's own voices. Models that make their own voices (LTX-2.3, Wan 2.2 Ovi, MiniMax H3) use `AUDIO_MODE=model`.
-
-Notebook servers now report `max_frames` and `fps` on `/health` (all of them), so the backend plans scene length around what the model can really make.
-
-New self-test: `python scripts/selftest_dialogue_and_speech.py`. Changing these settings changes the scene fingerprint, so existing scenes re-render once.
-
 ## One clip per scene (SCENE_MODE=whole)
 
     AUDIO_MODE=model
@@ -65,6 +50,19 @@ still drift a little - true face locking needs a reference-image model (IP-Adapt
 
 Now a per-project switch (New Project screen and the review screen). `NARRATOR_ENABLED` in .env is only the default
 for projects that never touched it. Switching it re-renders the scenes on the next run.
+
+## v2.13: complete spoken lines, real conversations, audio-driven video models
+
+**Spoken lines were being cut off.** Three causes, three fixes:
+- The clip length was a guess (2.5 words/s, capped at 5 s). Now `MODEL_VOICE_WPS=2.1`, a bigger safety margin, and `VIDEO_MAX_CLIP_SECONDS=8` / `MODEL_VOICE_MAX_WORDS=13` by default (lines are split less often and less mid-sentence).
+- After every model-voice clip the backend listens to the last 0.3 s. A voice still going at the very end means the line was cut: the clip is generated again, longer (`SPEECH_COMPLETE_CHECK`, `SPEECH_RETRY_EXTRA_SECONDS`, `SPEECH_MAX_RETRIES`). This is a loudness heuristic on the clip's own audio, not speech recognition; tune `SPEECH_TAIL_MARGIN_DB` if it fires too often or too rarely. If the server cannot make a longer clip, the backend logs a warning and keeps the clip.
+- The LTX notebook used to shorten clips silently when the GPU ran out of memory and to round the length down. `ltx23_wan2gp_api_server_kaggle_v5.ipynb` fails with a clear message instead (`LTX_STRICT_LENGTH=1`) and rounds up.
+
+**Characters walked around while talking.** `VIDEO_CAMERA_MOTION=auto` (new default) chooses the camera shot by shot: a conversation gets a calm camera and characters who stay in place and face each other (over-the-shoulder, the listener visible in the foreground, "no walking, no pacing"); an action beat (a fall, a chase, a fight, an explosion...) or an establishing shot gets a dynamic camera. Walking/pacing/running in a dialogue action is dropped unless the shot is an action beat. `model`, `gentle` and `static` still work exactly as before.
+
+**Audio-driven video models** (WanGP MultiTalk / InfiniteTalk / Hunyuan Avatar) do not make a voice: they animate a face to an audio file. Set `AUDIO_MODE=voices`, `VIDEO_AUDIO_DRIVEN=true` and use an image-first project. Each shot is sent its own slice of the scene's voice track and the clip is exactly as long as the slice, so words cannot be cut off. The final sound is still the pipeline's own voices. Models that make their own voices (LTX-2.3, Wan 2.2 Ovi, MiniMax H3) use `AUDIO_MODE=model`.
+
+New self-test: `python scripts/selftest_dialogue_and_speech.py`. (Changing these settings changes the scene fingerprint, so existing scenes re-render once.)
 
 ## Model voices, free camera, and the image-vs-text switch
 
@@ -418,3 +416,74 @@ This repo ships two requirements files:
 worker. The worker's GPU reservation block requires the NVIDIA Container
 Toolkit; if you're on a CPU-only machine, delete that `deploy:` block from
 the `celery_worker` service before running `docker compose up`.
+
+## v2.26: the scene decides how people move (CONVERSATION_STAGING)
+
+Characters that bounced up and down, ran around while saying "I'm stuck", or stood in place without talking to each other came
+from the prompt, not the video model. Now WHAT IS HAPPENING decides how a character is staged, in this order:
+
+1. **A situation** named in the shot's action, the spoken line, the scene description or the camera note is shown with the
+   body, for the whole scene: *stuck / trapped / sinking* (struggles and pulls in the same spot, never walks or runs; the other
+   character stays beside them and helps), *lying hurt*, *swimming*, *climbing*, *hiding*, *sitting*. "Keto is stuck in mud"
+   or Keto saying "I'm stuck" is enough. The camera follows (a slight handheld shake for a struggle).
+2. **A specific action** ("kneels and opens the old box", "grips the rope") is performed exactly as written.
+3. **Only when nothing specific is happening** the conversation is staged by `CONVERSATION_STAGING` (in `.env`, used with
+   `VIDEO_CAMERA_MOTION=auto`): `walk` (default) = they walk side by side at an easy pace, turn to each other, gesture, react,
+   no bouncing / jumping / pacing, camera tracks them; `stay` = they stand and face each other; `free` = the model decides.
+
+Action beats (falls, chases, fights) keep their dynamic camera. The same rules apply in all four "How each scene is built"
+styles (the whole-scene prompt shows the situation in every beat). The script writer is told to give every line a specific
+action that fits the situation, and to state any predicament plainly in the scene description.
+This is prompt-level guidance: the video model still decides the final motion, so a clip can occasionally ignore it. If it
+does, write the situation into the scene description in the editor (e.g. "Keto is stuck waist-deep in thick mud") and re-render.
+
+Audio-driven mode (`VIDEO_AUDIO_DRIVEN=true`, MultiTalk / InfiniteTalk / Hunyuan Avatar) works in "Shot by shot" only.
+The Draft/Fast/Balanced/High picker is ignored by a notebook that sets `FORCE_RESOLUTION` (Ovi / H3 / MultiTalk / Hunyuan).
+
+## v2.28: spoken lines are never cut off
+
+What went wrong: in "Whole scene" mode a scene whose dialogue did not fit one clip had every line shortened to its first few
+words ("this fruit is gotten from an apple tree" became "this fruit is gotten from."), and a whole-scene clip was never checked
+for a cut-off line (only shot-by-shot clips were). The length estimate was also so padded that one clip held only ~6 words.
+
+Now:
+1. **Nothing is shortened or cut mid-sentence.** A scene that does not fit one clip is split into more clips (lines in order,
+   each piece ending at a sentence / clause end). A later piece carries on from the last picture of the one before it.
+2. **Every clip is checked** (whole-scene and shot-by-shot): if the voice is still going at the clip's very end it is generated
+   again, longer (up to the video server's real limit, read from `/health`; `SPEECH_MAX_RETRIES`).
+3. **Still cut off?** The scene is split so that line gets a clip of its own; a single long line is cut into two complete pieces.
+4. **Last resort** (`SPEECH_FALLBACK_TTS=true`): the pipeline's own voice says the whole line over the clip (the picture holds on
+   its last frame if needed). Lips will not match for that line, but the meaning is never lost.
+5. Clip length and words per clip follow the real server limit: `min(VIDEO_MAX_CLIP_SECONDS, LTX_MAX_FRAMES / 24)`. If your
+   `.env` says 10 s but the notebook is at `LTX_MAX_FRAMES=193` (8 s), 8 s is used. For longer clips raise `LTX_MAX_FRAMES`
+   in the Kaggle launch cell (241 = 10 s; needs more GPU memory and time).
+A slow-speaking voice means more clips / retries, so a scene can take longer to render - that is the price of complete sentences.
+
+## v2.29: how a line is said, and the story bible
+
+**Delivery (volume, pitch, pace, voice quality).** `app/services/delivery.py` works out HOW each line is said from the
+speaker's emotion, what is physically happening (stuck, hiding, swimming, climbing...) and the line itself (`!`, `?`,
+`...`, CAPS, "help", "look out"). It is written into the video prompt ("says in a high-pitched, quick, shaky, trembling
+voice") so the video model's own voice performs it, and it drives rate / pitch / volume for the fallback TTS voices. The
+dialogue writer now asks each character for *how it is said* (whispering, shouting harshly, soft and sad...) and for an
+Action that happens WHILE the words are spoken and matches them.
+
+**Story bible (`app/services/bible.py`).** Every project gets one entry per place and per character:
+
+* *Places* (`locations` table): each scene's free-text `location` is matched to ONE place however it was worded
+  ("Jack's carpenter workshop", "Carpenter Workshop - morning" -> one place; "Mechanic workshop" stays separate). Each place
+  has one saved description (layout, props, colours, light - no people) used in every scene set there, and the keyframe
+  seed is per place, so the room comes back the same.
+* *Characters*: `core_look` (face, hair, skin, build - never changes) plus `outfit` and `outfits` per place, so Jack is the
+  same man in a leather apron in the carpenter's workshop and in overalls in the mechanic's.
+* Built after the script is written and again before generation / after "Continue the story"; **only missing entries are
+  created** - existing or edited ones are never rewritten, and "Continue the story" is told the existing places so new
+  scenes reuse them by name.
+* Edit on the review screen (Places section, character cards) or via `PATCH /projects/{id}/locations/{id}`,
+  `POST /projects/{id}/locations/merge`, `PATCH /projects/{id}/characters/{id}` (`core_look`, `outfit`, `outfits`).
+  Editing a place or look re-renders only the scenes that use it.
+* The schema upgrades itself on start (new `locations` table, new columns); an Alembic migration is included too.
+* Needs the Ollama notebook for the descriptions; without it the bible is built from the script's own text.
+
+Limit: this keeps the *description*, seed and outfits identical, which makes places and faces much more consistent, but
+the image/video models can still vary details - it is not a pixel-exact reference image.

@@ -107,4 +107,5 @@ class Project(Base):
 
     script = relationship("Script", back_populates="project", uselist=False, cascade="all, delete-orphan")
     characters = relationship("Character", back_populates="project", cascade="all, delete-orphan")
+    locations = relationship("Location", back_populates="project", cascade="all, delete-orphan")
     scenes = relationship("Scene", back_populates="project", order_by="Scene.scene_number", cascade="all, delete-orphan")

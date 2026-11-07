@@ -204,6 +204,7 @@ class LLMService:
         genre_hint: str = None,
         tone_hint: str = None,
         visual_style_hint: str = None,
+        places: list = None,
     ) -> dict:
         """Writes what happens NEXT in an existing film: more of the story and new scenes (numbered after the existing
         ones) with the SAME characters, looks and voices. Returns {"story_addition", "new_characters", "scenes"}."""
@@ -220,6 +221,11 @@ class LLMService:
             for sc in scenes_so_far[-6:]
         )
         last = scenes_so_far[-1] if scenes_so_far else {}
+        place_block = ""
+        if places:
+            place_block = ("\n        PLACES ALREADY IN THE FILM (when a new scene is set in one of these, write its EXACT name in \"location\" "
+                           "so it is filmed the same way again; only name a new place if the story really goes somewhere new):\n"
+                           + "\n".join(f"        - {p.get('name')}: {p.get('description') or ''}" for p in places) + "\n")
         want = (f"The user wants the story to continue like this: {direction.strip()}" if (direction or "").strip()
                 else "The user gave no direction - continue the story in the most natural, interesting way.")
         prompt = f"""
@@ -235,6 +241,7 @@ class LLMService:
 {recap}
         The film stopped at: scene {last.get('scene_number', 0)} in "{last.get('location') or ''}".
 
+        {place_block}
         {want}
 
         RULES
@@ -258,7 +265,7 @@ class LLMService:
                     "story_beat": "One sentence: what happens and why it matters.",
                     "continues_previous": false,
                     "location": "...",
-                    "visual_description": "...",
+                    "visual_description": "What we SEE, including what is physically happening to the characters (e.g. 'Keto is stuck waist-deep in thick mud, struggling to pull free', 'two friends sit at a table', 'she hides behind the bush'). State any predicament or posture plainly - it is kept for the whole scene.",
                     "image_prompt": "Detailed standalone text-to-image prompt for the keyframe.",
                     "narration_text": "One or two short narrator sentences (under 25 words), never a character's own words.",
                     "characters_present": ["Name1"],
@@ -387,6 +394,8 @@ class LLMService:
            cut to a new place or time. Scene 1 is always false. In a film most scenes should be true.
         3. Same characters, names and looks in every scene. Add a new character only if the story truly needs one.
         4. Every scene must make sense to a viewer who has not read the story.
+        5. PLACES: give every place ONE short, plain name and write that EXACT name in "location" every time a scene is set
+           there (never reword it, never add the time of day). Reuse the names in the PREVIOUS SCENES when going back to a place.
         {style_constraints}
         Return JSON exactly like this:
         {{
@@ -536,6 +545,9 @@ class LLMService:
         5. {count_rule} Do NOT compress the story into one scene unless the prompt is genuinely a single moment.
            Each scene is filmed as ONE continuous clip of about {secs} seconds, so give it only what fits in that time.
         6. Every scene's visuals, narration and mood must match the genre and tone of the story.
+        7. PLACES: give every place ONE short, plain name (e.g. "Carpenter Workshop", "Mechanic Workshop", "Cobbler Shop",
+           "Jack's House") and write that EXACT name in "location" every time a scene is set there - never reword it,
+           never add the time of day or the mood to it. A different place gets a different name.
 
         Output valid JSON matching this structure exactly:
         {{
@@ -557,7 +569,7 @@ class LLMService:
                     "scene_number": 1,
                     "story_beat": "One sentence: what happens in this scene and why it matters to the story (hook / setup / complication / turning point / climax / ending).",
                     "location": "...",
-                    "visual_description": "...",
+                    "visual_description": "What we SEE, including what is physically happening to the characters (e.g. 'Keto is stuck waist-deep in thick mud, struggling to pull free', 'two friends sit at a table', 'she hides behind the bush'). State any predicament or posture plainly - it is kept for the whole scene.",
                     "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - subject(s), action, setting, time of day, lighting and camera framing (e.g. wide shot / medium shot). Sent directly to the image generator, so it must make sense on its own.",
                     "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here. In scene 1 this is the HOOK line.",
                     "characters_present": ["Name1", "Name2"],

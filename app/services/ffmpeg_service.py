@@ -319,6 +319,24 @@ class FFmpegService:
             return False, overall, tail
         return (tail >= overall - float(margin_db)), overall, tail
 
+    def dub_clip(self, src_path: str, wav_path: str, dst_path: str, lead: float = 0.25, tail: float = 0.6) -> str:
+        """Replaces a clip's sound with a recorded voice line (kept whole). If the voice is longer than the picture, the
+        last frame is held so the line is never cut. Used only when the video model keeps cutting a line off."""
+        _require_ffmpeg()
+        vd = max(self.get_duration(src_path), 0.1)
+        ad = max(self.get_duration(wav_path), 0.1)
+        total = max(vd, ad + lead + tail)
+        hold = max(0.0, total - vd) + 0.05
+        ms = int(lead * 1000)
+        _run([
+            "ffmpeg", "-y", "-i", src_path, "-i", wav_path, "-filter_complex",
+            f"[0:v]tpad=stop_mode=clone:stop_duration={hold:.3f}[v];[1:a]adelay={ms}|{ms},apad[a]",
+            "-map", "[v]", "-map", "[a]", "-t", f"{total:.3f}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst_path,
+        ])
+        return dst_path
+
     def cut_audio(self, src_path: str, start: float, duration: float, out_wav: str) -> str:
         """A slice of an audio file as 16 kHz mono WAV (what the audio-driven video models listen to)."""
         _require_ffmpeg()

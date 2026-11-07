@@ -137,8 +137,8 @@ class Settings(BaseSettings):
     # model is much sharper on short clips than on stretched-out long ones).
     VIDEO_SHOT_SECONDS: float = 4.5
     VIDEO_MAX_SHOTS_PER_SCENE: int = 5
-    # Longest clip the video server can produce in one call (121 frames @ 24fps).
-    # (Model-voice lines need room: this used to be 5.0, which cut longer lines off. Match the video server's LTX_MAX_FRAMES.)
+    # Longest clip the video server can produce in one call (LTX notebook: LTX_MAX_FRAMES=193 -> 8 s @ 24fps).
+    # Model-voice lines need room: this used to be 5.0, which cut longer lines off.
     VIDEO_MAX_CLIP_SECONDS: float = 8.0
     VIDEO_FPS: int = 24
     # Turn on when the video model outputs fewer than 24 fps (e.g. CogVideoX = 8 fps):
@@ -155,21 +155,23 @@ class Settings(BaseSettings):
     AUDIO_MODE: str = "model"
     # Model-voice mode: the longest spoken piece (words) put into ONE clip. A longer line is split at sentence
     # ends into several clips, so the model never has to fit a whole paragraph into ~5 seconds.
-    MODEL_VOICE_MAX_WORDS: int = 10
+    MODEL_VOICE_MAX_WORDS: int = 13
     # How fast the video model's voices speak (words per second) - used to size a clip before it exists.
     # Real model speech is slower than a TTS voice; 2.1 leaves room, 2.5 (the old value) cut lines off.
     MODEL_VOICE_WPS: float = 2.1
     # After each model-voice clip, listen to its last fraction of a second. If a voice is still going at the very
-    # end the line was cut off: the clip is generated again, longer (up to SPEECH_MAX_RETRIES times, never longer
-    # than the video server allows).
+    # end the line was cut off: the clip is generated again, longer (up to SPEECH_MAX_RETRIES times).
     SPEECH_COMPLETE_CHECK: bool = True
     SPEECH_RETRY_EXTRA_SECONDS: float = 1.5
     SPEECH_MAX_RETRIES: int = 2
+    # A line still cut off after the retries: first split the scene so it gets its own, longer clip; if even that fails,
+    # the line is spoken by the pipeline's own voice over the picture, so the full sentence is ALWAYS heard.
+    SPEECH_FALLBACK_TTS: bool = True
     # The clip's last 0.3 s counts as 'still speaking' when it is within this many dB of the clip's average level.
     SPEECH_TAIL_MARGIN_DB: float = 14.0
     # Audio-driven video models (WanGP MultiTalk / InfiniteTalk / Hunyuan Avatar) do not make a voice: they animate the
-    # face to an audio file you give them. true = send each shot's slice of the pipeline's own voices (needs
-    # AUDIO_MODE=voices, an image-first project and 'Shot by shot'). The final sound is still the pipeline's voices.
+    # face to an audio file you give them. true = send each shot's slice of the pipeline's own voices (AUDIO_MODE=voices,
+    # image-first project) to the video server. The final sound is still the pipeline's voices.
     VIDEO_AUDIO_DRIVEN: bool = False
     # Model-voice mode: narrator voice-over is kept to this many words per scene (one clip) when the scene also has
     # character dialogue (twice this when it has none). Every extra narration chunk is a whole extra clip, and
@@ -190,7 +192,7 @@ class Settings(BaseSettings):
     REUSE_BASE_SECONDS: float = 6.0
     # False (default) = exactly ONE clip per scene: if the dialogue is longer than fits, the lines are shortened.
     # True = a long scene may be split between lines into several clips.
-    WHOLE_SCENE_SPLIT: bool = False
+    WHOLE_SCENE_SPLIT: bool = True    # kept for old .env files; lines are never shortened to fit one clip any more
     # What to do if the server returns less than 80% of the requested length (GPU memory): False = keep it (never
     # generate a scene twice), True = redo that scene shot by shot.
     WHOLE_SCENE_FALLBACK: bool = False
@@ -212,11 +214,17 @@ class Settings(BaseSettings):
     # shot from the scene's wide keyframe instead (faster, lower quality).
     # Camera: "model" (default) = free, cinematic camera - the scene's own camera direction (or a rotating set of
     # film moves) goes into the prompt and the video model decides how to move, like a normal movie.
+    # "auto" (default) = chosen shot by shot: conversations get a calm, steady camera and characters who stay put
+    # and talk to each other; action beats (falls, chases, fights...) and establishing shots get a dynamic camera.
     # "gentle" = slow, small moves only; "static" = locked-off tripod shot (the old, stiff behaviour).
-    # "auto" (default) = chosen shot by shot: conversations get a calm, steady camera and characters who stay put and
-    # talk to each other; action beats (falls, chases, fights...) and establishing shots get a dynamic camera.
-    # "model" = the old rotating set of film moves for every shot; "gentle" / "static" = slow / locked-off.
     VIDEO_CAMERA_MOTION: str = "auto"
+    # How two or more characters TALK to each other (used when VIDEO_CAMERA_MOTION=auto):
+    #   "walk" (default) = walk-and-talk: they move together through the place at an easy pace, glance and turn to each
+    #            other, gesture as they speak, and the camera tracks them. No bouncing, no jumping, no aimless pacing
+    #            back and forth. Scenes that are clearly seated / in a vehicle / in bed fall back to "stay".
+    #   "stay"   = they stand where they are and face each other (over-the-shoulder shots).
+    #   "free"   = no staging instruction, the video model decides.
+    CONVERSATION_STAGING: str = "walk"
     SHOT_COVERAGE: bool = True
     # Final export size and sharpening (0 disables sharpening).
     OUTPUT_WIDTH: int = 1280

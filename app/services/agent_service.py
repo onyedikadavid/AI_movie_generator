@@ -7,6 +7,19 @@ from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
 from app.services.http_retry import post_with_retry
 from app.services.style_presets import KIDS_DIALOGUE_RULE
 
+ACTION_RULE = (
+    " Your Action must fit what is PHYSICALLY happening in this scene and SHOW what you say with your body. If the scene "
+    "says someone is stuck, trapped, sinking, injured, hiding, swimming, climbing, falling or sitting, your Action shows "
+    "exactly that (for example: pulls at his legs stuck in the mud, strains and struggles to get free, ducks lower behind "
+    "the bush, grips the rope) - never walking, running or pacing around instead. If you say you are stuck, you ARE stuck "
+    "and cannot move from the spot. Be specific and visual, never vague (not 'moves', 'gestures' or 'stands'). "
+    "The Action happens WHILE you say the line and matches its words: when you say 'look at this', you hold the thing "
+    "up; 'I'm stuck' - you strain against it; 'come here' - you wave them over. The body and the words tell ONE story. "
+    "Choose the Emotion for how the line is SAID - its volume and voice: e.g. whispering, shouting harshly, "
+    "soft and tender, low and stern, trembling, bright and excited, flat and tired - not just a mood label."
+)
+
+
 logger = logging.getLogger(__name__)
 
 class AgentService:
@@ -92,6 +105,7 @@ class AgentService:
                 "Speak the way a real person speaks out loud - short, direct, emotional, in natural "
                 "conversational English. One to two sentences, under 25 words. Never describe actions inside "
                 "the spoken line, never say your own name, never narrate."
+                + ACTION_RULE
                 + (KIDS_DIALOGUE_RULE if kids else "")
             )
             recent = "\n".join(
@@ -101,8 +115,8 @@ class AgentService:
             user_prompt = (
                 f"Context:\n{scene_context}\n\nConversation so far:\n{recent}\n\n"
                 f"Reply with EXACTLY these three lines and nothing else:{ending}\n"
-                "Emotion: <one or two words, e.g. angry, pleading, sad, joyful, stern, afraid>\n"
-                "Action: <a short physical action, e.g. kneels, turns away, clenches fists>\n"
+                "Emotion: <how it is said, one to three words, e.g. shouting angrily, whispering, soft and sad, stern and low, trembling, excited>\n"
+                "Action: <a short, specific physical action that fits the situation, e.g. kneels, pulls at his stuck legs, clenches fists>\n"
                 "Text: <what you say out loud>"
             )
 
@@ -132,6 +146,7 @@ class AgentService:
                 "or to someone just off-screen. Speak the way a real person speaks: short, natural, emotional, "
                 "one or two sentences, under 25 words. Never say your own name, never narrate, never describe "
                 "actions inside the spoken line."
+                + ACTION_RULE
                 + (KIDS_DIALOGUE_RULE if kids else "")
             )
             recent = "\n".join(f"{h['text']}" for h in history[-2:]) or "(you speak first)"
@@ -139,8 +154,8 @@ class AgentService:
             user_prompt = (
                 f"What you already said:\n{recent}\n\n"
                 f"Reply with EXACTLY these three lines and nothing else:{ending}\n"
-                "Emotion: <one or two words, e.g. worried, hopeful, determined, amazed>\n"
-                "Action: <a short physical action>\n"
+                "Emotion: <how it is said, one to three words, e.g. worried and quiet, hopeful, firm and low, amazed>\n"
+                "Action: <a short, specific physical action that fits the situation>\n"
                 "Text: <what you say out loud>"
             )
             raw = await self._query_agent(system_prompt, user_prompt)
@@ -179,4 +194,4 @@ class AgentService:
         extra_action, text = split_dialogue(text)
         action = merge_actions(action, extra_action)
         text = text.strip().strip('"\u201c\u201d').strip()
-        return emotion[:40], action[:120], text
+        return emotion[:60], action[:120], text

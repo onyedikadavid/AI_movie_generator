@@ -15,6 +15,9 @@ from app.core.sync_db import SessionLocal
 from app.models.character import Character
 from app.models.project import BUSY_STATUSES, Project
 from app.models.scene import Scene
+from app.models.location import Location
+from app.schemas.location import LocationMerge, LocationResponse, LocationUpdate
+from app.services.bible import place_tokens
 from app.schemas.character import CharacterResponse, CharacterUpdate
 from app.schemas.project import (
     DeleteResult, ProjectDetailResponse, ProjectListItem, ProjectResponse, ProjectSettingsUpdate, QueueSnapshot,
@@ -167,7 +170,7 @@ async def get_project(project_id: str):
         rc.reconcile_stale(db)
         p = db.execute(
             select(Project)
-            .options(selectinload(Project.script), selectinload(Project.characters), selectinload(Project.scenes))
+            .options(selectinload(Project.script), selectinload(Project.characters), selectinload(Project.locations), selectinload(Project.scenes))
             .where(Project.id == project_id)
         ).scalars().first()
         if not p:
@@ -277,6 +280,14 @@ async def update_scene(project_id: str, scene_id: str, payload: SceneUpdate, db:
         # turn's `action`, so only the spoken words stay in `text`.
         turns = [normalize_turn(t) for t in changes["dialogue_turns"]]
         changes["dialogue_turns"] = [t for t in turns if (t.get("text") or "").strip()] or None
+    if "location_id" in changes:
+        if changes["location_id"]:
+            loc = (await db.execute(select(Location).where(Location.id == changes["location_id"], Location.project_id == project_id))).scalars().first()
+            if not loc:
+                raise HTTPException(status_code=404, detail="Place not found.")
+            changes["location"] = loc.name            # the scene is now set in that place of the bible
+    elif "location" in changes and (changes["location"] or "").strip() != (scene.location or "").strip():
+        changes["location_id"] = None                 # a new place name: matched to the bible again on the next run
     for field, value in changes.items():
         setattr(scene, field, value)
     if changes:
@@ -285,6 +296,73 @@ async def update_scene(project_id: str, scene_id: str, payload: SceneUpdate, db:
     await db.commit()
     await db.refresh(scene)
     return scene
+
+
+async def _location_or_404(project_id: str, location_id: str, db: AsyncSession) -> Location:
+    loc = (await db.execute(select(Location).where(Location.id == location_id, Location.project_id == project_id))).scalars().first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Place not found.")
+    return loc
+
+
+async def _redo_scenes_at(db: AsyncSession, project_id: str, location_ids: list) -> None:
+    scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id, Scene.location_id.in_(location_ids)))).scalars().all()
+    for sc in scenes:
+        if sc.render_status == "DONE":
+            sc.render_status = "PENDING"
+
+
+@router.patch("/projects/{project_id}/locations/{location_id}", response_model=LocationResponse)
+async def update_location(project_id: str, location_id: str, payload: LocationUpdate, db: AsyncSession = Depends(get_db)):
+    """Edit a place in the scene bible. Every scene set there is re-rendered with the new description."""
+    project = await _get_project_or_404(project_id, db)
+    if project.status in BUSY_STATUSES:
+        raise HTTPException(status_code=409, detail="Pause the project (or wait for it to finish) before editing places.")
+    loc = await _location_or_404(project_id, location_id, db)
+    changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes:
+        name = (changes["name"] or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="A place needs a name.")
+        loc.name = name[:80]
+        scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id, Scene.location_id == loc.id))).scalars().all()
+        for sc in scenes:
+            sc.location = loc.name
+    if "description" in changes:
+        loc.description = (changes["description"] or "").strip()
+    if changes:
+        await _redo_scenes_at(db, project_id, [loc.id])
+    await db.commit()
+    await db.refresh(loc)
+    return loc
+
+
+@router.post("/projects/{project_id}/locations/merge", response_model=LocationResponse)
+async def merge_locations(project_id: str, payload: LocationMerge, db: AsyncSession = Depends(get_db)):
+    """Two bible entries that are really one place: all scenes (and outfits) move to `into_id`, the other entry goes."""
+    project = await _get_project_or_404(project_id, db)
+    if project.status in BUSY_STATUSES:
+        raise HTTPException(status_code=409, detail="Pause the project (or wait for it to finish) before editing places.")
+    if payload.from_id == payload.into_id:
+        raise HTTPException(status_code=422, detail="Pick two different places.")
+    src = await _location_or_404(project_id, payload.from_id, db)
+    dst = await _location_or_404(project_id, payload.into_id, db)
+    scenes = (await db.execute(select(Scene).where(Scene.project_id == project_id, Scene.location_id == src.id))).scalars().all()
+    for sc in scenes:
+        sc.location_id, sc.location = dst.id, dst.name
+        if sc.render_status == "DONE":
+            sc.render_status = "PENDING"
+    for c in (await db.execute(select(Character).where(Character.project_id == project_id))).scalars().all():
+        outs = dict(c.outfits or {})
+        if src.key in outs:
+            moved = outs.pop(src.key)
+            outs.setdefault(dst.key, moved)
+            c.outfits = outs or None
+    await db.flush()
+    await db.delete(src)
+    await db.commit()
+    await db.refresh(dst)
+    return dst
 
 
 @router.patch("/projects/{project_id}", response_model=ProjectResponse)

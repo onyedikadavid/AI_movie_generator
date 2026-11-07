@@ -1,6 +1,6 @@
 # app/schemas/character.py
 from pydantic import BaseModel
-from typing import Optional
+from typing import Dict, Optional
 
 
 class CharacterBase(BaseModel):
@@ -11,6 +11,10 @@ class CharacterBase(BaseModel):
     gender: Optional[str] = None      # "male" | "female"
     age_group: Optional[str] = None   # "child" | "teen" | "adult" | "elder"
     voice_id: Optional[str] = None
+    # Character bible: what never changes, the usual outfit, and outfits per place ({location key: clothing}).
+    core_look: Optional[str] = None
+    outfit: Optional[str] = None
+    outfits: Optional[Dict[str, str]] = None
 
 
 class CharacterCreate(CharacterBase):
@@ -24,6 +28,9 @@ class CharacterUpdate(BaseModel):
     appearance_prompt: Optional[str] = None
     gender: Optional[str] = None
     age_group: Optional[str] = None
+    core_look: Optional[str] = None
+    outfit: Optional[str] = None
+    outfits: Optional[Dict[str, str]] = None
 
 
 class CharacterResponse(CharacterBase):

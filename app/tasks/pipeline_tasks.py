@@ -20,6 +20,8 @@ from app.models.project import Project, ProjectStatus
 from app.models.script import Script
 from app.models.character import Character
 from app.models.scene import Scene
+from app.models.location import Location
+from app.services.bible import BibleView, ensure_bible
 from app.schemas.script import ScriptDecompositionSchema
 
 from app.services import run_control as rc
@@ -32,7 +34,7 @@ from app.services.tts_service import TTSService
 from app.services.ffmpeg_service import FFmpegService
 from app.services.scene_renderer import SceneRenderer
 from app.services.voice_service import VoiceCast, normalize_age_group, normalize_gender, normalize_turn
-from app.services.media_storage import publish_file
+from app.services.media_storage import publish_file, publish_file_strict
 from app.services.style_presets import resolve_style
 
 logger = logging.getLogger(__name__)
@@ -200,6 +202,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
     for attempt in range(1, 5):
         try:
             _save_script(db, pid, script_schema)
+            _build_bible(db, project)
             try:
                 os.remove(cache_file)   # saved: the next run writes a fresh script
             except OSError:
@@ -214,11 +217,32 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
             ctl.checkpoint()
 
 
+def _build_bible(db, project: Project) -> None:
+    """Story bible: one entry per place and per character, so they look the same every time they come back.
+    Only missing entries are written; existing (or user-edited) ones are kept. Never raises."""
+    try:
+        script = db.execute(select(Script).where(Script.project_id == project.id)).scalars().first()
+        style = project.requested_visual_style or (script.visual_style if script else "") or ""
+        tone = project.requested_tone or (script.tone if script else "") or ""
+        llm = LLMService()
+
+        def ask(prompt: str) -> dict:
+            data = llm._parse_json(asyncio.run(llm._generate(prompt)))
+            return data if isinstance(data, dict) else {}
+
+        info = ensure_bible(db, project.id, style, tone, ask)
+        logger.info("Story bible: %s", info)
+    except Exception as e:  # noqa: BLE001 - never let the bible stop a film
+        logger.warning("Story bible skipped: %s", e)
+        safe_rollback(db)
+
+
 def _save_script(db, pid: str, script_schema) -> None:
     """Replaces the project's characters/scenes/script with a freshly written one (one transaction)."""
     project = db.get(Project, pid)
     # Re-running (Retry / Resume after a failed breakdown) replaces earlier output.
     db.execute(delete(Scene).where(Scene.project_id == pid))
+    db.execute(delete(Location).where(Location.project_id == pid))
     db.execute(delete(Character).where(Character.project_id == pid))
     db.execute(delete(Script).where(Script.project_id == pid))
     db.flush()
@@ -282,6 +306,8 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
         "scene_number": sc.scene_number, "location": sc.location, "visual_description": sc.visual_description,
         "lines": " / ".join(f"{t.get('speaker')}: {t.get('text')}" for t in (sc.dialogue_turns or [])[:4]),
     } for sc in scenes]
+    places = [{"name": l.name, "description": l.description} for l in
+              db.execute(select(Location).where(Location.project_id == pid)).scalars().all()]
     story = (script.story_text if script and script.story_text else None) or project.raw_prompt or ""
     genre = project.requested_genre or (script.genre if script else None)
     tone = project.requested_tone or (script.tone if script else None)
@@ -292,7 +318,7 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
         db, ctl,
         lambda: asyncio.run(llm.continue_story(
             story, cast, recap, direction=direction, scene_count=count, scene_seconds=secs,
-            genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
+            genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle, places=places,
         ))
     )
     ctl.checkpoint()
@@ -328,6 +354,7 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
     project.stage_detail = None
     project.total_scenes = len(scenes) + len(result["scenes"])
     db.commit()
+    _build_bible(db, project)   # new scenes in an existing place reuse that place; new people/places get entries
 
 
 @celery_app.task(bind=True)
@@ -396,7 +423,10 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     scenes = db.execute(select(Scene).where(Scene.project_id == pid).order_by(Scene.scene_number)).scalars().all()
     if not scenes:
         raise RuntimeError("This project has no scenes yet. Press Resume/Retry to write the script first.")
+    _build_bible(db, project)   # fills in anything missing (old projects, scenes whose place was edited)
     characters = db.execute(select(Character).where(Character.project_id == pid)).scalars().all()
+    locations = db.execute(select(Location).where(Location.project_id == pid)).scalars().all()
+    bible = BibleView(locations, characters)
     script = db.execute(select(Script).where(Script.project_id == pid)).scalars().first()
     style = resolve_style(
         project.requested_visual_style, script.visual_style if script else None,
@@ -448,7 +478,8 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
             prev_clip = os.path.join(project_root, f"scene_{scenes[i - 1].scene_number}", "scene_final.mp4")
         sctx = _SceneCtx(db, project, scene, ctl, i, total)
         try:
-            result = renderer.render(scene, characters, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode,
+            scene_chars = bible.prepare(scene)   # the characters as they look in THIS place, and the place's saved description
+            result = renderer.render(scene, scene_chars, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode,
                                      narrator=project.narrator_enabled, scene_seconds=project.scene_seconds, prev_clip=prev_clip,
                                      resolution=project.video_resolution, scene_style=project.scene_style)
         except RunStopped:
@@ -475,6 +506,9 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
         wav = os.path.join(scene_dir, "voices.wav")
         scene.audio_path = wav if os.path.exists(wav) else None   # model-voice mode has no separate voice track
         scene.render_status = "DONE"
+        loc = bible.by_id.get(getattr(scene, "location_id", None))
+        if loc is not None and not loc.reference_image_path and scene.image_path:
+            loc.reference_image_path = scene.image_path   # the first picture of this place, shown in the bible
         project.progress_pct = int(((i + 1) / total) * 92)
         db.commit()
         finals.append(result.final_path)
@@ -488,7 +522,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     master = os.path.join(project_root, "final_master_video.mp4")
     _call(db, ctl, ff.concatenate_videos, finals, master, "aac")
     _set(db, project, progress_pct=97, stage_detail="Uploading the final video")
-    url = _call(db, ctl, publish_file, master, f"projects/{pid}/final_master_video.mp4")
+    url = _call(db, ctl, publish_file_strict, master, f"projects/{pid}/final_master_video.mp4")
 
     warnings = list(dict.fromkeys(tts.warnings))
     project.final_video_path = url

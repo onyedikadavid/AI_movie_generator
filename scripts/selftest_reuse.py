@@ -31,7 +31,6 @@ def main():
                 gender="male", age_group="adult", voice_id=None)]
     cast = VoiceCast(chars, "ng", "", texts=["Nollywood sound engineer"])
     settings.NARRATOR_ENABLED = False
-    settings.SPEECH_COMPLETE_CHECK = False   # this test counts clip requests; its fake clips keep a tone to the very end
     settings.AUDIO_MODE, settings.VIDEO_CAMERA_MOTION = "model", "model"   # reuse must still use text-to-speech
 
     for mode in ("t2v", "i2v"):

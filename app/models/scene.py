@@ -35,6 +35,9 @@ class Scene(Base):
     # True = this scene carries on the previous one (same place, same people): it starts from that scene's last frame.
     continues_previous = Column(Boolean, nullable=True)
 
+    # The scene bible entry (Location) this scene is set in - assigned automatically, editable.
+    location_id = Column(String, ForeignKey("locations.id", ondelete="SET NULL"), nullable=True)
+
     render_status = Column(String, default="PENDING", nullable=False, server_default="PENDING")
 
     project = relationship("Project", back_populates="scenes")
