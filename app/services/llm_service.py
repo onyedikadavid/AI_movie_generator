@@ -5,6 +5,7 @@ import httpx
 from typing import Dict, Any
 from app.core.config import settings
 from app.schemas.script import ScriptDecompositionSchema
+from app.services.text_clean import clean_text
 from app.services.agent_service import AgentService
 from app.services.style_presets import is_kids, script_constraints
 from app.services.dynamic_config import resolve_url, KEY_OLLAMA_URL
@@ -114,7 +115,8 @@ class LLMService:
             logger.warning("Story analysis failed (%s) - writing the scenes straight from the prompt.", e)
             return {}
         keys = ("logline", "main_character", "problem", "turning_point", "ending", "message", "hook", "story")
-        return {k: str(data.get(k)).strip() for k in keys if isinstance(data, dict) and data.get(k)}
+        out = {k: clean_text(data.get(k)) for k in keys if isinstance(data, dict) and data.get(k)}
+        return {k: v for k, v in out.items() if v}
 
     @staticmethod
     def _story_problems(data: dict, scene_count: int = None) -> list:
@@ -269,7 +271,7 @@ class LLMService:
                     "image_prompt": "Detailed standalone text-to-image prompt for the keyframe.",
                     "narration_text": "One or two short narrator sentences (under 25 words), never a character's own words.",
                     "characters_present": ["Name1"],
-                    "motion_prompt": "Cinematic camera direction plus what the people DO.",
+                    "motion_prompt": "Cinematic camera direction plus what the people DO. When people talk, use a side-on two-shot or over-the-shoulder shots (they face each other); never a camera straight in front of a speaker's face.",
                     "sound_design": "Background sounds, 6 to 14 words, no speech, no music.",
                     "duration_seconds": {secs}
                 }}
@@ -297,7 +299,7 @@ class LLMService:
         for sc, orig in zip(completed["scenes"], scenes):
             sc["scene_number"], sc["continues_previous"] = orig["scene_number"], orig["continues_previous"]
         return {
-            "story_addition": str(data.get("story_addition") or "").strip(),
+            "story_addition": clean_text(data.get("story_addition")),
             "new_characters": new_chars,
             "scenes": completed["scenes"],
         }
@@ -410,7 +412,7 @@ class LLMService:
                     "image_prompt": "Detailed standalone text-to-image prompt for the first frame.",
                     "narration_text": "One or two SHORT narrator sentences (under 25 words), never a character's own words.",
                     "characters_present": ["Name1"],
-                    "motion_prompt": "Cinematic camera direction plus what the people DO.",
+                    "motion_prompt": "Cinematic camera direction plus what the people DO. When people talk, use a side-on two-shot or over-the-shoulder shots (they face each other); never a camera straight in front of a speaker's face.",
                     "sound_design": "Background sounds, 6 to 14 words, no speech, no music.",
                     "duration_seconds": {secs}
                 }}
@@ -573,7 +575,7 @@ class LLMService:
                     "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - subject(s), action, setting, time of day, lighting and camera framing (e.g. wide shot / medium shot). Sent directly to the image generator, so it must make sense on its own.",
                     "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here. In scene 1 this is the HOOK line.",
                     "characters_present": ["Name1", "Name2"],
-                    "motion_prompt": "Cinematic camera direction plus what the people DO, for a few seconds, like a real film: e.g. 'slow dolly-in on the boy as he lowers his head, then a handheld pan to the door' or 'tracking shot following her down the corridor'. Vary the camera from scene to scene (push-in, tracking, pan, handheld, low angle).",
+                    "motion_prompt": "Cinematic camera direction plus what the people DO, for a few seconds, like a real film: e.g. 'slow dolly-in on the boy as he lowers his head, then a handheld pan to the door' or 'tracking shot following her down the corridor'. Vary the camera from scene to scene (push-in, tracking, pan, handheld, low angle). When people talk, use a side-on two-shot or over-the-shoulder shots so they face each other - never a camera straight in front of a speaker's face, and never a speaker looking into the lens.",
                     "sound_design": "The background sounds and effects you would HEAR here - 6 to 14 words, no speech, no music. e.g. 'distant gunfire, helicopter overhead, running footsteps' or 'light wind, birds, far-off market chatter'.",
                     "duration_seconds": {secs}
                 }}

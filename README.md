@@ -487,3 +487,71 @@ Action that happens WHILE the words are spoken and matches them.
 
 Limit: this keeps the *description*, seed and outfits identical, which makes places and faces much more consistent, but
 the image/video models can still vary details - it is not a pixel-exact reference image.
+
+## v2.29.2: story text shown as plain text
+
+A model that answered the story with an object (`{"hook": "...the whole story..."}`) used to be saved as a printed Python
+dict, so the review screen showed `{'hook': ...}` with literal `\r\n`. `app/services/text_clean.py` now flattens objects,
+lists and printed dicts into plain paragraphs when the story is written, when it is continued, when it is read back for
+prompts, and when the script is sent to the app - so projects saved before this fix display correctly too.
+
+## v2.29.3: descriptions are never cut mid-thought
+
+`clip_words` (used to fit a place, a look, a setting or a camera note into the video prompt) used to cut at a word count, which
+could leave "...flickering torches cast eerie". It now ends at the last full sentence, else the last clause, that fits.
+The Kaggle notebooks printed only the first 160 characters of each prompt in their log (the prompt sent to the model was
+complete); the new notebooks print the whole prompt.
+
+
+## v2.29.4: finished clips are never thrown away for nothing
+
+Why a scene could be rendered again and again (about 3 GPU hours on one scene in a real log):
+* Any change - even `VIDEO_MAX_CLIP_SECONDS` or a speech setting - wiped the scene folder, including finished clips.
+  Now only a change to the PICTURE (scene look, characters, style, size, where it continues from) starts over. Every other
+  change keeps the finished clips; each clip is reused only if its own request (prompt, length, seed, source) is unchanged.
+* A clip whose last word seemed cut off was deleted and the scene split; a Resume then rendered the same too-big clip
+  again, found out again, split again. The split is now remembered (`split_memory.json` in the scene folder).
+* A clip that took longer than `SPEECH_RETRY_MAX_RENDER_SECONDS` (default 900 s) is kept: no retry, no split. On a T4
+  one clip takes 25-40 min, so a repeat costs more than a slightly clipped last word.
+* The log now prints the plan ("Scene 1 plan: clip 1: ...") and, per clip, "finished earlier - reusing it" or "generating".
+
+Video server (LTX notebook v12): `DELETE /v1/jobs/{id}` drops a queued job (a running one cannot be interrupted);
+a new request from a project drops that project's older queued jobs (they were replaced). The backend stops polling a job
+when a run is paused / stopped and asks the server to drop it. A running job is left to finish, so Resume re-attaches to it.
+
+
+## v2.30.0: "Straight to video" (no writer model / Ollama)
+
+New project field `generation_mode` (form field on `POST /api/v1/projects`):
+
+* `script` (default) - as before: the writer model writes a script you can review, then you generate.
+* `direct` - no writer model at all. Your idea is the video prompt. The project is created, goes straight to the
+  video model (text-to-video, whole-scene style) and starts rendering at once. No script review step, no story bible,
+  no Ollama needed (the image/SDXL notebook is not needed either).
+
+Length: `scene_seconds` is the clip length (the video server's own ceiling still applies); `scene_count` N > 1 makes
+N clips in a row, each carrying on from the last picture of the one before. Describe the people, place, action and
+camera in the idea; nobody speaks unless the video model is asked to (put the words in the idea in quotes).
+"Continue the story" is not available on a direct project (it needs the writer model).
+
+Database: new column `projects.generation_mode` (added automatically at start-up; alembic `a7d41c9e3b52`).
+
+## v2.29.5: the camera follows the conversation (who is talking TO whom)
+
+Problem: speakers faced the lens like news presenters (the camera straight in front of them), so you could not tell who
+they were talking to. Cause: the whole-scene prompt only said "follow whoever is speaking, with natural cuts", the script's
+own camera note was often "slow dolly-in on X's face", and nothing told the model where the listener was or where to look.
+
+Now (`CONVERSATION_COVERAGE=true`, default):
+* **Two or more people**: the prompt places them face to face, seen from the side in profile / three-quarter view, and
+  directs the camera as a side-on two-shot, then over-the-shoulder shots (over B's shoulder onto A while A speaks, reversing
+  when B answers). Each line says who it is said TO (a name inside the line, else the person who spoke before or after,
+  else the only other person) and "eyes on" them. Nobody looks into the lens.
+* **A lone speaker** (a crowd, someone off-frame): three-quarter view from beside the listeners, eyes off the lens.
+* The face-on parts of the script's own camera note ("dolly-in on her face", "close-up") are dropped; the rest is kept.
+* Keyframes and close-ups are drawn side-on / three-quarter with eyes turned away from the lens, and "looking at the camera"
+  is added to the image negative prompt.
+* A deliberate direct address ("to the camera", a vlog, a news report) keeps the old frontal wording.
+* The script writer is told to plan conversations as side-on / over-the-shoulder coverage.
+`CONVERSATION_COVERAGE=false` restores the old wording. This changes prompts and keyframes, so scenes already rendered are
+made again once (their pictures are different). It guides the video model; it cannot force it.

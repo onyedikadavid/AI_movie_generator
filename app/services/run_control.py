@@ -40,6 +40,7 @@ from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.services import abandon
 from app.core.db_safety import safe_rollback
 from app.core.sync_db import SessionLocal
 from app.models.lease import PipelineLease
@@ -212,8 +213,10 @@ class RunControl:
         """
         self.checkpoint()
         box: "queue.Queue[tuple]" = queue.Queue(maxsize=1)
+        walked_away = threading.Event()      # set when this call is abandoned: a polling loop below stops itself
 
         def runner() -> None:
+            abandon.bind(walked_away, self.project_id)
             try:
                 box.put(("ok", fn(*args, **kwargs)))
             except BaseException as e:  # noqa: BLE001 - delivered to the caller
@@ -227,6 +230,7 @@ class RunControl:
                 break
             except queue.Empty:
                 if self._stop.is_set():
+                    walked_away.set()
                     raise RunStopped(self.stop_reason or "pause")
         if kind == "err":
             raise value
@@ -463,6 +467,9 @@ def start_continuation(db: Session, project_id: str, prompt: Optional[str], scen
         raise ActionError(409, "Wait for the project to finish (or pause it) before continuing the story.")
     if p.status not in _START_FROM:
         raise ActionError(409, f"The story can't be continued yet (status: {p.status.value}).")
+    if (p.generation_mode or "script") == "direct":
+        raise ActionError(409, "This project went straight to video (no script), so there is no story to continue. "
+                               "Start a new project with 'Write a script' to use this.")
     has_scenes = db.execute(select(Scene.id).limit(1).where(Scene.project_id == p.id)).first() is not None
     if not has_scenes:
         raise ActionError(409, "This project has no scenes yet - write the script first.")

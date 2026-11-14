@@ -31,6 +31,7 @@ import os
 import zlib
 import re
 import shutil
+import time
 import dataclasses
 from collections import deque
 from dataclasses import dataclass
@@ -101,7 +102,7 @@ class SceneRenderer:
         reuse = style_mode == "reuse"
         blob = json.dumps(
             {
-                "v": 9,
+                "v": 10,
                 "img": scene.image_prompt,
                 "motion": scene.motion_prompt,
                 "vis": scene.visual_description,
@@ -136,21 +137,74 @@ class SceneRenderer:
         )
         return hashlib.sha1(blob.encode()).hexdigest()
 
-    def _prepare_dir(self, scene_dir: str, fingerprint: str) -> bool:
-        """Returns True if previously rendered files in the folder may be reused."""
+    def _picture_fingerprint(self, scene, characters: Sequence, style: str, video_mode: str, prev_sig: str = "",
+                             resolution=None) -> str:
+        """Only what decides the PICTURE (keyframes, look, size, where the scene continues from). A finished clip is
+        kept when this is unchanged - every other change (speech settings, clip ceiling, scene seconds, interpolation,
+        sharpening...) is already part of each clip's own key, so a clip is reused exactly when it would come out the
+        same, instead of the whole scene folder being wiped."""
+        blob = json.dumps(
+            {
+                "v": 2,
+                "img": scene.image_prompt, "vis": scene.visual_description, "loc": scene.location,
+                "place": [getattr(scene, "place_key", ""), getattr(scene, "place_text", "")],
+                "chars": [(c.name, c.appearance_prompt, c.description) for c in characters],
+                "style": style, "mode": video_mode, "continues": prev_sig,
+                "size": [settings.IMAGE_WIDTH, settings.IMAGE_HEIGHT, settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT],
+                "t2vres": resolution or settings.VIDEO_T2V_RESOLUTION,
+                "driven": settings.VIDEO_AUDIO_DRIVEN,
+            },
+            sort_keys=True, default=str,
+        )
+        return hashlib.sha1(blob.encode()).hexdigest()
+
+    # Files that outlive a settings change (finished GPU work). Everything else in the folder is cheap to rebuild.
+    _KEEP = re.compile(r"^(whole_\d+_raw\.mp4(\.key)?|shot_\d+_raw\.mp4(\.key)?|split_memory\.json|keyframe\.png|"
+                       r"start_frame\.png|closeup_.+\.png|picture\.txt|fingerprint\.txt)$")
+
+    def _prepare_dir(self, scene_dir: str, fingerprint: str, picture_fp: str = "") -> bool:
+        """Returns True if previously rendered files in the folder may be reused.
+
+        Full match: reuse everything. Same PICTURE but other settings changed: keep the finished clips / keyframes
+        (their own keys decide whether each one still fits) and drop only the cheap files. Different picture: start
+        over. (Before, ANY change wiped the folder - including hours of finished GPU clips.)"""
         marker = os.path.join(scene_dir, "fingerprint.txt")
-        reusable = False
+        pmarker = os.path.join(scene_dir, "picture.txt")
+        full = same_picture = False
         if os.path.isdir(scene_dir) and os.path.exists(marker):
             try:
-                reusable = open(marker).read().strip() == fingerprint
+                full = open(marker).read().strip() == fingerprint
+                if os.path.exists(pmarker):
+                    same_picture = bool(picture_fp) and open(pmarker).read().strip() == picture_fp
+                elif full:
+                    same_picture = True            # a folder from an older version: it matches as a whole
             except OSError:
-                reusable = False
-        if not reusable and os.path.isdir(scene_dir):
-            shutil.rmtree(scene_dir, ignore_errors=True)
+                full = same_picture = False
+        if not full and os.path.isdir(scene_dir):
+            if same_picture:
+                kept = 0
+                for name in os.listdir(scene_dir):
+                    path = os.path.join(scene_dir, name)
+                    if self._KEEP.match(name):
+                        kept += name.endswith("_raw.mp4")
+                        continue
+                    try:
+                        shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+                    except OSError:
+                        pass
+                if kept:
+                    logger.info("Settings changed, but not the picture: kept %d finished clip(s) in %s "
+                                "(each is reused only if its own request is unchanged).", kept, os.path.basename(scene_dir))
+            else:
+                shutil.rmtree(scene_dir, ignore_errors=True)
+                same_picture = False
         os.makedirs(scene_dir, exist_ok=True)
         with open(marker, "w") as f:
             f.write(fingerprint)
-        return reusable
+        if picture_fp:
+            with open(pmarker, "w") as f:
+                f.write(picture_fp)
+        return full or same_picture
 
     def _segments(self, scene, cast: VoiceCast, model_audio: bool = False, narrator: bool = False, whole: Optional[bool] = None) -> List[Segment]:
         # Each line is first split into ACTION (performed on screen) and WORDS (the only thing ever spoken).
@@ -289,6 +343,40 @@ class SceneRenderer:
             parts.append(cur)
         return parts
 
+    # ---- remembered splits: what one resume learns, the next resume starts from -------------------------------
+    @staticmethod
+    def _part_sig(part: Sequence[Segment], cap: float) -> str:
+        """Identity of 'these exact lines in one clip of this ceiling'."""
+        raw = "|".join(f"{sg.kind}:{sg.speaker}:{sg.text}" for sg in part) + f"|{cap:.1f}"
+        return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _memory_path(scene_dir: str) -> str:
+        return os.path.join(scene_dir, "split_memory.json")
+
+    def _load_memory(self, scene_dir: str) -> set:
+        try:
+            return set(json.load(open(self._memory_path(scene_dir))).get("did_not_fit", []))
+        except (OSError, ValueError, AttributeError):
+            return set()
+
+    def _remember_split(self, scene_dir: str, memory: set, sig: str) -> None:
+        memory.add(sig)
+        try:
+            with open(self._memory_path(scene_dir), "w") as fh:
+                json.dump({"did_not_fit": sorted(memory)}, fh)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _describe(part: Sequence[Segment]) -> str:
+        bits = []
+        for sg in part:
+            words = sg.text.split()
+            head = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
+            bits.append(f"{sg.speaker}: \"{head}\"")
+        return "; ".join(bits) or "(no speech)"
+
     def _split_part(self, part: List[Segment], queue: "deque") -> bool:
         """A clip whose last line is still cut off after the retries: give the last line its own, shorter clip
         (several lines), or cut a single long line into two complete pieces. True if the queue was changed."""
@@ -343,6 +431,9 @@ class SceneRenderer:
         if len(parts) > 1:
             logger.info("Scene %s: the dialogue needs %d clips of up to %.1f s (nothing is shortened).",
                         scene.scene_number, len(parts), cap)
+        memory = self._load_memory(scene_dir) if may_reuse else set()
+        logger.info("Scene %s plan (clip ceiling %.1f s): %s", scene.scene_number, cap,
+                    " | ".join(f"clip {i + 1}: {self._describe(pt)}" for i, pt in enumerate(parts)))
         t2v = mode == "t2v"
         wide_path = os.path.join(scene_dir, "keyframe.png")
         ctx.stage(STAGE_AUDIO, 0.05, "Preparing the scene")
@@ -377,6 +468,13 @@ class SceneRenderer:
         while queue:
             part = queue.popleft()
             ctx.checkpoint()
+            if part and self._part_sig(part, cap) in memory:
+                # An earlier run already found that these lines do not fit in one clip (after hours of GPU time).
+                # Start from what it learned instead of rendering the same clip, finding out, and splitting again.
+                if self._split_part(part, queue):
+                    logger.info("Scene %s: splitting \"%s\" straight away (it did not fit in one clip last time).",
+                                scene.scene_number, self._describe(part))
+                    continue
             planned = max(planned, n + 1 + len(queue))
             ctx.stage(STAGE_VIDEOS, 0.35 + 0.55 * n / planned, f"Generating the scene ({n + 1}/{planned})")
             beats = []
@@ -388,6 +486,9 @@ class SceneRenderer:
                 })
             talk = self._talk_seconds(part)
             request_len = self._request_len(talk, cap)
+            if not part and getattr(scene, "duration_seconds", None):
+                # Nobody speaks in this clip (e.g. a "straight to video" idea): ask for the length that was chosen.
+                request_len = min(max(float(scene.duration_seconds), 3.0), cap)
             # A later piece of the scene carries on from the last picture of the piece before it.
             part_source = source
             if n > 0 and fitted:
@@ -415,8 +516,15 @@ class SceneRenderer:
 
             if may_reuse and _nonempty(raw) and stored == key:
                 reused += 1
+                logger.info("Scene %s clip %d: finished earlier - reusing it (%s).", scene.scene_number, n + 1,
+                            self._describe(part))
             else:
+                logger.info("Scene %s clip %d: generating (%.1f s, %s).", scene.scene_number, n + 1, request_len,
+                            self._describe(part))
+                t0 = time.time()
                 render(request_len)
+                took = time.time() - t0
+                slow = bool(settings.SPEECH_RETRY_MAX_RENDER_SECONDS) and took > float(settings.SPEECH_RETRY_MAX_RENDER_SECONDS)
                 got = self.ff.get_duration(raw)
                 if got < 0.8 * request_len:
                     if settings.WHOLE_SCENE_FALLBACK:
@@ -429,8 +537,14 @@ class SceneRenderer:
                 # Was the last line finished? If not: generate again, longer; then give it a clip of its own; then
                 # (last resort) say it with the pipeline's own voice. A line is never left cut off.
                 if settings.SPEECH_COMPLETE_CHECK and any(sg.text for sg in part):
-                    complete = self._finish_the_line(ctx, raw, request_len, render, n, "Scene part")
-                    if not complete:
+                    complete = self._finish_the_line(ctx, raw, request_len, render, n, "Scene part", allow_regen=not slow)
+                    if not complete and slow:
+                        logger.warning("Scene %s clip %d: its last word may be clipped, but the clip took %d min to render, "
+                                       "so it is kept (SPEECH_RETRY_MAX_RENDER_SECONDS=%d) instead of being rendered again.",
+                                       scene.scene_number, n + 1, int(took // 60), int(settings.SPEECH_RETRY_MAX_RENDER_SECONDS))
+                    if not complete and not slow:
+                        self._remember_split(scene_dir, memory, self._part_sig(part, cap))
+                    if not complete and not slow:
                         if self._split_part(part, queue):
                             logger.warning("Scene %s: the last line did not fit, so the scene is split into more clips "
                                            "(nothing is cut).", scene.scene_number)
@@ -438,8 +552,8 @@ class SceneRenderer:
                                 if os.path.exists(f):
                                     os.remove(f)
                             continue
-                        if settings.SPEECH_FALLBACK_TTS and len(part) == 1:
-                            self._dub_with_tts(ctx, raw, part[0], cast)
+                    if not complete and settings.SPEECH_FALLBACK_TTS and len(part) == 1:
+                        self._dub_with_tts(ctx, raw, part[0], cast)
                 with open(key_file, "w") as fh:
                     fh.write(key)
             if n == 0 and t2v and not continuing and not _nonempty(wide_path):
@@ -495,7 +609,7 @@ class SceneRenderer:
         prev_clip = prev_clip if (getattr(scene, "continues_previous", False) and prev_clip and os.path.exists(prev_clip)) else None
         prev_sig = f"{os.path.getsize(prev_clip)}:{int(os.path.getmtime(prev_clip))}" if prev_clip else ""
         fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds, prev_sig, resolution, style_mode)
-        may_reuse = self._prepare_dir(scene_dir, fp)
+        may_reuse = self._prepare_dir(scene_dir, fp, self._picture_fingerprint(scene, characters, style, mode, prev_sig, resolution))
         final_path = os.path.join(scene_dir, "scene_final.mp4")
         if may_reuse and _nonempty(final_path):
             wide = os.path.join(scene_dir, "keyframe.png")
@@ -698,9 +812,13 @@ class SceneRenderer:
                     else:
                         ctx.call(self.video.generate_clip, _src, _raw, _prompt, length, seed_now, resolution=resolution)
 
+                t0 = time.time()
                 render(request_len)
+                slow = bool(settings.SPEECH_RETRY_MAX_RENDER_SECONDS) and \
+                    (time.time() - t0) > float(settings.SPEECH_RETRY_MAX_RENDER_SECONDS)
                 if model_audio and speech and settings.SPEECH_COMPLETE_CHECK:
-                    if not self._finish_the_line(ctx, raw, request_len, render, sh.index) and settings.SPEECH_FALLBACK_TTS:
+                    if not self._finish_the_line(ctx, raw, request_len, render, sh.index, allow_regen=not slow) \
+                            and settings.SPEECH_FALLBACK_TTS:
                         self._dub_with_tts(ctx, raw, sh, cast)
                 with open(key_file, "w") as fh:
                     fh.write(clip_key)
@@ -834,13 +952,14 @@ class SceneRenderer:
         return SceneResult(final_path, wide_path, total, len(shots), reused)
 
     # ------------------------------------------------------------------ cut-off lines
-    def _finish_the_line(self, ctx, raw: str, length: float, render, shot_index: int, label: str = "Shot") -> bool:
+    def _finish_the_line(self, ctx, raw: str, length: float, render, shot_index: int, label: str = "Shot",
+                         allow_regen: bool = True) -> bool:
         """Model-voice mode: a clip whose voice is still going at its very last instant had its line cut off. Render it
         again, longer (and with a fresh seed), up to settings.SPEECH_MAX_RETRIES times. Stops early if the server
         cannot make a longer clip. A line that still seems cut off after that is logged, never silently dropped."""
         extra = max(0.5, float(settings.SPEECH_RETRY_EXTRA_SECONDS))
         margin = float(settings.SPEECH_TAIL_MARGIN_DB)
-        for attempt in range(1, max(0, int(settings.SPEECH_MAX_RETRIES)) + 1):
+        for attempt in range(1, (max(0, int(settings.SPEECH_MAX_RETRIES)) if allow_regen else 0) + 1):
             ctx.checkpoint()
             active, overall, tail = self.ff.tail_speech_active(raw, margin_db=margin)
             if not active:

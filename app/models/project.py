@@ -64,6 +64,9 @@ class Project(Base):
     # How a scene is made: "whole" (one clip, the model speaks), "shots" (a clip per shot), "reuse" (one clip cut into
     # all shots, voices added on top). NULL = the SCENE_MODE setting.
     scene_style = Column(String, nullable=True)
+    # "script" (the writer model writes a script you can review first) or "direct" (no writer model: the idea goes
+    # straight to the video model). NULL = "script".
+    generation_mode = Column(String, nullable=True)
     # A pending 'continue the story' request (read by the worker, then cleared).
     continue_prompt = Column(Text, nullable=True)
     continue_scenes = Column(Integer, nullable=True)

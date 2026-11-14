@@ -27,6 +27,7 @@ class Client:
     def __exit__(self,*a): return False
     def post(self,url,data=None,files=None): return SERVER.post(url,data or {},files)
     def get(self,url): return SERVER.get(url)
+    def delete(self,url): return SERVER.delete(url)
 
 h=types.ModuleType("httpx")
 for n,o in dict(ReadError=ReadError,ConnectError=ConnectError,RemoteProtocolError=RemoteProtocolError,WriteError=WriteError,
@@ -50,7 +51,11 @@ class FakeServer:
             self._accept(data); raise ReadError("connection dropped after the server accepted the job")
         jid,dup=self._accept(data)
         return Response(202,{"job_id":jid,"status":"queued","duplicate":dup})
+    def delete(self,url):
+        self.deleted=getattr(self,"deleted",[])+[url.rsplit("/",1)[-1]]
+        return Response(200,{"status":"cancelled","action":"dropped"})
     def _accept(self,data):
+        self.last_group=data.get("group")
         key=data["job_key"]
         if key in self.keys: return self.keys[key],True
         self.created+=1; jid=f"job{self.created}"; self.keys[key]=jid; self.jobs[jid]={"polls":0}; return jid,False
@@ -63,6 +68,7 @@ class FakeServer:
         if url.endswith("/result"): return Response(200,raw=b"VIDEO"*2000,ctype="video/mp4")
         job["polls"]+=1
         if self.kw.get("blips") and job["polls"] in (2,3): raise ReadError("blip while polling")
+        if self.kw.get("cancelled"): return Response(200,{"status":"cancelled"})
         if self.kw.get("fail"): return Response(200,{"status":"error","error":"RuntimeError: CUDA out of memory","trace":"File x\nline y"})
         if job["polls"]<5: return Response(200,{"status":"running","queue_position":None})
         return Response(200,{"status":"done"})
@@ -100,4 +106,31 @@ k=lambda d,img=None: svc._job_key(d,img)
 d={"motion_prompt":"p","duration":"3.5","seed":"1"}
 assert k(d)==k(dict(d)) and k(d)!=k({**d,"seed":"2"}) and k(d,b"imgA")!=k(d,b"imgB") and k(d,b"imgA")==k(d,b"imgA")
 print("OK 6: job keys are stable for identical requests and differ when anything changes")
+
+# 7. the server dropped the job (a newer request replaced it)
+try: run(cancelled=True); raise SystemExit("should have failed")
+except RuntimeError as e: assert "dropped" in str(e); print("OK 7: a job the server dropped is reported, not waited on forever")
+
+# 8. an abandoned call (run paused/stopped) stops polling and asks the server to drop the job; the project id is sent
+import threading
+from app.services import abandon
+def worker(box):
+    ev=threading.Event(); abandon.bind(ev,"proj-123")
+    global SERVER
+    SERVER=FakeServer(never_done=True)
+    orig=SERVER.get
+    def get(url):
+        r=orig(url)
+        if SERVER.get_calls==3: ev.set()          # the run walks away after a few polls
+        return Response(200,{"status":"running"})
+    SERVER.get=get
+    try: svc.generate_text_clip("a prompt", tempfile.mktemp(suffix=".mp4"), 3.5, 42); box.append("finished")
+    except RuntimeError as e: box.append(str(e))
+box=[]; t=threading.Thread(target=worker,args=(box,)); t.start(); t.join(10)
+assert not t.is_alive(), "the abandoned thread must stop polling"
+assert "Stopped waiting" in box[0], box
+assert SERVER.last_group=="proj-123", "the project id must reach the server"
+assert getattr(SERVER,"deleted",None)==["job1"], getattr(SERVER,"deleted",None)
+assert SERVER.get_calls<=5, SERVER.get_calls
+print("OK 8: abandoned run -> polling stops after", SERVER.get_calls, "polls, server told to drop the job, project id sent")
 print("ALL VIDEO CLIENT CHECKS PASSED")

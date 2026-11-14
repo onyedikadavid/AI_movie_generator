@@ -22,6 +22,7 @@ from app.models.character import Character
 from app.models.scene import Scene
 from app.models.location import Location
 from app.services.bible import BibleView, ensure_bible
+from app.services.text_clean import clean_text
 from app.schemas.script import ScriptDecompositionSchema
 
 from app.services import run_control as rc
@@ -161,6 +162,9 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
         _set(db, project, raw_prompt=text)
 
     ctl.checkpoint()
+    if (project.generation_mode or "script") == "direct":
+        _direct_body(db, project, ctl)
+        return
     _set(db, project, status=ProjectStatus.GENERATING_SCRIPT, stage_detail="Writing the script")
 
     llm = LLMService()
@@ -217,6 +221,51 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
             ctl.checkpoint()
 
 
+def _direct_scenes(idea: str, count: int, seconds: int) -> list:
+    """'Straight to video': no writer model. The idea is the video prompt itself. One scene per requested count; each
+    later scene carries on from the last picture of the one before it, with the same idea."""
+    idea = clean_text(idea) or idea.strip()
+    scenes = []
+    for n in range(1, max(1, count) + 1):
+        text = idea if n == 1 else f"{idea} (the same shot carries on without a cut)"
+        scenes.append({"scene_number": n, "text": text, "seconds": seconds, "continues": n > 1})
+    return scenes
+
+
+def _direct_body(db, project: Project, ctl: RunControl) -> None:
+    """No script, no writer model (Ollama): the idea goes straight to the video model and rendering starts at once."""
+    pid = project.id
+    idea = (project.raw_prompt or "").strip()
+    if not idea:
+        raise RuntimeError("Write your idea first - there is nothing to turn into a video.")
+    _set(db, project, status=ProjectStatus.GENERATING_SCRIPT, stage_detail="Preparing the video (no script)")
+    seconds = int(project.scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)
+    plan = _direct_scenes(idea, project.scene_count or 1, seconds)
+
+    db.execute(delete(Scene).where(Scene.project_id == pid))
+    db.execute(delete(Location).where(Location.project_id == pid))
+    db.execute(delete(Character).where(Character.project_id == pid))
+    db.execute(delete(Script).where(Script.project_id == pid))
+    db.flush()
+    project.title = clean_text(" ".join(idea.split()[:7])).strip(" .,;:!?-") or "My video"
+    # No pictures are drawn first (no image model needed): the video model works from the text alone, as one clip.
+    project.video_mode = "t2v"
+    project.scene_style = "whole"
+    db.add(Script(project_id=pid, genre=project.requested_genre, tone=project.requested_tone,
+                  visual_style=project.requested_visual_style, full_text=idea))
+    for sc in plan:
+        db.add(Scene(
+            project_id=pid, scene_number=sc["scene_number"], duration_seconds=sc["seconds"], location=None,
+            visual_description=sc["text"], image_prompt=sc["text"], narration_text=None, motion_prompt=None,
+            dialogue_turns=None, characters_present=None, continues_previous=sc["continues"], render_status="PENDING",
+        ))
+    project.total_scenes = len(plan)
+    project.progress_pct = 0
+    db.commit()
+    ctl.checkpoint()
+    _asset_body(db, project, ctl)
+
+
 def _build_bible(db, project: Project) -> None:
     """Story bible: one entry per place and per character, so they look the same every time they come back.
     Only missing entries are written; existing (or user-edited) ones are kept. Never raises."""
@@ -251,7 +300,7 @@ def _save_script(db, pid: str, script_schema) -> None:
     db.add(Script(
         project_id=pid, genre=script_schema.genre, tone=script_schema.tone,
         visual_style=script_schema.visual_style, full_text=project.raw_prompt,
-        story_text=script_schema.story, story_hook=script_schema.hook, story_outline=script_schema.story_outline,
+        story_text=clean_text(script_schema.story) or None, story_hook=clean_text(script_schema.hook) or None, story_outline=script_schema.story_outline,
     ))
 
     for ch in script_schema.characters:
@@ -308,7 +357,7 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
     } for sc in scenes]
     places = [{"name": l.name, "description": l.description} for l in
               db.execute(select(Location).where(Location.project_id == pid)).scalars().all()]
-    story = (script.story_text if script and script.story_text else None) or project.raw_prompt or ""
+    story = clean_text(script.story_text if script and script.story_text else None) or project.raw_prompt or ""
     genre = project.requested_genre or (script.genre if script else None)
     tone = project.requested_tone or (script.tone if script else None)
     vstyle = project.requested_visual_style or (script.visual_style if script else None)
@@ -423,7 +472,8 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     scenes = db.execute(select(Scene).where(Scene.project_id == pid).order_by(Scene.scene_number)).scalars().all()
     if not scenes:
         raise RuntimeError("This project has no scenes yet. Press Resume/Retry to write the script first.")
-    _build_bible(db, project)   # fills in anything missing (old projects, scenes whose place was edited)
+    if (project.generation_mode or "script") != "direct":
+        _build_bible(db, project)   # fills in anything missing (old projects, scenes whose place was edited)
     characters = db.execute(select(Character).where(Character.project_id == pid)).scalars().all()
     locations = db.execute(select(Location).where(Location.project_id == pid)).scalars().all()
     bible = BibleView(locations, characters)

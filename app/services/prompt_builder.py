@@ -23,9 +23,29 @@ _ANIMATED = re.compile(
 )
 
 
+_DANGLING = {"a", "an", "the", "and", "or", "of", "with", "in", "on", "at", "to", "from", "by", "for", "as", "but", "that",
+             "who", "whose", "while", "its", "his", "her", "their", "into", "onto", "over", "under", "than", "like", "is", "are"}
+
+
 def clip_words(text: Optional[str], n: int) -> str:
+    """At most `n` words, but never cut in the middle of a thought: if the text is longer it ends at the last full
+    sentence, else the last clause, that fits (when that keeps at least half the room), else at a word that can end a phrase
+    - so a place or look description is never left as '...flickering torches cast eerie'."""
     words = (text or "").replace("\n", " ").split()
-    return " ".join(words[:n])
+    if len(words) <= n:
+        return " ".join(words)
+    cut = " ".join(words[:n])
+    floor = max(3, n // 2)
+    end = max(cut.rfind(m) for m in ".!?")
+    if end >= 0 and len(cut[:end].split()) >= floor:
+        return cut[:end + 1]
+    end = max(cut.rfind(m) for m in ",;:")
+    if end >= 0 and len(cut[:end].split()) >= floor:
+        return cut[:end].rstrip(" ,;:-")
+    kept = cut.split()
+    while len(kept) > 1 and kept[-1].lower().strip(",;:.") in _DANGLING:
+        kept.pop()
+    return " ".join(kept).rstrip(" ,;:-")
 
 
 def style_kind(style: Optional[str]) -> str:
@@ -69,6 +89,10 @@ def image_style_suffix(style: Optional[str]) -> str:
 
 
 def image_negative(style: Optional[str]) -> str:
+    return _image_negative(style) + (", looking at the camera, staring at the viewer, eye contact with the camera" if coverage_on() else "")
+
+
+def _image_negative(style: Optional[str]) -> str:
     kind = style_kind(style)
     base = (
         "blurry, out of focus, low quality, jpeg artifacts, distorted face, asymmetrical face, "
@@ -98,6 +122,10 @@ def keyframe_prompt(image_prompt: str, characters: Sequence, style: Optional[str
             looks.append(f"{c.name}: {appearance}")
     if looks:
         parts.append("featuring " + "; ".join(looks))
+    if coverage_on() and len(list(characters)) >= 2 and "profile" not in lowered:
+        parts.append("the characters face each other in profile or three-quarter view, seen from the side, nobody looking at the camera")
+    elif coverage_on() and len(list(characters)) == 1 and "looking at the camera" not in lowered:
+        parts.append("three-quarter view, eyes turned away from the camera")
     if place_desc:  # the story bible's saved description of this place: identical in every scene set there
         parts.append("set in " + clip_words(place_desc, 40))
     if style and style.lower()[:20] not in lowered:
@@ -118,7 +146,10 @@ def closeup_prompt(character, expression: str, location: Optional[str], style: O
     parts = [f"{framing} of {name}, {look}"]
     if mood and mood.lower() not in ("neutral", "dynamic expression"):
         parts.append(f"{mood} expression")
-    parts.append("natural relaxed pose, mouth relaxed" if free_camera else "looking slightly off-camera, mouth relaxed")
+    if free_camera and coverage_on():
+        parts.append("three-quarter view, eyes on the person they are talking to just off-frame, not looking at the camera, mouth relaxed")
+    else:
+        parts.append("natural relaxed pose, mouth relaxed" if free_camera else "looking slightly off-camera, mouth relaxed")
     if location:
         parts.append(f"in {clip_words(location, 30)}")
     if style:
@@ -666,6 +697,97 @@ def text_video_prompt(
 
 
 
+# ---------------------------------------------------------------------------
+# Camera coverage and eye-lines (who is talking TO whom decides where the camera is)
+#
+# Why: a prompt that only says "follow whoever is speaking, with natural cuts" (and a script camera note such as "slow
+# dolly-in on X's face") makes the video model park the camera straight in front of the speaker, who then talks INTO
+# the lens like a news presenter. In a film, two people talking are seen from the side: a side-on two-shot, then
+# over-the-shoulder shots, each looking at the other. The camera is only in front of someone for a deliberate direct
+# address. CONVERSATION_COVERAGE=false restores the old wording.
+# ---------------------------------------------------------------------------
+_FRONTAL = re.compile(
+    r"\b(faces?|close-?ups?|extreme close|head-?on|straight[- ]on|facing the camera|into the camera|to the camera)\b", re.I)
+_DIRECT_ADDRESS = re.compile(
+    r"\b(?:to|into|at|toward|towards)\s+the\s+(?:camera|lens)\b|\bdirect(?:ly)? address\b|\bbreaks? the fourth wall\b|"
+    r"\bvlog\b|\bnews (?:anchor|presenter|report)\b|\binterview(?:ed)? to camera\b", re.I)
+_NAME_NOISE = {"mister", "grand", "chancellor", "lord", "lady", "doctor", "captain", "master", "queen", "king", "prince", "princess"}
+
+
+def coverage_on() -> bool:
+    return bool(getattr(settings, "CONVERSATION_COVERAGE", True))
+
+
+def _name_tokens(name: str) -> list:
+    return [t for t in re.findall(r"[A-Za-z']{4,}", name or "") if t.lower() not in _NAME_NOISE]
+
+
+def addressee(speaker: str, speech: str, on_screen: Sequence, beats: Sequence[dict] = (), index: int = -1) -> str:
+    """Who this line is said TO: a name inside the line, else the person who spoke just before (a reply) or just after,
+    else the only other person on screen. '' when nobody else is there (they speak to someone just off-frame)."""
+    me = (speaker or "").strip().lower()
+    names = [getattr(c, "name", "") for c in on_screen if getattr(c, "name", "").strip().lower() != me]
+    low = (speech or "").lower()
+    for n in names:
+        if n.lower() in low or any(t.lower() in low for t in _name_tokens(n)):
+            return n
+    order = []
+    if 0 <= index < len(beats):
+        order = list(range(index - 1, -1, -1)) + list(range(index + 1, len(beats)))
+    for j in order:
+        b = beats[j]
+        other = (b.get("speaker") or "").strip()
+        if b.get("kind") != "narration" and other and other.lower() != me and other in names:
+            return other
+    return names[0] if len(names) == 1 else ""
+
+
+def strip_frontal_motion(motion: str) -> str:
+    """The script's camera note without the parts that put the camera straight in front of a face."""
+    parts = re.split(r"\s*(?:[,;]|\bthen\b|\band then\b)\s*", motion or "")
+    keep = [p.strip() for p in parts if p.strip() and not _FRONTAL.search(p)]
+    return ", then ".join(keep)
+
+
+def conversation_coverage(beats: Sequence[dict], on_screen: Sequence, scene_text: str = "") -> Optional[dict]:
+    """Blocking + camera for a scene where people talk. None = leave the prompt as it was (direct address, narration only,
+    or the feature is off)."""
+    if not coverage_on():
+        return None
+    talkers = []
+    for b in beats:
+        who = (b.get("speaker") or "").strip()
+        if b.get("kind") != "narration" and b.get("speech") and who and who not in talkers:
+            talkers.append(who)
+    if not talkers:
+        return None
+    blob = " ".join(f"{b.get('action') or ''} {b.get('speech') or ''}" for b in beats) + " " + (scene_text or "")
+    if _DIRECT_ADDRESS.search(blob):
+        return None
+    cast = [getattr(c, "name", "") for c in on_screen if getattr(c, "name", "")]
+    people = list(dict.fromkeys([t for t in talkers if t in cast or len(cast) < 2] + cast))[:3]
+    if len(people) >= 2:
+        a, b2 = people[0], people[1]
+        pair = f"{a} and {b2}" + (f" and {people[2]}" if len(people) > 2 else "")
+        blocking = (f"{pair} stand face to face a short distance apart and are seen from the side, in profile or three-quarter "
+                    "view; each looks at the person they are talking to and nobody ever looks into the camera lens")
+        camera = (f"Camera: it starts side-on with a two-shot of {pair} face to face in the place, then uses over-the-shoulder "
+                  f"shots that follow the conversation - over {b2}'s shoulder onto {a} while {a} speaks, reversing over {a}'s "
+                  f"shoulder onto {b2} when {b2} answers; the camera is never straight in front of a speaker")
+    else:
+        x = people[0] if people else talkers[0]
+        blocking = (f"{x} is seen in three-quarter view from the side, speaking to the people just off-frame, eyes on them "
+                    "and never into the camera lens")
+        camera = (f"Camera: a side-angle medium shot of {x} taken from beside the listeners, steady with a very slight "
+                  "drift; the camera is never straight in front of the speaker")
+    return {"people": people, "blocking": blocking, "camera": camera}
+
+
+def eyeline_phrase(speaker: str, speech: str, on_screen: Sequence, beats: Sequence[dict], index: int) -> str:
+    to = addressee(speaker, speech, on_screen, beats, index)
+    return f"turned toward {to}, eyes on {to}" if to else "eyes on the listener just off-frame, not on the camera"
+
+
 def whole_scene_prompt(
     beats: Sequence[dict],
     on_screen: Sequence,
@@ -681,7 +803,8 @@ def whole_scene_prompt(
     LTX-2.x follows a flowing, chronological description: the place and cast first, then what happens in order,
     with each spoken line in quotes next to who says it. Action is written as action, speech only in quotes."""
     place = clip_words(location, 30)
-    setting = clip_words(visual_description, 40)
+    # A scene with nobody speaking has room for a longer description (a "straight to video" idea is the whole prompt).
+    setting = clip_words(visual_description, 40 if beats else 90)
     motion = clip_words(scene_motion, 26)
     cast_bits = []
     for c in list(on_screen)[:4]:
@@ -692,6 +815,7 @@ def whole_scene_prompt(
     order = ["First", "Then", "Next", "After that", "Finally"]
     spoken = 0
     scene_ctx = f"{place.split(':')[0]} {setting} {motion}"
+    cov = conversation_coverage(beats, on_screen, f"{setting} {motion}")
     for i, b in enumerate(beats):
         word = order[min(i, len(order) - 1)] if len(beats) > 1 else ""
         speech = b.get("speech") or ""
@@ -705,6 +829,8 @@ def whole_scene_prompt(
             line = situation_clause(sit, who, helper) if (sit and is_generic_action(raw_act)) else perform(who, raw_act)
             if sit and not is_generic_action(raw_act):
                 line = perform(who, raw_act)
+            if speech and cov:
+                line += ", " + eyeline_phrase(who, speech, on_screen, beats, i)
             if speech:
                 line += ", and " + speech_clause(who, speech, b.get("voice_desc", ""), b.get("expression", ""), action=raw_act, scene=scene_ctx)
         if speech:
@@ -724,6 +850,8 @@ def whole_scene_prompt(
     if scene_sit == "stuck":
         bits.append("The character who is stuck stays trapped in the same spot for the whole scene and never walks or runs; "
                     "the others stay close and react")
+    if cov and not walking and scene_sit != "stuck":
+        bits.append(cov["blocking"])
     bits += steps
     if walking:
         camera = ("Camera: smooth tracking shots that move with the walking characters, alternating between a two-shot "
@@ -731,11 +859,16 @@ def whole_scene_prompt(
     elif scene_sit == "stuck":
         camera = ("Camera: steady medium shots with a slight handheld shake that stay on the struggling character, "
                   "with close-ups of the effort and of the others reacting" + (f", {motion}" if motion else ""))
+    elif cov:
+        extra = strip_frontal_motion(motion)
+        camera = cov["camera"] + (f"; also {extra}" if extra else "")
     else:
         camera = (f"Camera: {motion}, and it keeps moving like a real film, changing angle and framing to follow whoever is "
                   "speaking, with natural cuts between wide, medium and close-up shots") if motion else (
                   "Camera: moves like a real film, changing angle and framing to follow whoever is speaking, with natural "
                   "cuts between wide, medium and close-up shots")
+    if cov and (walking or scene_sit == "stuck"):
+        camera += "; nobody looks into the camera lens, the characters look at each other"
     bits += [camera, _t2v_style(style),
              "Natural, fluid, lifelike motion, sharp focus, consistent character appearance throughout"]
     if spoken:

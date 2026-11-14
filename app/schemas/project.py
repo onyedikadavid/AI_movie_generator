@@ -40,6 +40,16 @@ def normalize_scene_style(value) -> Optional[str]:
     return v if v in ("whole", "shots", "reuse", "film") else None
 
 
+def normalize_generation_mode(value) -> Optional[str]:
+    """'script' (write a script first) | 'direct' (straight to the video model); anything else = None (= 'script')."""
+    v = str(value or "").strip().lower().replace("_", "-")
+    if v in ("direct", "video", "straight", "straight-to-video", "no-script"):
+        return "direct"
+    if v in ("script", "story", "write-script"):
+        return "script"
+    return None
+
+
 def normalize_video_mode(value: Optional[str]) -> Optional[str]:
     """'t2v' / 'i2v' (also accepts friendly spellings); anything else = None (use the server default)."""
     v = (value or "").strip().lower().replace("_", "-")
@@ -65,6 +75,7 @@ class ProjectCreate(BaseModel):
     scene_seconds: Optional[int] = None
     video_resolution: Optional[str] = None
     scene_style: Optional[str] = None
+    generation_mode: Optional[str] = None
 
 
 class ContinueRequest(BaseModel):
@@ -124,6 +135,7 @@ class ProjectResponse(RunState):
     scene_seconds: Optional[int] = None
     video_resolution: Optional[str] = None
     scene_style: Optional[str] = None
+    generation_mode: Optional[str] = None
     created_at: datetime
 
     class Config:

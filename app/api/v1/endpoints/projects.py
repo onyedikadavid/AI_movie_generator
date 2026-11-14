@@ -24,6 +24,7 @@ from app.schemas.project import (
     normalize_video_mode,
     normalize_resolution,
     normalize_scene_style,
+    normalize_generation_mode,
     clamp_scene_count,
     ContinueRequest,
     clamp_scene_seconds,
@@ -60,6 +61,8 @@ def _project_out(db, p: Project, model=ProjectResponse):
         item.video_mode = normalize_video_mode(settings.VIDEO_MODE) or "i2v"   # show the mode that will really be used
     if hasattr(item, "scene_style") and item.scene_style is None:
         item.scene_style = normalize_scene_style(settings.SCENE_MODE) or "shots"   # show what will really happen
+    if hasattr(item, "generation_mode") and item.generation_mode is None:
+        item.generation_mode = "script"
     if hasattr(item, "video_resolution") and item.video_resolution is None:
         item.video_resolution = normalize_resolution(settings.VIDEO_T2V_RESOLUTION) or "960x544"   # what will really be used
     if hasattr(item, "scene_seconds") and item.scene_seconds is None:
@@ -85,6 +88,7 @@ async def create_project(
     scene_seconds: Optional[str] = Form(None),
     video_resolution: Optional[str] = Form(None),
     scene_style: Optional[str] = Form(None),
+    generation_mode: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -107,6 +111,7 @@ async def create_project(
         scene_seconds=clamp_scene_seconds(scene_seconds),
         video_resolution=normalize_resolution(video_resolution),
         scene_style=normalize_scene_style(scene_style),
+        generation_mode=normalize_generation_mode(generation_mode),
     )
     db.add(new_project)
     await db.commit()

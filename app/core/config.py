@@ -167,6 +167,11 @@ class Settings(BaseSettings):
     # A line still cut off after the retries: first split the scene so it gets its own, longer clip; if even that fails,
     # the line is spoken by the pipeline's own voice over the picture, so the full sentence is ALWAYS heard.
     SPEECH_FALLBACK_TTS: bool = True
+    # A clip that took longer than this to render is NEVER rendered again or split because its last word seems cut
+    # off (on a T4 one clip takes 25-40 min; doing it twice is worse than a slightly clipped last word). It is kept;
+    # a single line may still be finished by the pipeline's voice (SPEECH_FALLBACK_TTS). Fast GPUs stay under it and
+    # keep the retries. 0 = always allow retries.
+    SPEECH_RETRY_MAX_RENDER_SECONDS: int = 900
     # The clip's last 0.3 s counts as 'still speaking' when it is within this many dB of the clip's average level.
     SPEECH_TAIL_MARGIN_DB: float = 14.0
     # Audio-driven video models (WanGP MultiTalk / InfiniteTalk / Hunyuan Avatar) do not make a voice: they animate the
@@ -226,6 +231,10 @@ class Settings(BaseSettings):
     #   "free"   = no staging instruction, the video model decides.
     CONVERSATION_STAGING: str = "walk"
     SHOT_COVERAGE: bool = True
+    # Who is talking TO whom decides the camera: two people talking are seen from the side (a side-on two-shot, then
+    # over-the-shoulder shots), each looking at the other, never into the lens; a lone speaker is seen in three-quarter
+    # view looking at someone just off-frame. false = the old wording ("follow whoever is speaking").
+    CONVERSATION_COVERAGE: bool = True
     # Final export size and sharpening (0 disables sharpening).
     OUTPUT_WIDTH: int = 1280
     OUTPUT_HEIGHT: int = 720

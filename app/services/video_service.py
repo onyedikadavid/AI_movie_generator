@@ -5,6 +5,7 @@ import time
 import logging
 import httpx
 from app.core.config import settings
+from app.services import abandon
 from app.services.dynamic_config import resolve_url, KEY_WAN_API_URL
 from app.services.media_client import GPU_HEADERS, TRANSIENT, TRANSIENT_STATUS, atomic_write, explain
 
@@ -91,6 +92,9 @@ class VideoGenerationService:
             return self._video_bytes(resp)
 
         data = {**data, "async": "1", "job_key": self._job_key(data, image_bytes)}
+        grp = abandon.group()
+        if grp:
+            data["group"] = grp      # lets the server drop this project's older, still-queued (replaced) jobs
         resp = self._send("post", url, data=data, files=files, timeout=httpx.Timeout(120.0, connect=30.0), attempts=4)
         ctype = (resp.headers.get("content-type") or "").lower()
         if resp.status_code == 200 and "json" not in ctype:
@@ -109,6 +113,16 @@ class VideoGenerationService:
             raise RuntimeError(explain(resp, "Video generation (returned an empty clip)"))
         return resp.content
 
+    def _cancel_job(self, jobs_url: str) -> None:
+        """Best effort: DELETE the job. A queued job is dropped; a running one is left to finish (it cannot be stopped)."""
+        try:
+            with httpx.Client(timeout=httpx.Timeout(15.0, connect=8.0), headers=GPU_HEADERS) as client:
+                r = client.delete(jobs_url)
+            logger.info("Video job %s: asked the server to drop it (%s).", jobs_url.rsplit("/", 1)[-1],
+                        (r.json() or {}).get("action", r.status_code) if "json" in (r.headers.get("content-type") or "") else r.status_code)
+        except Exception as e:  # noqa: BLE001 - nothing depends on it
+            logger.info("Could not tell the video server to drop the job (%s).", str(e)[:80])
+
     def _wait_for_job(self, base: str, job_id: str) -> bytes:
         """Poll the job until it is done, then download it. Network blips while polling are tolerated:
         the render keeps going on the GPU server regardless of this connection."""
@@ -122,6 +136,12 @@ class VideoGenerationService:
                     f"(job {job_id}). Check the notebook; Resume will pick the same job up if it is still running."
                 )
             time.sleep(max(0, settings.VIDEO_POLL_SECONDS))
+            if abandon.abandoned():
+                # The run was paused / stopped / replaced and walked away from this call: stop polling, and tell the
+                # server to drop the job if it has not started yet (a running one cannot be interrupted - Resume
+                # re-attaches to it instead of starting it again).
+                self._cancel_job(jobs_url)
+                raise RuntimeError(f"Stopped waiting for video job {job_id} (the run was paused or stopped).")
             try:
                 r = self._send("get", jobs_url, timeout=httpx.Timeout(60.0, connect=20.0), attempts=1)
             except RuntimeError as e:
@@ -152,6 +172,8 @@ class VideoGenerationService:
             if status == "done":
                 res = self._send("get", f"{jobs_url}/result", timeout=httpx.Timeout(300.0, connect=30.0), attempts=4)
                 return self._video_bytes(res)
+            if status == "cancelled":
+                raise RuntimeError("The video server dropped this job (a newer request for the same project replaced it).")
             if status == "error":
                 trace = (info.get("trace") or "")[-700:].replace("\n", " / ")
                 raise RuntimeError(f"The video server failed this clip: {info.get('error')}" + (f" | {trace}" if trace else ""))

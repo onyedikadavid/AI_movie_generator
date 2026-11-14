@@ -1,5 +1,6 @@
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from app.services.text_clean import clean_text
 
 # --- LLM Parsing Schemas ---
 
@@ -85,6 +86,17 @@ class ScriptBase(BaseModel):
     story_text: Optional[str] = None
     story_hook: Optional[str] = None
     story_outline: Optional[dict] = None
+
+    @field_validator("story_text", "story_hook", mode="before")
+    @classmethod
+    def _plain_story(cls, v):
+        """Stories saved by an older version may be a printed dict ("{'hook': ...}"): show them as the plain story."""
+        return clean_text(v) or None if v is not None else None
+
+    @field_validator("story_outline", mode="before")
+    @classmethod
+    def _plain_outline(cls, v):
+        return {k: clean_text(x) for k, x in v.items()} if isinstance(v, dict) else v
 
 class ScriptCreate(ScriptBase):
     pass
