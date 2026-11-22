@@ -15,6 +15,8 @@ from selftest_renderer import FakeTTS  # noqa: E402
 
 
 def main():
+    _cfg = __import__('app.core.config', fromlist=['settings']).settings
+    _cfg.WHOLE_ONLY = False; _cfg.WHOLE_SCENE_STRICT = False; _cfg.SCENE_MODE = 'shots'   # these tests cover the retired shot / reuse / split styles
     settings.AUDIO_MODE = "model"; settings.SCENE_MODE = "whole"; settings.WHOLE_SCENE_MAX_SECONDS = 30.0
     settings.VIDEO_MAX_CLIP_SECONDS = 10.0; settings.SPEECH_COMPLETE_CHECK = True; settings.SPEECH_FALLBACK_TTS = True
     settings.SPEECH_RETRY_MAX_RENDER_SECONDS = 900

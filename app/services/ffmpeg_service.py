@@ -245,6 +245,8 @@ class FFmpegService:
         fps: int = 24,
         sharpen: float = 0.0,
         interpolate: bool = False,
+        trim_head: float = 0.0,
+        trim_tail: float = 0.0,
     ) -> str:
         """
         Model-voice mode: makes a generated clip match the other shots (size, frame rate, codecs) but keeps its
@@ -254,6 +256,10 @@ class FFmpegService:
         """
         _require_ffmpeg()
         length = max(self.get_duration(src_path), 0.1)
+        # The first / last fraction of a second of a generated clip is where the picture smears or settles; long clips
+        # lose it (a clip too short to spare it is left alone).
+        head, tail = max(0.0, float(trim_head or 0)), max(0.0, float(trim_tail or 0))
+        trimmed = head + tail > 0 and length > 20 * (head + tail)
         vf = []
         if interpolate:
             vf.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
@@ -267,7 +273,11 @@ class FFmpegService:
             vf.append(f"unsharp=5:5:{sharpen:.2f}:5:5:0.0")
         vf.append("format=yuv420p")
 
-        cmd = ["ffmpeg", "-y", "-i", src_path]
+        cmd = ["ffmpeg", "-y"]
+        if trimmed:
+            cmd += ["-ss", f"{head:.3f}", "-t", f"{length - head - tail:.3f}"]
+            length = length - head - tail
+        cmd += ["-i", src_path]
         if self.has_audio(src_path):
             # If the model's voice runs longer than its picture, hold the last frame until the speech ends instead of
             # cutting the speech off ("-shortest" below would otherwise trim the audio to the picture).
@@ -275,7 +285,7 @@ class FFmpegService:
             if v_len > 0 and a_len > v_len + 0.05:
                 vf.insert(len(vf) - 1, f"tpad=stop_mode=clone:stop_duration={a_len - v_len + 0.1:.3f}")
             # Per-clip loudness levelling keeps the voices at a similar volume from shot to shot.
-            af = "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,aformat=channel_layouts=stereo,apad"
+            af = "loudnorm=I=-16:TP=-1.5:LRA=15,aresample=48000,aformat=channel_layouts=stereo,apad"
             cmd += ["-vf", ",".join(vf), "-af", af, "-map", "0:v:0", "-map", "0:a:0"]
         else:
             cmd += ["-f", "lavfi", "-t", f"{length:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
@@ -463,6 +473,23 @@ class FFmpegService:
         finally:
             if os.path.exists(list_file_path):
                 os.remove(list_file_path)
+        return output_path
+
+    def add_music_bed(self, video_path: str, track_path: str, output_path: str, volume: float = 0.18, duck: bool = True) -> str:
+        """One continuous music track under the WHOLE film: looped to the film's length, faded in and out, and (duck=True)
+        lowered automatically whenever somebody speaks. The picture is copied untouched."""
+        _require_ffmpeg()
+        total = max(1.0, self.get_duration(video_path))
+        fade = min(4.0, total / 4)
+        music = f"[1:a]volume={float(volume):.3f},afade=t=in:d={fade:.2f}[m]"
+        if duck:
+            graph = (f"{music};[0:a]asplit=2[mix][sc];[m][sc]sidechaincompress=threshold=0.04:ratio=9:attack=30:release=700[d];"
+                     f"[mix][d]amix=inputs=2:duration=first:normalize=0,afade=t=out:st={total - fade:.2f}:d={fade:.2f}[a]")
+        else:
+            graph = (f"{music};[0:a][m]amix=inputs=2:duration=first:normalize=0,afade=t=out:st={total - fade:.2f}:d={fade:.2f}[a]")
+        _run(["ffmpeg", "-y", "-i", video_path, "-stream_loop", "-1", "-i", track_path, "-filter_complex", graph,
+              "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+              "-t", f"{total:.2f}", "-movflags", "+faststart", output_path])
         return output_path
 
     def assemble_scene(self, clip_paths: List[str], audio_wav: str, output_path: str) -> str:

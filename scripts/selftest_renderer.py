@@ -113,6 +113,8 @@ def make_scene():
 
 
 def main():
+    _cfg = __import__('app.core.config', fromlist=['settings']).settings
+    _cfg.WHOLE_ONLY = False; _cfg.WHOLE_SCENE_STRICT = False; _cfg.SCENE_MODE = 'shots'   # these tests cover the retired shot / reuse / split styles
     from app.core.config import settings
 
     settings.NARRATOR_ENABLED = True   # the first checks cover the narrator-on path; narrator-off is tested below

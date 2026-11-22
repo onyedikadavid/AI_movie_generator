@@ -1,3 +1,26 @@
+## v2.33.0 - keep my story, chat with the writer, music bed, no character limit
+
+- **Keep my story exactly** (new-project checkbox, on by default, `projects.keep_story`): the writer no longer rewrites your story. It only cuts it into scenes in order and adds what the camera needs; spoken words in your story are used as written.
+- **Chat with the writer** (`POST /api/v1/chat`, page `/chat`): talk the story over with the Ollama model. It is told never to change your story unless you ask. "Use this as my story" fills the new-project page.
+- **Music bed** (`MUSIC_BED=true`): put your own tracks (mp3/wav/m4a/ogg) in `storage/music/` (or set `MUSIC_DIR`). One track, picked by a word of the tone/genre in its file name (e.g. `sad_piano.mp3`), is looped under the whole film, faded in and out, and lowered while people speak (`MUSIC_VOLUME=0.18`, `MUSIC_DUCK=true`). No tracks = no music, nothing else changes.
+- **Characters follow the story**: every character the story has is drawn (`BIBLE_MAX_CHARACTERS=0` = no limit). One picture can only follow a few faces, so when a scene has more people, the speakers (up to `BIBLE_REF_MAX=4`) are shown to the image model and the rest (a crowd) are drawn from the text.
+
+## v2.32.0 - the cast and the places are drawn first (consistency)
+
+- When you press "Generate scene pictures", the app now draws **every character** (one picture each: name, gender, age, outfit) and **every place** (an empty establishing picture) BEFORE any scene picture. They appear on the review screen; redraw any of them, optionally with your own description (it becomes the saved look). The scene pictures that show a changed character/place can then be redrawn in one click.
+- Every scene picture is built from those pictures: the people in the scene are given to the image model as references (IP-Adapter, up to `BIBLE_REF_MAX=4`), and the picture starts from its place's picture (`BIBLE_PLACE_STRENGTH`). The video then starts from the approved scene picture.
+- **Update the SDXL notebook** (`sdxl_image_server_v2_characters.ipynb`). An old SDXL notebook still works (it ignores the references), but then nothing keeps the faces the same. Check `/health` shows `"ip_adapter": true`.
+- Settings: `BIBLE_PICTURES=true`, `BIBLE_MAX_CHARACTERS=0` (no limit), `BIBLE_REF_MAX=4`, `BIBLE_REF_SCALE=0.7`, `BIBLE_PLACE_STRENGTH=0.72`.
+- Not covered: "straight to video" projects (no script, so no named characters), and faces can still drift in the middle of a very long clip - only its first frame is pinned.
+
+## v2.31.0 - long scenes (2-10 min), pictures first, calmer film
+
+- **One scene = one clip, 2 to 10 minutes.** No seconds anywhere in the app; the length is chosen in minutes (2-10). No shots, no splitting, no film chaining (`WHOLE_ONLY=true`, `WHOLE_SCENE_STRICT=true`). A scene is only continued in a second clip if your video server's `/health` reports a ceiling below the length asked for.
+- Set `VIDEO_MAX_CLIP_SECONDS=600`, `VIDEO_SERVER_TIMEOUT=21600`, `VIDEO_JOB_MAX_WAIT=43200`.
+- **Pictures first.** Script -> "Generate scene pictures" -> review (redraw one with your own words, or reuse another scene's picture) -> "Make the video". Approved pictures are kept in `storage/projects/<id>/images/`, and each scene's video starts from its picture. New status `IMAGES_READY`, new column `projects.images_approved` (added automatically; alembic `c5e2a8b97f13`).
+- **Less rush** (`CALM_STAGING=true`): people only walk when the scene says so, one steady camera, unhurried pace, dialogue spread with pauses, the last line finishes well before the end. `CLIP_TRIM_HEAD_SECONDS`/`CLIP_TRIM_TAIL_SECONDS` trim the model's first and last moments.
+- Not done yet: keeping your story word-for-word, the writer chat page, a continuous music bed.
+
 ## One clip per scene (SCENE_MODE=whole)
 
     AUDIO_MODE=model

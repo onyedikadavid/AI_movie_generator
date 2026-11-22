@@ -22,7 +22,11 @@ def clamp_scene_seconds(value) -> Optional[int]:
         n = int(value)
     except (TypeError, ValueError):
         return None
-    return max(3, min(n, 120)) if n > 0 else None
+    # v2.31: a scene is one clip of 2 to 10 minutes (stored in seconds, shown in minutes). Anything shorter is raised
+    # to the 2-minute minimum, anything longer lowered to 10 minutes.
+    if n <= 0:
+        return None
+    return max(120, min(n, 600))
 
 
 VIDEO_RESOLUTIONS = ("512x288", "640x352", "768x448", "960x544")
@@ -36,8 +40,9 @@ def normalize_resolution(value) -> Optional[str]:
 
 def normalize_scene_style(value) -> Optional[str]:
     """'whole' | 'shots' | 'reuse' | 'film'; anything else = None (use the SCENE_MODE setting)."""
-    v = str(value or "").strip().lower()
-    return v if v in ("whole", "shots", "reuse", "film") else None
+    # v2.31: scenes are never cut into shots or filmed in pieces any more - one scene, one clip. Old values
+    # ("shots", "reuse", "film") that an earlier project still holds are treated as "whole".
+    return "whole"
 
 
 def normalize_generation_mode(value) -> Optional[str]:
@@ -76,6 +81,8 @@ class ProjectCreate(BaseModel):
     video_resolution: Optional[str] = None
     scene_style: Optional[str] = None
     generation_mode: Optional[str] = None
+    images_approved: Optional[bool] = None
+    keep_story: Optional[bool] = None
 
 
 class ContinueRequest(BaseModel):
@@ -136,6 +143,8 @@ class ProjectResponse(RunState):
     video_resolution: Optional[str] = None
     scene_style: Optional[str] = None
     generation_mode: Optional[str] = None
+    images_approved: Optional[bool] = None
+    keep_story: Optional[bool] = None
     created_at: datetime
 
     class Config:

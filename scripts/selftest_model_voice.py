@@ -69,6 +69,8 @@ def scene():
 
 
 def main():
+    _cfg = __import__('app.core.config', fromlist=['settings']).settings
+    _cfg.WHOLE_ONLY = False; _cfg.WHOLE_SCENE_STRICT = False; _cfg.SCENE_MODE = 'shots'   # these tests cover the retired shot / reuse / split styles
     if not shutil.which("ffmpeg"):
         print("ffmpeg not found"); sys.exit(1)
     ff = FFmpegService()

@@ -230,8 +230,7 @@ _SEATED = re.compile(
     r"hospital bed|wheelchair|cell|prison|interrogat\w+|meeting room|office desk)\b",
     re.IGNORECASE,
 )
-_NO_BOUNCE = ("smooth, even walking gait, the body stays level, no bouncing, no jumping, no bobbing up and down, "
-              "no hopping, no pacing back and forth, no spinning")
+_NO_BOUNCE = "a smooth, even, unhurried walking gait, upright and level, steady and grounded"
 _CAMERA_WALK = [
     "smooth gimbal tracking shot that moves alongside them at walking pace, keeping the speaker in frame",
     "steady tracking shot from in front of them, backing away at their walking pace, faces clearly visible",
@@ -501,15 +500,16 @@ def speech_clause(speaker: str, speech: str, voice_desc: str = "", mood: str = "
     sit = detect_situation(action, scene) if not off_screen else ""
     d = _analyze_delivery("" if off_screen else mood, action, speech, sit, scene)
     manner = d.phrase()
-    voice = f" {voice_desc}" if voice_desc else ""
-    if voice and manner:
-        voice = f" in {voice_desc.removeprefix('in ').strip()}, {manner.removeprefix('in ')}"
-    elif voice:
-        voice = f" in {voice_desc.removeprefix('in ').strip()}"
-    elif manner:
+    # ONE description of the voice. Before v2.31 both the cast's voice note and the scene's delivery were written out, which
+    # produced "in low, tense, a loud, quick, harsh, sharp voice" - the model got contradictory directions.
+    if manner:
         voice = f" {manner}"
+    elif voice_desc:
+        voice = f" in {voice_desc.removeprefix('in ').strip()}"
+    else:
+        voice = ""
     emo = (mood or "").strip()
-    feel = f", {emo}," if emo and emo.lower() not in ("neutral", "dynamic expression") and not off_screen else ""
+    feel = f", {emo}" if emo and emo.lower() not in ("neutral", "dynamic expression") and not off_screen else ""
     return f'{who} says{voice}{feel}: "{speech}"'
 
 
@@ -742,6 +742,21 @@ def addressee(speaker: str, speech: str, on_screen: Sequence, beats: Sequence[di
     return names[0] if len(names) == 1 else ""
 
 
+_RUSH = re.compile(r"\b(whip|swish|rapid|fast|quick|speed|spin|orbit|swirl|swing|shak|shaky|handheld|crash|zoom|dolly[- ]zoom|"
+                   r"tracking|follow|chase|sweep|circl|rotat|pan\b|tilt|cut|cuts|alternat|reverse|montage)", re.I)
+_EXPLICIT_MOVE = re.compile(r"\b(walk|walks|walking|stroll|strolls|strolling|march|marches|wander|wanders|hike|hikes|run|runs|"
+                            r"running|chase|chases|follow|follows|ride|rides|drive|drives|sprint|climb|climbs)\b", re.I)
+_CROWD = re.compile(r"\b(crowd|crowded|people|courtyard|market|street|square|audience|plaza|bazaar|festival|ceremony|"
+                    r"gathering|villagers|townspeople|spectators|onlookers|students|soldiers)\b", re.I)
+
+
+def calm_motion(motion: str) -> str:
+    """The script's camera note without anything that makes a long take rush, swing or cut."""
+    parts = re.split(r"\s*(?:[,;]|\bthen\b|\band then\b)\s*", motion or "")
+    keep = [p.strip() for p in parts if p.strip() and not _RUSH.search(p)]
+    return ", ".join(keep)
+
+
 def strip_frontal_motion(motion: str) -> str:
     """The script's camera note without the parts that put the camera straight in front of a face."""
     parts = re.split(r"\s*(?:[,;]|\bthen\b|\band then\b)\s*", motion or "")
@@ -771,9 +786,9 @@ def conversation_coverage(beats: Sequence[dict], on_screen: Sequence, scene_text
         pair = f"{a} and {b2}" + (f" and {people[2]}" if len(people) > 2 else "")
         blocking = (f"{pair} stand face to face a short distance apart and are seen from the side, in profile or three-quarter "
                     "view; each looks at the person they are talking to and nobody ever looks into the camera lens")
-        camera = (f"Camera: it starts side-on with a two-shot of {pair} face to face in the place, then uses over-the-shoulder "
-                  f"shots that follow the conversation - over {b2}'s shoulder onto {a} while {a} speaks, reversing over {a}'s "
-                  f"shoulder onto {b2} when {b2} answers; the camera is never straight in front of a speaker")
+        camera = (f"Camera: one steady, locked-off side-on two-shot of {pair} face to face in the place, held for the whole "
+                  "take with at most a very slow push-in; the framing stays stable and the camera is never straight in front "
+                  "of a speaker")
     else:
         x = people[0] if people else talkers[0]
         blocking = (f"{x} is seen in three-quarter view from the side, speaking to the people just off-frame, eyes on them "
@@ -805,7 +820,8 @@ def whole_scene_prompt(
     place = clip_words(location, 30)
     # A scene with nobody speaking has room for a longer description (a "straight to video" idea is the whole prompt).
     setting = clip_words(visual_description, 40 if beats else 90)
-    motion = clip_words(scene_motion, 26)
+    calm = bool(getattr(settings, "CALM_STAGING", True))
+    motion = clip_words(calm_motion(scene_motion) if calm else scene_motion, 26)
     cast_bits = []
     for c in list(on_screen)[:4]:
         look = clip_words(getattr(c, "appearance_prompt", "") or getattr(c, "description", ""), 30)
@@ -843,10 +859,13 @@ def whole_scene_prompt(
     walking = (len(cast_bits) >= 2 and len(talkers) >= 1 and not scene_sit
                and not any(is_action_beat(b.get("action")) for b in beats)
                and all(is_generic_action(b.get("action")) for b in beats if b.get("kind") != "narration")
-               and staging_mode(" ".join(str(b.get("action") or "") for b in beats), place, setting, motion) == "walk")
+               and staging_mode(" ".join(str(b.get("action") or "") for b in beats), place, setting, motion) == "walk"
+               # v2.31: in a long calm take people only walk when the scene itself says so (otherwise they stand or sit
+               # face to face). "Everyone walks everywhere" is what made the film feel rushed.
+               and (not calm or _EXPLICIT_MOVE.search(f"{setting} {scene_motion or ''} " + " ".join(str(b.get('action') or '') for b in beats))))
     if walking:
-        bits.append("While they talk the characters walk together through the place at an easy, steady pace, turning to "
-                    "each other, gesturing and reacting, a real flowing conversation without stopping; " + _NO_BOUNCE)
+        bits.append("While they talk the characters walk together through the place at a slow, easy pace, turning to "
+                    "each other, gesturing and reacting, a real flowing conversation; " + _NO_BOUNCE)
     if scene_sit == "stuck":
         bits.append("The character who is stuck stays trapped in the same spot for the whole scene and never walks or runs; "
                     "the others stay close and react")
@@ -854,25 +873,29 @@ def whole_scene_prompt(
         bits.append(cov["blocking"])
     bits += steps
     if walking:
-        camera = ("Camera: smooth tracking shots that move with the walking characters, alternating between a two-shot "
-                  "and a medium shot of whoever is speaking" + (f", {motion}" if motion else ""))
+        camera = ("Camera: one smooth, steady tracking shot that moves alongside the walking characters at their pace, "
+                  "keeping them in frame" + (f", {motion}" if motion else ""))
     elif scene_sit == "stuck":
-        camera = ("Camera: steady medium shots with a slight handheld shake that stay on the struggling character, "
-                  "with close-ups of the effort and of the others reacting" + (f", {motion}" if motion else ""))
+        camera = ("Camera: a steady medium shot that stays on the struggling character, the others close by"
+                  + (f", {motion}" if motion else ""))
     elif cov:
         extra = strip_frontal_motion(motion)
+        extra = "" if (extra and extra.lower() in cov["camera"].lower()) else extra
         camera = cov["camera"] + (f"; also {extra}" if extra else "")
     else:
-        camera = (f"Camera: {motion}, and it keeps moving like a real film, changing angle and framing to follow whoever is "
-                  "speaking, with natural cuts between wide, medium and close-up shots") if motion else (
-                  "Camera: moves like a real film, changing angle and framing to follow whoever is speaking, with natural "
-                  "cuts between wide, medium and close-up shots")
+        camera = (f"Camera: a steady medium-wide shot, {motion}, the framing stays stable") if motion else (
+                  "Camera: a steady, locked-off medium-wide shot with at most a very slow push-in, the framing stays stable")
     if cov and (walking or scene_sit == "stuck"):
         camera += "; nobody looks into the camera lens, the characters look at each other"
     bits += [camera, _t2v_style(style),
-             "Natural, fluid, lifelike motion, sharp focus, consistent character appearance throughout"]
+             "Everything happens in real time at a calm, natural, unhurried pace, with relaxed lifelike motion",
+             "Crisp, sharp, high-resolution detail, faces in clear focus, the same faces and clothes in every moment"]
+    if calm and _CROWD.search(f"{setting} {place}"):
+        bits.append("Only a few people stand far in the background, soft and out of focus, moving slowly; the main "
+                    "characters are the only sharp subjects")
     if spoken:
-        bits.append("The scene runs until the last spoken line is completely finished, then holds for a moment")
+        bits.append("The lines are spread across the take with calm pauses between them, each said slowly and completely; "
+                    "the last spoken line is finished well before the end, then the scene holds quietly for a moment")
     cue = clip_words(sound_design, 22) or "natural ambient sound of the location"
     bits.append(f"Audio: every spoken line is clearly audible, in the order given, and lip-synced, with {cue} quietly "
                 "underneath, no background music" if spoken else f"Audio: {cue}, no spoken dialogue, no background music")

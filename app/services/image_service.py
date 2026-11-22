@@ -53,8 +53,16 @@ class ImageGenerationService:
         width: int = None,
         height: int = None,
         seed: int = None,
+        references: list = None,
+        reference_scale: float = None,
+        init_image: str = None,
+        init_strength: float = None,
     ) -> str:
-        """`prompt` is used exactly as given - build it with prompt_builder."""
+        """`prompt` is used exactly as given - build it with prompt_builder.
+
+        `references`: picture files of the people who must look the same as in the bible (sent to the SDXL server, which
+        uses them through IP-Adapter). `init_image` + `init_strength`: the place's own picture, redrawn with the people in
+        it. A server without those features simply ignores them and draws from the text."""
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         width = int(width or settings.IMAGE_WIDTH)
         height = int(height or settings.IMAGE_HEIGHT)
@@ -76,11 +84,20 @@ class ImageGenerationService:
             if seed is not None:
                 data["seed"] = str(int(seed))
 
+            files = []
+            for path in (references or [])[: max(1, int(settings.BIBLE_REF_MAX))]:
+                if path and os.path.exists(path):
+                    files.append(("reference_images", (os.path.basename(path), open(path, "rb").read(), "image/png")))
+            if files:
+                data["reference_scale"] = str(float(settings.BIBLE_REF_SCALE if reference_scale is None else reference_scale))
+            if init_image and os.path.exists(init_image):
+                files.append(("init_image", (os.path.basename(init_image), open(init_image, "rb").read(), "image/png")))
+                data["init_strength"] = str(float(settings.BIBLE_PLACE_STRENGTH if init_strength is None else init_strength))
             response = None
             for attempt in (1, 2, 3):
                 try:
                     with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0), headers=GPU_HEADERS) as client:
-                        response = client.post(image_api_url, data=data)
+                        response = client.post(image_api_url, data=data, files=files or None)
                 except httpx.ConnectError as e:
                     if attempt < 3:
                         time.sleep(3 * attempt)

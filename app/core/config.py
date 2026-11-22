@@ -139,7 +139,11 @@ class Settings(BaseSettings):
     VIDEO_MAX_SHOTS_PER_SCENE: int = 5
     # Longest clip the video server can produce in one call (LTX notebook: LTX_MAX_FRAMES=193 -> 8 s @ 24fps).
     # Model-voice lines need room: this used to be 5.0, which cut longer lines off.
-    VIDEO_MAX_CLIP_SECONDS: float = 8.0
+    # v2.31: every scene is ONE long clip, 2 to 10 minutes. The backend still asks the video server (/health) and never
+    # asks for more than it reports, so this is only the upper bound.
+    VIDEO_MAX_CLIP_SECONDS: float = 600.0
+    SCENE_MIN_SECONDS: int = 120
+    SCENE_MAX_SECONDS: int = 600
     VIDEO_FPS: int = 24
     # Turn on when the video model outputs fewer than 24 fps (e.g. CogVideoX = 8 fps):
     # the missing frames are interpolated instead of repeated.
@@ -189,14 +193,22 @@ class Settings(BaseSettings):
     #            could only render part of the requested length (GPU memory), the scene falls back to "shots".
     # The video server must allow the length too: set LTX_MAX_FRAMES in the Kaggle launch cell (24 fps, 8k+1 frames:
     # 145 = 6 s, 193 = 8 s, 241 = ~10 s). Generation time and GPU memory grow quickly with length.
-    SCENE_MODE: str = "shots"
-    WHOLE_SCENE_MAX_SECONDS: float = 8.0
+    SCENE_MODE: str = "whole"
+    WHOLE_SCENE_MAX_SECONDS: float = 120.0   # default scene length (the minimum, 2 minutes)
     # SCENE_MODE=reuse: make ONE short clip per scene, cut every shot of the scene from it (different start, zoom
     # and side), and lay the voices on top with text-to-speech. Much less GPU time; lips do not match the words.
     # (The project's own choice in the UI wins over SCENE_MODE.) Length of that one clip:
     REUSE_BASE_SECONDS: float = 6.0
     # False (default) = exactly ONE clip per scene: if the dialogue is longer than fits, the lines are shortened.
     # True = a long scene may be split between lines into several clips.
+    # True (default) = "Whole scene" really is ONE clip per scene: its length is "Seconds per scene" (up to the video
+    # server's longest clip, VIDEO_MAX_CLIP_SECONDS), it is never cut into extra clips because the dialogue is long or the
+    # last line was clipped. Only a scene LONGER than the server's longest clip is split, into the fewest clips that
+    # carry on from each other. False = the old behaviour (split at lines / when a line is cut off).
+    WHOLE_SCENE_STRICT: bool = True
+    # v2.31: true = every scene is ONE clip spoken by the video model; shots / reuse / film no longer exist.
+    # false brings the old styles back (only for the old self-tests).
+    WHOLE_ONLY: bool = True
     WHOLE_SCENE_SPLIT: bool = True    # kept for old .env files; lines are never shortened to fit one clip any more
     # What to do if the server returns less than 80% of the requested length (GPU memory): False = keep it (never
     # generate a scene twice), True = redo that scene shot by shot.
@@ -207,13 +219,13 @@ class Settings(BaseSettings):
     VIDEO_MODE: str = "i2v"
     # Resolution requested from a text-to-video server (WxH, both divisible by 32).
     VIDEO_T2V_RESOLUTION: str = "960x544"
-    VIDEO_SERVER_TIMEOUT: int = 900
+    VIDEO_SERVER_TIMEOUT: int = 21600
     # Video clips are requested as background JOBS: the request returns at once and the backend polls for the
     # result, so a long render never depends on one HTTP connection staying open (ngrok / timeouts / blips).
     VIDEO_ASYNC: bool = True
     VIDEO_POLL_SECONDS: int = 6
     # Longest the backend will wait for ONE clip before giving up (seconds).
-    VIDEO_JOB_MAX_WAIT: int = 7200
+    VIDEO_JOB_MAX_WAIT: int = 43200   # a 10-minute clip can take hours on a T4
     # Generate a dedicated close-up keyframe for each speaking character
     # (bigger, sharper faces -> far less "melting"). Turn off to render every
     # shot from the scene's wide keyframe instead (faster, lower quality).
@@ -235,6 +247,23 @@ class Settings(BaseSettings):
     # over-the-shoulder shots), each looking at the other, never into the lens; a lone speaker is seen in three-quarter
     # view looking at someone just off-frame. false = the old wording ("follow whoever is speaking").
     CONVERSATION_COVERAGE: bool = True
+    # v2.31: calm long takes - people walk only when the scene says so, the camera is steady (no swinging / alternating
+    # angles inside one clip), background crowds are few and soft. false = the older, busier prompts.
+    # --- v2.32 music bed under the whole film ---
+    MUSIC_BED: bool = True
+    MUSIC_DIR: str = ""                        # folder of your own tracks (mp3/wav/m4a/ogg); empty = <STORAGE_DIR>/music
+    MUSIC_VOLUME: float = 0.18                 # 1.0 = as loud as the film's own sound
+    MUSIC_DUCK: bool = True                    # the music dips while anybody speaks
+    # --- v2.32 cast & places drawn BEFORE the scene pictures (the "bible pictures") ---
+    BIBLE_PICTURES: bool = True                # draw every character and place once, then reuse those pictures everywhere
+    BIBLE_MAX_CHARACTERS: int = 0              # 0 = no limit: every character the story has gets a picture
+    BIBLE_REF_MAX: int = 4                     # most character pictures the image model can follow in ONE scene picture (speakers first); the rest are drawn from the text
+    BIBLE_REF_SCALE: float = 0.7               # how strongly the character pictures steer a scene picture (0-1)
+    BIBLE_PLACE_STRENGTH: float = 0.72         # how far a scene picture may move away from its place's picture (1 = ignore it)
+    CALM_STAGING: bool = True
+    # Cut this much off the start / end of every long generated clip (where the picture smears). 0 = keep everything.
+    CLIP_TRIM_HEAD_SECONDS: float = 0.3
+    CLIP_TRIM_TAIL_SECONDS: float = 0.5
     # Final export size and sharpening (0 disables sharpening).
     OUTPUT_WIDTH: int = 1280
     OUTPUT_HEIGHT: int = 720

@@ -13,7 +13,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.sync_db import SessionLocal
 from app.models.character import Character
-from app.models.project import BUSY_STATUSES, Project
+from app.models.project import BUSY_STATUSES, Project, ProjectStatus
 from app.models.scene import Scene
 from app.models.location import Location
 from app.schemas.location import LocationMerge, LocationResponse, LocationUpdate
@@ -29,7 +29,7 @@ from app.schemas.project import (
     ContinueRequest,
     clamp_scene_seconds,
 )
-from app.schemas.scene import SceneResponse, SceneUpdate
+from app.schemas.scene import SceneImageRequest, SceneResponse, SceneUpdate
 from app.services import run_control as rc
 from app.services.voice_service import normalize_age_group, normalize_gender, normalize_turn
 
@@ -59,10 +59,14 @@ def _project_out(db, p: Project, model=ProjectResponse):
     item = model.model_validate(p)
     if hasattr(item, "video_mode") and item.video_mode is None:
         item.video_mode = normalize_video_mode(settings.VIDEO_MODE) or "i2v"   # show the mode that will really be used
-    if hasattr(item, "scene_style") and item.scene_style is None:
-        item.scene_style = normalize_scene_style(settings.SCENE_MODE) or "shots"   # show what will really happen
+    if hasattr(item, "scene_style"):
+        item.scene_style = "whole"   # v2.31: one scene = one clip, always
     if hasattr(item, "generation_mode") and item.generation_mode is None:
         item.generation_mode = "script"
+    if hasattr(item, "images_approved") and item.images_approved is None:
+        item.images_approved = False
+    if hasattr(item, "keep_story") and item.keep_story is None:
+        item.keep_story = False       # projects made before this option existed were written the old way
     if hasattr(item, "video_resolution") and item.video_resolution is None:
         item.video_resolution = normalize_resolution(settings.VIDEO_T2V_RESOLUTION) or "960x544"   # what will really be used
     if hasattr(item, "scene_seconds") and item.scene_seconds is None:
@@ -89,6 +93,7 @@ async def create_project(
     video_resolution: Optional[str] = Form(None),
     scene_style: Optional[str] = Form(None),
     generation_mode: Optional[str] = Form(None),
+    keep_story: Optional[bool] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -112,6 +117,7 @@ async def create_project(
         video_resolution=normalize_resolution(video_resolution),
         scene_style=normalize_scene_style(scene_style),
         generation_mode=normalize_generation_mode(generation_mode),
+        keep_story=True if keep_story is None else bool(keep_story),    # default: the user's story is kept as written
     )
     db.add(new_project)
     await db.commit()
@@ -200,6 +206,113 @@ async def run_pipeline(
         return _project_out(db, p)
 
     return await _in_session(inner)
+
+
+@router.post("/projects/{project_id}/images", response_model=ProjectResponse, status_code=202)
+async def draw_images(project_id: str, redo: bool = Query(False, description="true = throw the current pictures away and draw all again")):
+    """Image-first: draw the opening picture of every scene (no video yet). The project then waits in IMAGES_READY so the
+    pictures can be reviewed, redrawn one by one, or reused."""
+
+    def inner(db):
+        return _project_out(db, rc.start_images(db, project_id, redo=redo))
+
+    return await _in_session(inner)
+
+
+@router.post("/projects/{project_id}/approve-images", response_model=ProjectResponse, status_code=202)
+async def approve_images(project_id: str):
+    """The pictures are fine: make the video of every scene from them."""
+
+    def inner(db):
+        return _project_out(db, rc.approve_images(db, project_id))
+
+    return await _in_session(inner)
+
+
+@router.post("/projects/{project_id}/scenes/{scene_id}/image", response_model=SceneResponse)
+async def redraw_scene_image(project_id: str, scene_id: str, payload: SceneImageRequest):
+    """Redraw ONE scene's picture - from your own prompt, from the scene's own description (empty prompt), or by reusing
+    another scene's picture (`from_scene_id`). Takes as long as one image (seconds to a minute)."""
+
+    def inner(db):
+        from app.services import scene_images
+        from app.services.image_service import ImageGenerationService
+
+        p = db.get(Project, project_id)
+        if p is None:
+            raise rc.ActionError(404, "Project not found.")
+        if p.status in BUSY_STATUSES:
+            raise rc.ActionError(409, "Pause the project (or wait for it to finish) before changing its pictures.")
+        scene = db.execute(select(Scene).where(Scene.id == scene_id, Scene.project_id == project_id)).scalars().first()
+        if scene is None:
+            raise rc.ActionError(404, "Scene not found.")
+        source = None
+        if payload.from_scene_id:
+            source = db.execute(select(Scene).where(Scene.id == payload.from_scene_id, Scene.project_id == project_id)).scalars().first()
+            if source is None:
+                raise rc.ActionError(404, "The scene to reuse the picture of was not found.")
+        try:
+            scene_images.regenerate(db, p, scene, ImageGenerationService(), prompt=payload.prompt, from_scene=source)
+        except ValueError as e:
+            raise rc.ActionError(409, str(e))
+        except Exception as e:  # noqa: BLE001 - the image server is down / timed out: say so plainly
+            logger.error("Redrawing the picture of scene %s failed: %s", scene.scene_number, e, exc_info=True)
+            raise rc.ActionError(502, f"The image server could not draw it: {e}")
+        p.images_approved = False
+        if p.status == ProjectStatus.COMPLETED:
+            pass   # a finished film: the new picture is used the next time that scene is rendered
+        db.commit()
+        return SceneResponse.model_validate(scene)
+
+    return await _in_session(inner)
+
+
+def _redraw_bible_item(project_id: str, item_id: str, kind: str, prompt):
+    """Draw one character / place again. Returns the item and the ids of the scenes whose pictures now look out of date."""
+
+    def inner(db):
+        from app.models.location import Location
+        from app.services import bible_assets
+        from app.services.image_service import ImageGenerationService
+
+        p = db.get(Project, project_id)
+        if p is None:
+            raise rc.ActionError(404, "Project not found.")
+        if p.status in BUSY_STATUSES:
+            raise rc.ActionError(409, "Pause the project (or wait for it to finish) before redrawing.")
+        model = Character if kind == "character" else Location
+        item = db.execute(select(model).where(model.id == item_id, model.project_id == project_id)).scalars().first()
+        if item is None:
+            raise rc.ActionError(404, "Not found.")
+        try:
+            fn = bible_assets.regenerate_character if kind == "character" else bible_assets.regenerate_place
+            affected = fn(db, p, item, ImageGenerationService(), prompt=prompt)
+        except Exception as e:  # noqa: BLE001 - the image server is down / timed out: say so plainly
+            logger.error("Redrawing %s %s failed: %s", kind, item_id, e, exc_info=True)
+            raise rc.ActionError(502, f"The image server could not draw it: {e}")
+        if p.status != ProjectStatus.COMPLETED:
+            p.images_approved = False
+        for sc in db.execute(select(Scene).where(Scene.project_id == project_id)).scalars().all():
+            if sc.render_status == "DONE":
+                sc.render_status = "PENDING"      # its clip was made with the old look
+        db.commit()
+        model_out = CharacterResponse if kind == "character" else LocationResponse
+        return {"item": model_out.model_validate(item).model_dump(mode="json"),
+                "affected_scene_ids": [sc.id for sc in affected]}
+
+    return inner
+
+
+@router.post("/projects/{project_id}/characters/{character_id}/image")
+async def redraw_character_image(project_id: str, character_id: str, payload: SceneImageRequest):
+    """Draw ONE character's picture again (optionally from your own description, which becomes their saved look).
+    The answer lists the scenes whose pictures show them, so the app can offer to redraw those."""
+    return await _in_session(_redraw_bible_item(project_id, character_id, "character", payload.prompt))
+
+
+@router.post("/projects/{project_id}/locations/{location_id}/image")
+async def redraw_location_image(project_id: str, location_id: str, payload: SceneImageRequest):
+    return await _in_session(_redraw_bible_item(project_id, location_id, "location", payload.prompt))
 
 
 @router.post("/projects/{project_id}/continue", response_model=ProjectResponse, status_code=202)
@@ -392,7 +505,7 @@ async def update_project_settings(project_id: str, payload: ProjectSettingsUpdat
     if "scene_style" in changes:
         new_style = normalize_scene_style(changes["scene_style"])
         if changes["scene_style"] and new_style is None:
-            raise HTTPException(status_code=422, detail="scene_style must be 'whole', 'shots', 'reuse' or 'film'.")
+            raise HTTPException(status_code=422, detail="scene_style must be 'whole'.")
         current = project.scene_style or normalize_scene_style(settings.SCENE_MODE) or "shots"
         if new_style and new_style != current:
             project.scene_style = new_style

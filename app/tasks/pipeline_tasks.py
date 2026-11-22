@@ -171,9 +171,9 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
     prompt, genre, tone, vstyle = project.raw_prompt, project.requested_genre, project.requested_tone, project.requested_visual_style
     # A long script (a full film can take 15+ minutes to write) is kept on disk, so if saving it fails or the task is
     # retried, the same request reuses it instead of writing it all again.
-    scene_style = project.scene_style or settings.SCENE_MODE
+    scene_style = "whole"   # v2.31: one scene = one clip, never shots / reuse / film
     cache_key = hashlib.sha1(json.dumps(
-        ["script-v1", prompt, genre, tone, vstyle, project.scene_count, project.scene_seconds, scene_style], default=str).encode()).hexdigest()
+        ["script-v2", prompt, genre, tone, vstyle, project.scene_count, project.scene_seconds, scene_style, bool(project.keep_story)], default=str).encode()).hexdigest()
     cache_file = os.path.join(settings.STORAGE_DIR, "projects", pid, "script_cache.json")
     script_schema = None
     try:
@@ -190,7 +190,7 @@ def _script_body(db, project: Project, ctl: RunControl) -> None:
             lambda: asyncio.run(
                 llm.generate_script_structure(prompt, genre_hint=genre, tone_hint=tone, visual_style_hint=vstyle,
                                              scene_count=project.scene_count, scene_seconds=project.scene_seconds,
-                                             scene_style=scene_style)
+                                             scene_style=scene_style, keep_story=bool(project.keep_story))
             )
         )
         try:
@@ -329,6 +329,7 @@ def _save_script(db, pid: str, script_schema) -> None:
             render_status="PENDING",
         ))
 
+    project.images_approved = False     # a new script: its pictures are drawn and reviewed before any video
     project.status = ProjectStatus.SCRIPT_READY
     project.stage_detail = None
     project.progress_pct = 0
@@ -383,9 +384,9 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
     for i, sc in enumerate(result["scenes"]):
         turns = [t for t in (normalize_turn(t) for t in (sc.get("dialogue_turns") or [])) if (t.get("text") or "").strip()]
         try:
-            dur = max(2, min(int(float(sc.get("duration_seconds") or secs or 8)), 120))
+            dur = max(120, min(int(float(secs or 120)), 600))   # v2.31: every scene is one take of the chosen length
         except (TypeError, ValueError):
-            dur = int(secs or 8)
+            dur = 120
         db.add(Scene(
             project_id=pid, scene_number=next_number + i, duration_seconds=dur,
             location=sc.get("location") or "", visual_description=sc.get("visual_description") or "A scene from the story.",
@@ -399,6 +400,7 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
     if script is not None and result["story_addition"]:
         script.story_text = ((script.story_text or "").rstrip() + "\n\n" + result["story_addition"]).strip()
     project.continue_prompt = project.continue_scenes = None
+    project.images_approved = False     # the new scenes have no pictures yet: they are drawn and reviewed first
     project.status = ProjectStatus.SCRIPT_READY
     project.stage_detail = None
     project.total_scenes = len(scenes) + len(result["scenes"])
@@ -492,7 +494,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     if cast.write_back(characters):
         db.commit()
     logger.info("Settings in effect: AUDIO_MODE=%s | scene style=%s (%ss per scene) | CAMERA=%s | video mode=%s | narrator=%s | video size=%s",
-                settings.AUDIO_MODE, project.scene_style or settings.SCENE_MODE, project.scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
+                settings.AUDIO_MODE, "whole", project.scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS, settings.VIDEO_CAMERA_MOTION,
                 project.video_mode or settings.VIDEO_MODE,
                 project.narrator_enabled if project.narrator_enabled is not None else settings.NARRATOR_ENABLED,
                 project.video_resolution or settings.VIDEO_T2V_RESOLUTION)
@@ -531,7 +533,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
             scene_chars = bible.prepare(scene)   # the characters as they look in THIS place, and the place's saved description
             result = renderer.render(scene, scene_chars, style, cast, scene_dir, pid, sctx, video_mode=project.video_mode,
                                      narrator=project.narrator_enabled, scene_seconds=project.scene_seconds, prev_clip=prev_clip,
-                                     resolution=project.video_resolution, scene_style=project.scene_style)
+                                     resolution=project.video_resolution, scene_style="whole")
         except RunStopped:
             safe_rollback(db)
             try:
@@ -571,6 +573,19 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
          stage_detail="Joining scenes into the final cut", current_scene=None)
     master = os.path.join(project_root, "final_master_video.mp4")
     _call(db, ctl, ff.concatenate_videos, finals, master, "aac")
+    if settings.MUSIC_BED:
+        from app.services import music
+        track = music.pick_track(pid, project.requested_tone, project.requested_genre, project.requested_visual_style)
+        if track:
+            try:
+                scored = os.path.join(project_root, "final_master_music.mp4")
+                _call(db, ctl, ff.add_music_bed, master, track, scored, settings.MUSIC_VOLUME, settings.MUSIC_DUCK)
+                master = scored
+                logger.info("Project %s: music bed added (%s).", pid, os.path.basename(track))
+            except Exception as e:  # noqa: BLE001 - the film is done; music is a bonus
+                logger.warning("Music bed skipped (%s).", e)
+        else:
+            logger.info("Project %s: no music tracks in %s - add some mp3 files there for a music bed.", pid, music.music_dir())
     _set(db, project, progress_pct=97, stage_detail="Uploading the final video")
     url = _call(db, ctl, publish_file_strict, master, f"projects/{pid}/final_master_video.mp4")
 
@@ -582,6 +597,54 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
     project.stage_detail = "Done"
     project.current_scene = None
     db.commit()
+
+
+def _image_body(db, project: Project, ctl: RunControl) -> None:
+    """Image-first: draw every scene's opening picture, then STOP so the user can look at them, redraw any (with their
+    own prompt) or reuse one. No video is made until they press 'Make the video'."""
+    from app.services import scene_images
+    pid = project.id
+    if not db.execute(select(Scene.id).where(Scene.project_id == pid).limit(1)).first():
+        raise RuntimeError("This project has no scenes yet. Press Resume/Retry to write the script first.")
+    if (project.generation_mode or "script") != "direct":
+        _build_bible(db, project)   # people and places, so every picture shows the same faces and rooms
+    project.video_mode = "i2v"      # the picture is the first frame of the scene's video
+    _set(db, project, status=ProjectStatus.GENERATING_IMAGES, stage_detail="Drawing the scene pictures", progress_pct=0)
+    img = ImageGenerationService()
+
+    def report(i, total, scene):
+        _set(db, project, status=ProjectStatus.GENERATING_IMAGES, current_scene=scene.scene_number, total_scenes=total,
+             progress_pct=int(100 * i / max(1, total)),
+             stage_detail=f"Drawing the picture for scene {scene.scene_number}/{total}")
+
+    # Each picture is a long GPU/HTTP call: _call releases the database connection while it runs.
+    class _Img:
+        def generate_image(self, *a, **kw):
+            return _call(db, ctl, img.generate_image, *a, **kw)
+
+    if settings.BIBLE_PICTURES and (project.generation_mode or "script") != "direct":
+        from app.services import bible_assets
+
+        def report_bible(i, total, kind, item):
+            _set(db, project, status=ProjectStatus.GENERATING_IMAGES, total_scenes=total, progress_pct=int(100 * i / max(1, total)),
+                 stage_detail=f"Drawing the {'character' if kind == 'character' else 'place'} {item.name} ({i + 1}/{total})")
+
+        made = bible_assets.draw_missing(db, project, _Img(), report=report_bible, checkpoint=ctl.checkpoint)
+        logger.info("Project %s: %d character/place picture(s) drawn.", pid, made)
+        _set(db, project, status=ProjectStatus.GENERATING_IMAGES, stage_detail="Drawing the scene pictures", progress_pct=0)
+    drawn = scene_images.draw_missing(db, project, _Img(), report=report, checkpoint=ctl.checkpoint)
+    logger.info("Project %s: %d scene picture(s) drawn, waiting for the user's review.", pid, drawn)
+    project.images_approved = False
+    project.status = ProjectStatus.IMAGES_READY
+    project.stage_detail = "Review the characters, places and scene pictures"
+    project.progress_pct = 0
+    project.current_scene = None
+    db.commit()
+
+
+@celery_app.task(bind=True)
+def run_image_pipeline(self, project_id: str, run_token: str = None):
+    _execute(project_id, run_token, ProjectStatus.GENERATING_IMAGES, _image_body)
 
 
 @celery_app.task(bind=True)

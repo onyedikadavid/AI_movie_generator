@@ -53,3 +53,10 @@ class SceneResponse(SceneBase):
 
     class Config:
         from_attributes = True
+
+
+class SceneImageRequest(BaseModel):
+    """Redraw one scene's opening picture. `prompt` = the user's own description (empty = the scene's own);
+    `from_scene_id` = reuse that scene's picture instead of drawing."""
+    prompt: Optional[str] = None
+    from_scene_id: Optional[str] = None

@@ -11,7 +11,7 @@ from app.services import prompt_builder as pb  # noqa: E402
 
 V = NS(name="Vesper", appearance_prompt="a woman in her mid-30s, short dark hair, green eyes", description="")
 K = NS(name="Kiran", appearance_prompt="a young man, spiky black hair, scar above his left eyebrow", description="")
-OLD = "changing angle and framing to follow whoever is speaking"
+OLD = "a steady medium-wide shot"   # the frontal wording for direct address (calm in v2.31: no angle changes inside a take)
 
 
 def beat(who, speech, action="stands attentively", kind="dialogue"):
@@ -31,12 +31,12 @@ def main():
     beats = [beat("Vesper", "Kiran, what do these markings mean?"), beat("Kiran", "I have never seen them before.")]
     p = prompt(beats, [V, K])
     assert "face to face" in p and "seen from the side" in p, p
-    assert "over-the-shoulder" in p and "never straight in front of a speaker" in p, p
+    assert "side-on two-shot" in p and "never straight in front of a speaker" in p and "over-the-shoulder" not in p, p
     assert "turned toward Kiran, eyes on Kiran" in p and "turned toward Vesper, eyes on Vesper" in p, p
     assert "nobody ever looks into the camera lens" in p, p
     assert OLD not in p, "the old 'follow whoever is speaking' wording must be gone"
-    assert "dolly-in on Vesper's face" not in p and "handheld pan to the ancient artifacts" in p, p
-    print("OK 1: two people talking -> side-on two-shot, over-the-shoulder, eyes on each other, no frontal dolly-in")
+    assert "dolly-in on Vesper's face" not in p and "handheld" not in p and "pan to" not in p, p   # v2.31: no swinging camera in a long take
+    print("OK 1: two people talking -> ONE steady side-on two-shot (no over-the-shoulder swap inside a take), eyes on each other, no frontal dolly-in")
 
     # 2. who is addressed
     on = [V, K]
@@ -70,15 +70,18 @@ def main():
 
     # 6. motion filter
     assert pb.strip_frontal_motion("Slow dolly-in on Vesper's face, then a handheld pan to the ancient artifacts") == "a handheld pan to the ancient artifacts"
+    assert pb.calm_motion("tracking shot, whip pan, slow push-in, handheld shake") == "slow push-in"   # v2.31
     assert pb.strip_frontal_motion("extreme close-up of his eyes") == ""
     assert pb.strip_frontal_motion("tracking shot following her down the corridor") == "tracking shot following her down the corridor"
     print("OK 6: only the face-on parts of the script's camera note are dropped")
 
     # 7. walking conversation keeps the tracking camera but nobody looks into the lens
     settings.CONVERSATION_STAGING = "walk"
-    p = prompt([beat("Vesper", "Kiran, we must hurry."), beat("Kiran", "I know.")], [V, K], vis="A long street at dawn", motion="")
-    assert "tracking shots" in p and "nobody looks into the camera lens" in p, p
-    print("OK 7: walk-and-talk keeps its tracking camera, eyes stay on each other")
+    p = prompt([beat("Vesper", "Kiran, we must hurry."), beat("Kiran", "I know.")], [V, K], vis="Two people walking down a long street at dawn", motion="")
+    assert "steady tracking shot" in p and "nobody looks into the camera lens" in p and "alternating" not in p, p
+    p2 = prompt([beat("Vesper", "Kiran, we must hurry."), beat("Kiran", "I know.")], [V, K], vis="A long street at dawn", motion="")
+    assert "walk together" not in p2, "v2.31: people only walk when the scene says so"
+    print("OK 7: walk-and-talk only when the scene says so, one steady tracking shot, eyes stay on each other")
     settings.CONVERSATION_STAGING = "stay"
 
     # 8. pictures: keyframe, close-up and the negative prompt

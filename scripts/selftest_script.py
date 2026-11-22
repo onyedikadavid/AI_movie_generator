@@ -57,8 +57,8 @@ async def main2():
     async def fake(prompt):
         calls.append(prompt); return answers.pop(0) if answers else json.dumps(three)
     svc._generate = fake
-    out = await svc.generate_script_structure("A fisherman must warn his village about a storm", scene_count=3, scene_seconds=8)
-    assert "EXACTLY 3 scenes" in calls[1] and "about 8 seconds" in calls[1]
+    out = await svc.generate_script_structure("A fisherman must warn his village about a storm", scene_count=3, scene_seconds=180)
+    assert "EXACTLY 3 scenes" in calls[1] and "about 3 minutes" in calls[1]
     assert len(out.scenes) == 3 and [s.scene_number for s in out.scenes] == [1, 2, 3]
     calls.clear(); answers[:] = [json.dumps(BIBLE), json.dumps(GOOD)]
     await svc.generate_script_structure("A fisherman must warn his village about a storm")

@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
-ENUM_VALUES = ["CANCELLED", "QUEUED", "PAUSED"]
+ENUM_VALUES = ["CANCELLED", "QUEUED", "PAUSED", "IMAGES_READY"]
 
 STATEMENTS = [
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS pause_requested BOOLEAN NOT NULL DEFAULT false",
@@ -34,6 +34,8 @@ STATEMENTS = [
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS video_resolution VARCHAR",
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS scene_style VARCHAR",
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS generation_mode VARCHAR",
+    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS images_approved BOOLEAN",
+    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS keep_story BOOLEAN",
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS resume_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE scripts ADD COLUMN IF NOT EXISTS story_text TEXT",
     "ALTER TABLE scripts ADD COLUMN IF NOT EXISTS story_hook TEXT",

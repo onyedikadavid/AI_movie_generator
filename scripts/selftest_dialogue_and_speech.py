@@ -61,7 +61,7 @@ def check_prompts():
     w = pb.text_video_prompt("dialogue", "Kobi", "irritated", "Walking up and down the studio", CHARS[0].appearance_prompt, CHARS,
                              "a recording studio", "a dim studio", "Cinematic", 1, "auto", None, False, "slow pan", "", "", model_voice=False)
     wl = w.lower()
-    assert "walk side by side" in wl and "ada" in wl and "tracking" in wl and "no bouncing" in wl and "no jumping" in wl, w
+    assert "walk side by side" in wl and "ada" in wl and "tracking" in wl and "unhurried walking gait" in wl, w
     assert "no walking" not in wl and "stands in one place" not in wl, w
     seated = pb.text_video_prompt("dialogue", "Kobi", "calm", "sits at the table", CHARS[0].appearance_prompt, CHARS,
                                   "a dinner table", "a family dinner", "Cinematic", 1, "auto", None, False, "", "", "", model_voice=False)
@@ -72,8 +72,8 @@ def check_prompts():
     whole = pb.whole_scene_prompt(
         [{"kind": "dialogue", "speaker": "Kobi", "speech": "Come on, we are late.", "action": "", "expression": "", "voice_desc": ""},
          {"kind": "dialogue", "speaker": "Ada", "speech": "I am right behind you.", "action": "", "expression": "", "voice_desc": ""}],
-        CHARS, "a market street", "busy street", "Cinematic", None, None, False)
-    assert "walk together" in whole and "tracking shots" in whole and "no bouncing" in whole, whole
+        CHARS, "a market street", "Kobi and Ada walking down a busy street", "Cinematic", None, None, False)
+    assert "walk together" in whole and "tracking shot" in whole and "unhurried walking gait" in whole, whole
     _st.CONVERSATION_STAGING = "stay"
     whole2 = pb.whole_scene_prompt(
         [{"kind": "dialogue", "speaker": "Kobi", "speech": "Hi.", "action": "", "expression": "", "voice_desc": ""}],
@@ -173,6 +173,7 @@ def main():
     cast = VoiceCast(CHARS, "ng", "", texts=["studio"])
     settings.NARRATOR_ENABLED = False
     check_prompts()
+    settings.WHOLE_ONLY = False; settings.WHOLE_SCENE_STRICT = False; settings.WHOLE_SCENE_MAX_SECONDS = 8.0; settings.SCENE_MODE = "shots"   # the speech-retry / split checks below cover the legacy path
 
     # ---- 1. a cut-off line is detected from the clip's audio and generated again, longer -------------------
     settings.AUDIO_MODE, settings.VIDEO_CAMERA_MOTION = "model", "auto"

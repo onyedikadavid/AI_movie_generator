@@ -56,7 +56,7 @@ async def main():
     assert nums == list(range(1, n + 1)), nums
     assert out.scenes[0].continues_previous is False
     assert any(s.continues_previous for s in out.scenes[1:]) and not out.scenes[3].continues_previous, [s.continues_previous for s in out.scenes]
-    assert all(s.duration_seconds == 8 for s in out.scenes)
+    assert all(s.duration_seconds == 120 for s in out.scenes)   # v2.31: every scene is a 2-minute-or-longer take
     assert out.title == "Ayo Flies" and out.characters[0].name == "Ayo" and out.story.startswith("A boy dangles")
     assert all(s.dialogue_turns for s in out.scenes), "dialogue must be written for every scene"
     batches = [c for c in calls if "Write scenes" in c]

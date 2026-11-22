@@ -25,6 +25,7 @@ fingerprint of its inputs, so Resume only redoes what is missing or changed.
 from __future__ import annotations
 
 import hashlib
+import math
 import json
 import logging
 import os
@@ -102,7 +103,7 @@ class SceneRenderer:
         reuse = style_mode == "reuse"
         blob = json.dumps(
             {
-                "v": 10,
+                "v": 11,
                 "img": scene.image_prompt,
                 "motion": scene.motion_prompt,
                 "vis": scene.visual_description,
@@ -130,23 +131,31 @@ class SceneRenderer:
                            settings.SPEECH_RETRY_EXTRA_SECONDS, settings.SPEECH_MAX_RETRIES, settings.SPEECH_TAIL_MARGIN_DB],
                 "driven": settings.VIDEO_AUDIO_DRIVEN,
                 "staging": [settings.CONVERSATION_STAGING, "sit2"],
-                "complete": ["whole-split", settings.SPEECH_FALLBACK_TTS],
+                "complete": ["whole-split", settings.SPEECH_FALLBACK_TTS, bool(settings.WHOLE_SCENE_STRICT)],
             },
             sort_keys=True,
             default=str,
         )
         return hashlib.sha1(blob.encode()).hexdigest()
 
+    @staticmethod
+    def _approved_image(scene_dir: str, scene) -> Optional[str]:
+        """The picture the user approved for this scene (image-first), or None. It lives next to the scene folders, not in
+        one, because a scene folder is wiped whenever the picture changes."""
+        path = os.path.join(os.path.dirname(os.path.abspath(scene_dir)), "images", f"scene_{int(scene.scene_number)}.png")
+        return path if _nonempty(path) else None
+
     def _picture_fingerprint(self, scene, characters: Sequence, style: str, video_mode: str, prev_sig: str = "",
-                             resolution=None) -> str:
+                             resolution=None, approved: Optional[str] = None) -> str:
         """Only what decides the PICTURE (keyframes, look, size, where the scene continues from). A finished clip is
         kept when this is unchanged - every other change (speech settings, clip ceiling, scene seconds, interpolation,
         sharpening...) is already part of each clip's own key, so a clip is reused exactly when it would come out the
         same, instead of the whole scene folder being wiped."""
         blob = json.dumps(
             {
-                "v": 2,
+                "v": 3,
                 "img": scene.image_prompt, "vis": scene.visual_description, "loc": scene.location,
+                "approved": f"{os.path.getsize(approved)}:{int(os.path.getmtime(approved))}" if approved else "",
                 "place": [getattr(scene, "place_key", ""), getattr(scene, "place_text", "")],
                 "chars": [(c.name, c.appearance_prompt, c.description) for c in characters],
                 "style": style, "mode": video_mode, "continues": prev_sig,
@@ -317,6 +326,22 @@ class SceneRenderer:
             out[-1].splits = getattr(seg, "splits", 0) + 1
         return out
 
+    @staticmethod
+    def _balance_parts(parts: List[List[Segment]], cap: float, want_total: float) -> List[List[Segment]]:
+        """A scene asked to run `want_total` seconds needs at least ceil(want_total / cap) clips when the server's
+        longest clip is `cap`. Use the fewest: split the part with the most lines, and where there is nothing left to
+        split add a clip that simply carries on (no new lines)."""
+        need = max(1, math.ceil(want_total / max(cap, 1.0) - 1e-6))
+        out = [list(p) for p in parts] or [[]]
+        while len(out) < need:
+            i = max(range(len(out)), key=lambda k: len(out[k]))
+            if len(out[i]) >= 2:
+                mid = len(out[i]) // 2
+                out[i:i + 1] = [out[i][:mid], out[i][mid:]]
+            else:
+                out.append([])
+        return out
+
     def _whole_parts(self, segments: List[Segment], cap: float) -> List[List[Segment]]:
         """Groups consecutive lines into the fewest pieces that each fit in ONE clip of `cap` seconds. A line is never
         shortened: one that cannot fit on its own is split at sentence / clause ends into several clips."""
@@ -420,7 +445,17 @@ class SceneRenderer:
         """One clip per scene (or per `WHOLE_SCENE_MAX_SECONDS` piece of a long one). Returns None when the server
         could only render a fraction of the requested length, so the caller can use the shot-by-shot path."""
         W, H, FPS = settings.OUTPUT_WIDTH, settings.OUTPUT_HEIGHT, settings.VIDEO_FPS
-        cap = float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)   # the project's own choice wins over .env
+        approved = self._approved_image(scene_dir, scene)
+        # STRICT (default): a scene is ONE clip, as long as the video server allows. "Seconds per scene" is the length
+        # asked for, not a ceiling that cuts the scene into extra clips. A scene is only split when it cannot fit the
+        # server's longest clip (then into the fewest clips that carry on from one another), never into shots.
+        strict = bool(settings.WHOLE_SCENE_STRICT)
+        if strict:
+            cap = float(settings.VIDEO_MAX_CLIP_SECONDS or settings.WHOLE_SCENE_MAX_SECONDS)
+            want_total = float(scene_seconds) if scene_seconds else 0.0
+        else:
+            cap = float(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)   # the project's own choice wins over .env
+            want_total = 0.0
         server_cap = getattr(self.video, "server_max_seconds", lambda: None)()
         if server_cap and server_cap < cap:
             logger.warning("Scene %s: the video server only makes %.1f s clips (LTX_MAX_FRAMES), below "
@@ -428,6 +463,9 @@ class SceneRenderer:
                            scene.scene_number, server_cap, cap)
             cap = server_cap
         parts = self._whole_parts(segments, cap) or [[]]
+        if want_total:
+            parts = self._balance_parts(parts, cap, want_total)
+        each_floor = want_total / len(parts) if want_total else 0.0
         if len(parts) > 1:
             logger.info("Scene %s: the dialogue needs %d clips of up to %.1f s (nothing is shortened).",
                         scene.scene_number, len(parts), cap)
@@ -448,6 +486,11 @@ class SceneRenderer:
             wide_path = start_frame
             ctx.set_scene_image(start_frame)
             source = start_frame
+        elif not t2v and approved:
+            ctx.stage(STAGE_IMAGES, 0.10, "Using the approved picture")
+            shutil.copyfile(approved, wide_path)
+            ctx.set_scene_image(wide_path)
+            source = wide_path
         elif not t2v:
             ctx.stage(STAGE_IMAGES, 0.10, "Drawing the scene")
             if not (may_reuse and _nonempty(wide_path)):
@@ -468,7 +511,7 @@ class SceneRenderer:
         while queue:
             part = queue.popleft()
             ctx.checkpoint()
-            if part and self._part_sig(part, cap) in memory:
+            if part and not strict and self._part_sig(part, cap) in memory:
                 # An earlier run already found that these lines do not fit in one clip (after hours of GPU time).
                 # Start from what it learned instead of rendering the same clip, finding out, and splitting again.
                 if self._split_part(part, queue):
@@ -489,6 +532,9 @@ class SceneRenderer:
             if not part and getattr(scene, "duration_seconds", None):
                 # Nobody speaks in this clip (e.g. a "straight to video" idea): ask for the length that was chosen.
                 request_len = min(max(float(scene.duration_seconds), 3.0), cap)
+            if each_floor:
+                # The scene was asked for at this length (or longer than one clip): share it out evenly.
+                request_len = min(max(request_len if part else 0.0, each_floor, 3.0), cap)
             # A later piece of the scene carries on from the last picture of the piece before it.
             part_source = source
             if n > 0 and fitted:
@@ -542,9 +588,13 @@ class SceneRenderer:
                         logger.warning("Scene %s clip %d: its last word may be clipped, but the clip took %d min to render, "
                                        "so it is kept (SPEECH_RETRY_MAX_RENDER_SECONDS=%d) instead of being rendered again.",
                                        scene.scene_number, n + 1, int(took // 60), int(settings.SPEECH_RETRY_MAX_RENDER_SECONDS))
-                    if not complete and not slow:
+                    if not complete and not slow and strict:
+                        logger.warning("Scene %s clip %d: the last line may be clipped. Strict whole-scene mode keeps ONE "
+                                       "clip per scene instead of splitting it (WHOLE_SCENE_STRICT=false allows a split).",
+                                       scene.scene_number, n + 1)
+                    if not complete and not slow and not strict:
                         self._remember_split(scene_dir, memory, self._part_sig(part, cap))
-                    if not complete and not slow:
+                    if not complete and not slow and not strict:
                         if self._split_part(part, queue):
                             logger.warning("Scene %s: the last line did not fit, so the scene is split into more clips "
                                            "(nothing is cut).", scene.scene_number)
@@ -559,7 +609,8 @@ class SceneRenderer:
             if n == 0 and t2v and not continuing and not _nonempty(wide_path):
                 ctx.call(self.ff.extract_frame, raw, wide_path)
                 ctx.set_scene_image(wide_path)
-            ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE)
+            ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE,
+                     settings.CLIP_TRIM_HEAD_SECONDS, settings.CLIP_TRIM_TAIL_SECONDS)
             fitted.append(fit)
             chain_sig = key
             n += 1
@@ -597,19 +648,32 @@ class SceneRenderer:
         mode = (video_mode or settings.VIDEO_MODE or "i2v").strip().lower()
         mode = "t2v" if mode == "t2v" else "i2v"
         style_mode = (scene_style or settings.SCENE_MODE or "shots").strip().lower()   # per-project choice wins
-        style_mode = style_mode if style_mode in ("whole", "shots", "reuse", "film") else "shots"
-        whole_mode = style_mode in ("whole", "film")   # "film" = whole scenes that carry on from one another
-        reuse = style_mode == "reuse"
-        # Reused footage has no speech of its own, so the voices are always recorded by text-to-speech.
-        model_audio = (settings.AUDIO_MODE or "voices").strip().lower() == "model" and not reuse
+        if settings.WHOLE_ONLY:
+            # v2.31: one scene = one clip. The shot-by-shot / reuse / film styles are retired; anything else is "whole".
+            style_mode = "whole"
+            whole_mode = True
+            reuse = False
+            # A whole-scene clip is always spoken by the video model itself (text-to-speech voices need the shot path).
+            model_audio = True
+        else:
+            style_mode = style_mode if style_mode in ("whole", "shots", "reuse", "film") else "shots"
+            whole_mode = style_mode in ("whole", "film")   # "film" = whole scenes that carry on from one another
+            reuse = style_mode == "reuse"
+            # Reused footage has no speech of its own, so the voices are always recorded by text-to-speech.
+            model_audio = (settings.AUDIO_MODE or "voices").strip().lower() == "model" and not reuse
         free_cam = pb.is_free_camera(settings.VIDEO_CAMERA_MOTION)
         narrator = bool(settings.NARRATOR_ENABLED if narrator is None else narrator)   # per-project choice wins
 
         # A scene that carries on from the previous one starts from that clip's last picture (same people, same place).
-        prev_clip = prev_clip if (getattr(scene, "continues_previous", False) and prev_clip and os.path.exists(prev_clip)) else None
+        approved = self._approved_image(scene_dir, scene)
+        # A scene whose opening picture the user approved starts from THAT picture, not from the previous clip's last frame.
+        prev_clip = prev_clip if (getattr(scene, "continues_previous", False) and prev_clip and os.path.exists(prev_clip) and not approved) else None
         prev_sig = f"{os.path.getsize(prev_clip)}:{int(os.path.getmtime(prev_clip))}" if prev_clip else ""
         fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds, prev_sig, resolution, style_mode)
-        may_reuse = self._prepare_dir(scene_dir, fp, self._picture_fingerprint(scene, characters, style, mode, prev_sig, resolution))
+        pic_fp = self._picture_fingerprint(scene, characters, style, mode, prev_sig, resolution, approved)
+        if approved:
+            fp = hashlib.sha1((fp + pic_fp).encode()).hexdigest()   # a new approved picture makes every earlier result stale
+        may_reuse = self._prepare_dir(scene_dir, fp, pic_fp)
         final_path = os.path.join(scene_dir, "scene_final.mp4")
         if may_reuse and _nonempty(final_path):
             wide = os.path.join(scene_dir, "keyframe.png")

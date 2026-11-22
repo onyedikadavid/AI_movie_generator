@@ -379,7 +379,7 @@ class ActionError(Exception):
 
 
 _START_FROM = {
-    ProjectStatus.SCRIPT_READY, ProjectStatus.FAILED, ProjectStatus.CANCELLED,
+    ProjectStatus.SCRIPT_READY, ProjectStatus.IMAGES_READY, ProjectStatus.FAILED, ProjectStatus.CANCELLED,
     ProjectStatus.PAUSED, ProjectStatus.COMPLETED,
 }
 _RESUME_FROM = {ProjectStatus.PAUSED, ProjectStatus.FAILED, ProjectStatus.CANCELLED}
@@ -393,7 +393,9 @@ def _load(db: Session, project_id: str) -> Project:
 
 
 def _enqueue(db: Session, p: Project, kind: str, fresh: bool) -> Project:
-    from app.tasks.pipeline_tasks import run_asset_pipeline, run_script_breakdown, run_story_continuation  # lazy: avoids a circular import
+    from app.tasks.pipeline_tasks import (  # lazy: avoids a circular import
+        run_asset_pipeline, run_image_pipeline, run_script_breakdown, run_story_continuation,
+    )
 
     had_progress = (p.progress_pct or 0) > 0 or p.status in (ProjectStatus.PAUSED, ProjectStatus.FAILED, ProjectStatus.CANCELLED)
     p.run_token = uuid.uuid4().hex
@@ -426,7 +428,8 @@ def _enqueue(db: Session, p: Project, kind: str, fresh: bool) -> Project:
     db.commit()
 
     try:
-        runner = {"script": run_script_breakdown, "continue": run_story_continuation}.get(kind, run_asset_pipeline)
+        runner = {"script": run_script_breakdown, "continue": run_story_continuation,
+                  "images": run_image_pipeline}.get(kind, run_asset_pipeline)
         task = runner.delay(p.id, p.run_token)
     except Exception as e:  # noqa: BLE001 - Redis/broker unreachable
         logger.error("Couldn't queue project %s: %s", p.id, e)
@@ -456,7 +459,58 @@ def start_generation(db: Session, project_id: str, fresh: Optional[bool] = None)
     has_scenes = db.execute(select(Scene.id).where(Scene.project_id == p.id).limit(1)).first() is not None
     if not has_scenes:
         return _enqueue(db, p, "script", fresh=False)
+    if _needs_image_review(db, p):
+        # Image-first: the pictures are drawn and shown to the user BEFORE any video is made.
+        return _enqueue(db, p, "images", fresh=False)
     return _enqueue(db, p, "assets", fresh=bool(fresh))
+
+
+def _needs_image_review(db: Session, p: Project) -> bool:
+    """A project that goes through a script is drawn first and reviewed; a straight-to-video one has no pictures, and a
+    project that already has finished scenes (made before this step existed) just carries on."""
+    if (p.generation_mode or "script") == "direct" or p.images_approved:
+        return False
+    done = db.execute(select(Scene.id).where(Scene.project_id == p.id, Scene.render_status == "DONE").limit(1)).first()
+    return done is None
+
+
+def approve_images(db: Session, project_id: str) -> Project:
+    """The user is happy with the scene pictures: make the video from them."""
+    p = _load(db, project_id)
+    if p.status in BUSY_STATUSES:
+        raise ActionError(409, "Wait for the project to finish (or pause it) first.")
+    if p.status not in _START_FROM:
+        raise ActionError(409, f"The pictures can't be approved yet (status: {p.status.value}).")
+    scenes = db.execute(select(Scene).where(Scene.project_id == p.id)).scalars().all()
+    if not scenes:
+        raise ActionError(409, "This project has no scenes yet.")
+    if any(not sc.image_path for sc in scenes):
+        raise ActionError(409, "Some scenes have no picture yet - generate the pictures first.")
+    p.images_approved = True
+    p.video_mode = "i2v"
+    db.commit()
+    return _enqueue(db, p, "assets", fresh=False)
+
+
+def start_images(db: Session, project_id: str, redo: bool = False) -> Project:
+    """Draw (or, with redo, redraw) the opening picture of every scene, then stop for review."""
+    p = _load(db, project_id)
+    if p.status in BUSY_STATUSES:
+        raise ActionError(409, f"Project is already {'queued' if p.status in (ProjectStatus.QUEUED, ProjectStatus.CREATED) else 'running'}.")
+    if p.status not in _START_FROM:
+        raise ActionError(409, f"Project isn't ready for pictures yet (status: {p.status.value}).")
+    if (p.generation_mode or "script") == "direct":
+        raise ActionError(409, "A straight-to-video project has no pictures - the video model starts from your idea.")
+    if db.execute(select(Scene.id).where(Scene.project_id == p.id).limit(1)).first() is None:
+        raise ActionError(409, "This project has no scenes yet - write the script first.")
+    if redo:
+        from app.services.scene_images import images_dir
+        shutil.rmtree(images_dir(p.id), ignore_errors=True)
+        for sc in db.execute(select(Scene).where(Scene.project_id == p.id)).scalars().all():
+            sc.image_path = None
+    p.images_approved = False
+    db.commit()
+    return _enqueue(db, p, "images", fresh=False)
 
 
 def start_continuation(db: Session, project_id: str, prompt: Optional[str], scene_count: Optional[int]) -> Project:
@@ -484,6 +538,8 @@ def resume(db: Session, project_id: str) -> Project:
     if p.status not in _RESUME_FROM:
         raise ActionError(409, f"Nothing to resume (status: {p.status.value}).")
     has_scenes = db.execute(select(Scene.id).where(Scene.project_id == p.id).limit(1)).first() is not None
+    if has_scenes and _needs_image_review(db, p):
+        return _enqueue(db, p, "images", fresh=False)
     return _enqueue(db, p, "assets" if has_scenes else "script", fresh=False)
 
 

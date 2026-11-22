@@ -122,6 +122,7 @@ class BibleView:
         key = loc.key if loc else ""
         # Transient attributes (not columns): read by the renderer.
         scene.place_key = key
+        scene.place_id = loc.id if loc else None
         scene.place_text = f"{loc.name}: {loc.description}".strip(": ").strip() if (loc and (loc.description or "").strip()) else (loc.name if loc else "")
         scene.place_desc = (loc.description or "").strip() if loc else ""
         out = []

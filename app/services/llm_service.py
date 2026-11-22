@@ -138,6 +138,15 @@ class LLMService:
             problems.append("no characters were listed")
         return problems
 
+    @staticmethod
+    def _turns_for(secs) -> int:
+        """How many spoken turns a scene of `secs` seconds gets: 2 min = 8 ... 10 min = 24. Talk fills well under half of the
+        take; the rest is the people doing things, so the pace stays calm."""
+        try:
+            return max(6, min(24, 4 + int(secs) // 30))
+        except (TypeError, ValueError):
+            return 8
+
     async def _complete_scenes(self, parsed_data: dict, genre_hint, tone_hint, visual_style_hint, secs: int, compact: bool = False) -> dict:
         """Writes each scene's dialogue and cleans up the model's output (shared by the first script and by
         story continuations). `parsed_data` needs "characters" (everyone who may appear) and "scenes"."""
@@ -164,14 +173,14 @@ class LLMService:
                 # Written whether or not a narrator is on, so switching the narrator off later never leaves a silent scene.
                 if solo is not None:
                     try:
-                        scene["dialogue_turns"] = await self.agent_service.simulate_monologue(solo, goal, lines=2, kids=kids)
+                        scene["dialogue_turns"] = await self.agent_service.simulate_monologue(solo, goal, lines=min(10, 3 + int(secs) // 60), kids=kids)
                     except Exception as e:  # noqa: BLE001
                         logger.warning("Spoken lines for scene %s failed (%s).", scene.get("scene_number"), e)
                         scene["dialogue_turns"] = []
                 continue
             try:
                 scene["dialogue_turns"] = await self.agent_service.simulate_interaction(
-                    char_a, char_b, goal, turns=(2 if secs <= 5 else 3 if secs <= 9 else 4) if (compact or (settings.SCENE_MODE or '').lower() == 'whole') else 4, kids=kids
+                    char_a, char_b, goal, turns=self._turns_for(secs), kids=kids
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Dialogue for scene %s failed (%s) - continuing with narration only.", scene.get("scene_number"), e)
@@ -185,9 +194,10 @@ class LLMService:
             if not sc.get("visual_description"):
                 sc["visual_description"] = sc.get("image_prompt") or sc.get("location") or "A scene from the story."
             try:
-                sc["duration_seconds"] = max(2, min(int(float(sc.get("duration_seconds") or 5)), 120))
+                # v2.31: every scene is one take of the length the user chose (2-10 minutes), not the model's guess.
+                sc["duration_seconds"] = max(120, min(int(float(secs or 120)), 600))
             except (TypeError, ValueError):
-                sc["duration_seconds"] = 5
+                sc["duration_seconds"] = 120
             if not isinstance(sc.get("characters_present"), list):
                 sc["characters_present"] = []
         for ch in parsed_data.get("characters", []) or []:
@@ -251,7 +261,7 @@ class LLMService:
            and move the story forward - never repeat what already happened.
         2. Same characters, same names, same world and tone. Only add a NEW character if the story truly needs one
            (list them in "new_characters" with a full, concrete "appearance_prompt").
-        3. Each new scene is filmed as ONE continuous clip of about {secs} seconds: give it only what fits.
+        3. Each scene is filmed as ONE continuous take of about {secs // 60} minutes in ONE place with no cut: it must hold a whole stretch of the story - several small beats in order (people arrive, talk, react, move, something changes) - enough to fill {secs // 60} minutes at a calm, unhurried pace. Never jump to another place or time inside a scene.
         4. Cause and effect: each scene follows from the one before. Keep it clear for someone who has not read anything.
         5. "continues_previous": true ONLY if the scene continues the same moment in the same place with the same people
            (the camera simply carries on); false if it is a new place or time (a normal cut).
@@ -271,7 +281,7 @@ class LLMService:
                     "image_prompt": "Detailed standalone text-to-image prompt for the keyframe.",
                     "narration_text": "One or two short narrator sentences (under 25 words), never a character's own words.",
                     "characters_present": ["Name1"],
-                    "motion_prompt": "Cinematic camera direction plus what the people DO. When people talk, use a side-on two-shot or over-the-shoulder shots (they face each other); never a camera straight in front of a speaker's face.",
+                    "motion_prompt": "ONE calm camera plan for the whole take (steady, or a very slow drift; never swinging around the people, never cutting) plus what the people DO, step by step, at a relaxed pace. When people talk they face each other, seen from the side in one steady two-shot; never a camera straight in front of a speaker's face.",
                     "sound_design": "Background sounds, 6 to 14 words, no speech, no music.",
                     "duration_seconds": {secs}
                 }}
@@ -412,7 +422,7 @@ class LLMService:
                     "image_prompt": "Detailed standalone text-to-image prompt for the first frame.",
                     "narration_text": "One or two SHORT narrator sentences (under 25 words), never a character's own words.",
                     "characters_present": ["Name1"],
-                    "motion_prompt": "Cinematic camera direction plus what the people DO. When people talk, use a side-on two-shot or over-the-shoulder shots (they face each other); never a camera straight in front of a speaker's face.",
+                    "motion_prompt": "ONE calm camera plan for the whole take (steady, or a very slow drift; never swinging around the people, never cutting) plus what the people DO, step by step, at a relaxed pace. When people talk they face each other, seen from the side in one steady two-shot; never a camera straight in front of a speaker's face.",
                     "sound_design": "Background sounds, 6 to 14 words, no speech, no music.",
                     "duration_seconds": {secs}
                 }}
@@ -469,6 +479,7 @@ class LLMService:
         scene_count: int = None,
         scene_seconds: int = None,
         scene_style: str = None,
+        keep_story: bool = False,
     ) -> ScriptDecompositionSchema:
         """
         Generates full script breakdown utilizing AgentService for character interactions.
@@ -518,9 +529,18 @@ class LLMService:
             count_rule = (f"Choose the number of scenes the story needs - for this prompt usually {lo} to {hi}. "
                           f"Every scene must be a distinct story beat.")
         secs = int(scene_seconds or settings.WHOLE_SCENE_MAX_SECONDS)
-        bible = await self._story_bible(prompt, genre_hint, tone_hint)
-        story_text = bible.pop("story", "") if bible else ""
+        # keep_story: the user's own story is the story. The writer is not asked to rewrite, summarise or "improve" it - it
+        # only cuts it into scenes (in order) and adds what the camera needs (places, looks, sounds, who says what).
+        bible = {} if keep_story else await self._story_bible(prompt, genre_hint, tone_hint)
+        story_text = (prompt or "").strip() if keep_story else (bible.pop("story", "") if bible else "")
         bible_text = ""
+        if keep_story:
+            bible_text = ("\n        THE USER'S STORY - KEEP IT EXACTLY. This is the finished story. Do NOT rewrite it, shorten it, "
+                          "reorder it, change any name, place, event, line of dialogue or the ending, and do NOT add events, "
+                          "characters or twists of your own. Only cut it into scenes IN ITS OWN ORDER and add what the camera "
+                          "needs (what people look like, where they stand, small natural actions, background sounds). Where "
+                          "the story has spoken words, use those exact words.\n        "
+                          + story_text.replace("\n", "\n        ") + "\n")
         if bible:
             bible_text = "\n        STORY BIBLE (your own analysis of the prompt - the film MUST follow it):\n" + "".join(
                 f"        - {k}: {v}\n" for k, v in bible.items() if v
@@ -545,7 +565,7 @@ class LLMService:
         4. CLEAR: a viewer who has not read the prompt must understand who the people are, what they want, what goes wrong
            and how it ends. Use simple, concrete wording. One idea per scene.
         5. {count_rule} Do NOT compress the story into one scene unless the prompt is genuinely a single moment.
-           Each scene is filmed as ONE continuous clip of about {secs} seconds, so give it only what fits in that time.
+           Each scene is filmed as ONE continuous take of about {secs // 60} minutes in ONE place with no cut: it must hold a whole stretch of the story - several small beats in order (people arrive, talk, react, move, something changes) - enough to fill {secs // 60} minutes at a calm, unhurried pace. Never jump to another place or time inside a scene.
         6. Every scene's visuals, narration and mood must match the genre and tone of the story.
         7. PLACES: give every place ONE short, plain name (e.g. "Carpenter Workshop", "Mechanic Workshop", "Cobbler Shop",
            "Jack's House") and write that EXACT name in "location" every time a scene is set there - never reword it,
@@ -575,7 +595,7 @@ class LLMService:
                     "image_prompt": "A detailed, standalone text-to-image prompt for this scene's keyframe - subject(s), action, setting, time of day, lighting and camera framing (e.g. wide shot / medium shot). Sent directly to the image generator, so it must make sense on its own.",
                     "narration_text": "One or two SHORT sentences (under 25 words total) of narrator voiceover that set up this scene, written to be spoken aloud. Describe the situation - never put a character's own words here. In scene 1 this is the HOOK line.",
                     "characters_present": ["Name1", "Name2"],
-                    "motion_prompt": "Cinematic camera direction plus what the people DO, for a few seconds, like a real film: e.g. 'slow dolly-in on the boy as he lowers his head, then a handheld pan to the door' or 'tracking shot following her down the corridor'. Vary the camera from scene to scene (push-in, tracking, pan, handheld, low angle). When people talk, use a side-on two-shot or over-the-shoulder shots so they face each other - never a camera straight in front of a speaker's face, and never a speaker looking into the lens.",
+                    "motion_prompt": "ONE calm camera plan for the whole take plus what the people DO, step by step, at a relaxed natural pace: e.g. 'a steady wide shot, very slow push-in; the boy sits at the bench, picks up the tool, turns it over, looks up when the door opens'. The camera is locked off or drifts very slowly (never swings around the people, never cuts). When people talk, they sit or stand facing each other, seen from the side in one steady two-shot - never a camera straight in front of a speaker's face, and never a speaker looking into the lens.",
                     "sound_design": "The background sounds and effects you would HEAR here - 6 to 14 words, no speech, no music. e.g. 'distant gunfire, helicopter overhead, running footsteps' or 'light wind, birds, far-off market chatter'.",
                     "duration_seconds": {secs}
                 }}

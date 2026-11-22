@@ -14,6 +14,7 @@ class ProjectStatus(str, enum.Enum):
     QUEUED = "QUEUED"                      # Waiting for the (single) worker slot - NOT running yet
     GENERATING_ASSETS = "GENERATING_ASSETS"
     GENERATING_IMAGES = "GENERATING_IMAGES"
+    IMAGES_READY = "IMAGES_READY"          # Every scene's opening picture is drawn - awaiting the user's review before any video
     GENERATING_VIDEOS = "GENERATING_VIDEOS"
     GENERATING_AUDIO = "GENERATING_AUDIO"
     COMPOSITING = "COMPOSITING"
@@ -67,6 +68,9 @@ class Project(Base):
     # "script" (the writer model writes a script you can review first) or "direct" (no writer model: the idea goes
     # straight to the video model). NULL = "script".
     generation_mode = Column(String, nullable=True)
+    # True once the user has looked at the scene pictures and pressed "Make the video".
+    images_approved = Column(Boolean, nullable=True)
+    keep_story = Column(Boolean, nullable=True)      # True: the writer must not rewrite the user's story
     # A pending 'continue the story' request (read by the worker, then cleared).
     continue_prompt = Column(Text, nullable=True)
     continue_scenes = Column(Integer, nullable=True)
