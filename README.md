@@ -1,3 +1,30 @@
+## v2.35.0 - the video model gets the bible pictures (reference images)
+
+- **Why:** LTX / Ovi / MultiTalk only see ONE first picture and a text prompt, so they cannot "pick Michael from the character bible" - after the first seconds they invent faces again. A **reference-image model (Wan VACE)** is handed the bible pictures with the request and keeps them in view for the whole clip.
+- **New notebook `wan_vace_reference_server_kaggle_v1.ipynb`.** Same `/v1/generate` API. It receives the **place picture first, then each character on screen** (speakers first, `VIDEO_REFERENCE_MAX=4`), builds the clip window by window (~5 s each) and gives **each window only the actions that fall inside it** (`window_beats`), so a 2-10 minute scene does not try to do everything in every window.
+- **Backend:** set `VIDEO_REFERENCES=true`. The clip is silent, so every line is spoken whole by the pipeline's voice at the time the prompt gave for its beat (no line can be cut off); the prompt shows the person talking calmly, not the quoted words. Changing a bible picture makes the scene render again (the reference pictures are part of the scene fingerprint).
+- Old notebooks keep working with `VIDEO_REFERENCES=false` (default).
+- Honest limits: not timed on a real GPU; a 2-minute scene is ~25 windows, a 10-minute scene ~120; the lips are not matched to the words; the approved scene picture is not used as the first frame in this mode (the references carry the place and people).
+- Wording fix: "20 s" in the timed-actions note below was an internal limit for tiny "finish the line" clips only; every scene is 2-10 minutes and always gets timed actions.
+
+## v2.34.1 - actions are timed
+
+- In every scene clip each action + line now gets a time in the prompt ("At 0:28 - Sarah rushes to the crib ..., and Sarah says ...: ..."), spread by how long each takes, with the last ~12 % of the clip left quiet (`TIMED_BEATS=true`). Before, the beats were only "First / Then / Next", and a video model that is given many beats in one long clip performs the first few and blurs the rest. Celery has nothing to do with this: it only runs the job, and the actions were already in the prompt.
+- Limits: the video model decides how closely it follows the times; a baby that "arches back and stretches arms up" is still the model's interpretation of the first picture.
+
+## v2.34.0 - scene pictures are the EMPTY place + the real bible characters
+
+- A scene picture is no longer drawn with people in it. The place is drawn EMPTY (once per place; every scene set in the same place gets the same picture), the characters come from the character bible (each drawn once, then cut out of its own picture), and the scene picture is the place with those cut-outs standing in it (a light redraw, `BIBLE_COMPOSE_REFINE=0.25`, blends the light). The video then starts from that picture, so the people in the video are the bible characters. The video model only ever sees that first picture and the text - that is the only way a character reaches it.
+- Describing a scene's picture on the review screen now describes only its PLACE; the characters are always added from the bible.
+- Scenes are never chained to the previous scene (each starts from its own picture; Michael can leave the palace and the next scene can be a battlefield). Only clips inside ONE scene carry on from each other when the video server's limit forces more than one clip.
+- Needs the new SDXL notebook (`sdxl_image_server_v3_compose.ipynb`: /v1/cutout and /v1/compose-scene). With an older notebook the previous way is used (characters drawn into the scene).
+- Scene length: the Kaggle LTX launch cell caps clips with `LTX_MAX_FRAMES` (600 = about 25 s). For 2 to 10 minutes set it to 2880 (2 min) ... 14400 (10 min), and expect very long renders on a T4.
+
+## v2.33.1 - every line spoken (model voice), without making the long clip again
+
+- With `AUDIO_MODE=model` the video model speaks the lines. A 2-10 minute clip is never generated a second time just because its last line was cut off (that would cost hours). Instead (`SPEECH_TAIL_PATCH=true`): the clip is cut back to the pause before the unfinished line, and only that line is made in a short extra clip that continues from that exact frame (same people, place and voices) and is joined on. If that short clip is cut off too, it is made again longer (`SPEECH_MAX_RETRIES`), and as a last resort the pipeline voice says that one line (`SPEECH_FALLBACK_TTS`).
+- Limits: the check finds a line cut off at the END of a clip. A line the model silently skips in the middle cannot be detected without speech-to-text (not added yet). The cut needs a clear pause before the last line; if there is none, the log says so.
+
 ## v2.33.0 - keep my story, chat with the writer, music bed, no character limit
 
 - **Keep my story exactly** (new-project checkbox, on by default, `projects.keep_story`): the writer no longer rewrites your story. It only cuts it into scenes in order and adds what the camera needs; spoken words in your story are used as written.

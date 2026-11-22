@@ -192,12 +192,18 @@ class VideoGenerationService:
         want_audio: bool = False,
         resolution: str = None,
         audio_path: str = None,
+        reference_images: list = None,
+        reference_has_place: bool = False,
+        window_beats: list = None,
     ) -> str:
         """Image-to-video: render one short clip that starts from `image_path`.
+        reference_images: pictures a reference-image model (Wan VACE notebook) keeps in view for the WHOLE clip - the place
+        first (reference_has_place=True), then the people. image_path may then be None.
         want_audio=True also returns the model's own sound (its voices + effects) inside the mp4.
         audio_path: for audio-driven models (MultiTalk / InfiniteTalk / Hunyuan Avatar) - the audio the face is animated
         to. The server then makes the clip as long as that audio."""
-        if not os.path.exists(image_path):
+        refs = [r for r in (reference_images or []) if r and os.path.exists(r)]
+        if not refs and (not image_path or not os.path.exists(image_path)):
             raise RuntimeError(f"Keyframe image not found at {image_path}; cannot generate video.")
         data = {
             "motion_prompt": prompt,
@@ -211,15 +217,34 @@ class VideoGenerationService:
         if seed is not None:
             data["seed"] = str(int(seed))
         # The image is sent as file BYTES (the GPU is on another machine and can't read this disk).
-        with open(image_path, "rb") as fh:
-            image_bytes = fh.read()
-        files = {"image": (os.path.basename(image_path), image_bytes, "image/png")}
+        image_bytes = b""
+        files = {}
+        if image_path and os.path.exists(image_path):
+            with open(image_path, "rb") as fh:
+                image_bytes = fh.read()
+            files["image"] = (os.path.basename(image_path), image_bytes, "image/png")
+        if refs:
+            multi, h = [], hashlib.sha1()
+            for r in refs:
+                with open(r, "rb") as fh:
+                    b = fh.read()
+                h.update(hashlib.sha1(b).digest())
+                multi.append(("reference_images", (os.path.basename(r), b, "image/png")))
+            data["references_have_place"] = "1" if reference_has_place else ""
+            if window_beats:
+                # [(second, "what happens then"), ...]: a long clip is made window by window and each window gets its own actions.
+                data["window_beats"] = json.dumps([[round(float(a), 2), str(b)] for a, b in window_beats])
+            data["references_sha1"] = h.hexdigest()          # part of the job key: other references = other job
+            files = list(files.items()) + multi
         if audio_path:
             if not os.path.exists(audio_path):
                 raise RuntimeError(f"Audio for the shot not found at {audio_path}; cannot generate the talking clip.")
             with open(audio_path, "rb") as fh:
                 audio_bytes = fh.read()
-            files["audio"] = (os.path.basename(audio_path), audio_bytes, "audio/wav")
+            if isinstance(files, list):
+                files.append(("audio", (os.path.basename(audio_path), audio_bytes, "audio/wav")))
+            else:
+                files["audio"] = (os.path.basename(audio_path), audio_bytes, "audio/wav")
             data["audio_sha1"] = hashlib.sha1(audio_bytes).hexdigest()   # part of the job key: other audio = other job
         atomic_write(output_path, self._post(data, files, image_bytes))
         return output_path

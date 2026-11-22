@@ -171,6 +171,10 @@ class Settings(BaseSettings):
     # A line still cut off after the retries: first split the scene so it gets its own, longer clip; if even that fails,
     # the line is spoken by the pipeline's own voice over the picture, so the full sentence is ALWAYS heard.
     SPEECH_FALLBACK_TTS: bool = True
+    # Model voice, long scenes: a clip is NOT generated again for a cut-off last line (hours of GPU). Instead the clip is
+    # cut back to the pause before that line, and ONLY the unfinished line(s) are made in a short extra clip that carries
+    # on from that exact frame (same people, place and voices) and is joined on. Nothing is left half-spoken.
+    SPEECH_TAIL_PATCH: bool = True
     # A clip that took longer than this to render is NEVER rendered again or split because its last word seems cut
     # off (on a T4 one clip takes 25-40 min; doing it twice is worse than a slightly clipped last word). It is kept;
     # a single line may still be finished by the pipeline's voice (SPEECH_FALLBACK_TTS). Fast GPUs stay under it and
@@ -257,9 +261,17 @@ class Settings(BaseSettings):
     # --- v2.32 cast & places drawn BEFORE the scene pictures (the "bible pictures") ---
     BIBLE_PICTURES: bool = True                # draw every character and place once, then reuse those pictures everywhere
     BIBLE_MAX_CHARACTERS: int = 0              # 0 = no limit: every character the story has gets a picture
+    BIBLE_COMPOSE: bool = True                 # a scene picture = the place's EMPTY picture + the bible characters cut out and placed in it
+    BIBLE_COMPOSE_REFINE: float = 0.25         # light redraw (0 = none) that blends the cut-outs into the light of the place
     BIBLE_REF_MAX: int = 4                     # most character pictures the image model can follow in ONE scene picture (speakers first); the rest are drawn from the text
     BIBLE_REF_SCALE: float = 0.7               # how strongly the character pictures steer a scene picture (0-1)
     BIBLE_PLACE_STRENGTH: float = 0.72         # how far a scene picture may move away from its place's picture (1 = ignore it)
+    # v2.35: reference-image video model (Wan VACE notebook). The bible pictures (the PLACE first, then each character on screen)
+    # are sent WITH the request and the model keeps them in view for every moment of the clip, instead of only seeing a
+    # first frame. The model makes no sound: lines are spoken by the pipeline's voice (TTS) at the times the prompt gives.
+    VIDEO_REFERENCES: bool = False
+    VIDEO_REFERENCE_MAX: int = 4            # people sent as references (the place is extra)
+    TIMED_BEATS: bool = True                   # long clips: each action + line gets a time ("At 0:45 - ...") so the model performs them all
     CALM_STAGING: bool = True
     # Cut this much off the start / end of every long generated clip (where the picture smears). 0 = keep everything.
     CLIP_TRIM_HEAD_SECONDS: float = 0.3

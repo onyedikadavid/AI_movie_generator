@@ -168,7 +168,7 @@ class SceneRenderer:
         return hashlib.sha1(blob.encode()).hexdigest()
 
     # Files that outlive a settings change (finished GPU work). Everything else in the folder is cheap to rebuild.
-    _KEEP = re.compile(r"^(whole_\d+_raw\.mp4(\.key)?|shot_\d+_raw\.mp4(\.key)?|split_memory\.json|keyframe\.png|"
+    _KEEP = re.compile(r"^(whole_\d+_raw\.mp4(\.key|\.cut)?|shot_\d+_raw\.mp4(\.key)?|split_memory\.json|keyframe\.png|"
                        r"start_frame\.png|closeup_.+\.png|picture\.txt|fingerprint\.txt)$")
 
     def _prepare_dir(self, scene_dir: str, fingerprint: str, picture_fp: str = "") -> bool:
@@ -440,6 +440,41 @@ class SceneRenderer:
         logger.warning("The video model kept cutting off \"%s\" - the line is now spoken by the pipeline's own voice so "
                        "it is heard in full.", seg.text[:60])
 
+    def _voice_over(self, ctx, raw: str, part, beats, request_len: float, cast) -> None:
+        """A reference-image model (Wan VACE) makes a SILENT clip. Each line is spoken whole by the pipeline's voice at the
+        time the prompt gave for its beat (so the action and the words line up), and put on the clip."""
+        from app.services import prompt_builder as _pb
+        starts = _pb.beat_seconds(beats, request_len)
+        items, cursor = [], 0.8
+        for i, seg in enumerate(part):
+            if not seg.text:
+                continue
+            wav = f"{raw}.v{i}.mp3"
+            profile = cast.profile(seg.speaker, seg.expression, seg.action, seg.text)
+            ctx.call(self.tts.synthesize, seg.text, profile, wav, seg.speaker)
+            t = max(starts[i] if starts else cursor, cursor)
+            items.append((wav, t))
+            cursor = t + self.ff.get_duration(wav) + 0.5
+        if not items:
+            return
+        out = raw + ".voices.mp4"
+        ctx.call(self.ff.overlay_voices, raw, items, out)
+        os.replace(out, raw)
+        for w, _ in items:
+            try:
+                os.remove(w)
+            except OSError:
+                pass
+
+    def _reference_pictures(self, project_id, scene, on_screen, segments):
+        """(files, has_place): the bible pictures a reference-image model keeps in view - the PLACE first, then the people on
+        screen (the ones who speak first), at most VIDEO_REFERENCE_MAX of them."""
+        from app.services import bible_assets
+        spoke = [sg.speaker for sg in segments if getattr(sg, "kind", "") == "dialogue" and sg.speaker]
+        people, place = bible_assets.references_for(project_id, on_screen, getattr(scene, "place_id", None), speakers=spoke)
+        people = people[: max(1, int(settings.VIDEO_REFERENCE_MAX))]
+        return ([place] if place else []) + people, bool(place)
+
     def _render_whole(self, scene, characters, style, cast, scene_dir, project_id, ctx, segments, mode,
                       on_screen, may_reuse, final_path, scene_seconds=None, prev_clip=None, resolution=None):
         """One clip per scene (or per `WHOLE_SCENE_MAX_SECONDS` piece of a long one). Returns None when the server
@@ -473,6 +508,14 @@ class SceneRenderer:
         logger.info("Scene %s plan (clip ceiling %.1f s): %s", scene.scene_number, cap,
                     " | ".join(f"clip {i + 1}: {self._describe(pt)}" for i, pt in enumerate(parts)))
         t2v = mode == "t2v"
+        ref_files, ref_place = [], False
+        if settings.VIDEO_REFERENCES:
+            ref_files, ref_place = self._reference_pictures(project_id, scene, on_screen, segments)
+            if ref_files:
+                logger.info("Scene %s: the video model gets %d bible picture(s) as references for the whole clip (%s).",
+                            scene.scene_number, len(ref_files), "place first, then people" if ref_place else "people")
+        refmode = bool(ref_files)
+        ref_sig = hashlib.sha1("|".join(f"{os.path.basename(r)}:{os.path.getsize(r)}" for r in ref_files).encode()).hexdigest()[:12] if refmode else ""
         wide_path = os.path.join(scene_dir, "keyframe.png")
         ctx.stage(STAGE_AUDIO, 0.05, "Preparing the scene")
         source = None
@@ -508,8 +551,10 @@ class SceneRenderer:
         planned = len(parts)
         n = 0
         chain_sig = ""
+        tails: set = set()          # ids of the short "finish the line" clips that were queued after a cut-off line
         while queue:
             part = queue.popleft()
+            is_tail = id(part) in tails
             ctx.checkpoint()
             if part and not strict and self._part_sig(part, cap) in memory:
                 # An earlier run already found that these lines do not fit in one clip (after hours of GPU time).
@@ -532,7 +577,7 @@ class SceneRenderer:
             if not part and getattr(scene, "duration_seconds", None):
                 # Nobody speaks in this clip (e.g. a "straight to video" idea): ask for the length that was chosen.
                 request_len = min(max(float(scene.duration_seconds), 3.0), cap)
-            if each_floor:
+            if each_floor and not is_tail:
                 # The scene was asked for at this length (or longer than one clip): share it out evenly.
                 request_len = min(max(request_len if part else 0.0, each_floor, 3.0), cap)
             # A later piece of the scene carries on from the last picture of the piece before it.
@@ -540,26 +585,36 @@ class SceneRenderer:
             if n > 0 and fitted:
                 part_source = os.path.join(scene_dir, f"whole_{n}_start.png")
                 ctx.call(self.ff.extract_last_frame, fitted[-1], part_source)
+            win = {}
             prompt = pb.whole_scene_prompt(
                 beats, on_screen, self._place(scene), scene.visual_description, style, scene.motion_prompt,
                 getattr(scene, "sound_design", None), start_image=bool(continuing or (n > 0 and part_source)),
+                clip_seconds=request_len, silent=refmode, parts_out=win,
             )
+            win_base, win_steps = win.get("base", ""), list(win.get("steps") or [])
             seed = _seed(project_id, scene.scene_number, "whole", n)
             raw = os.path.join(scene_dir, f"whole_{n}_raw.mp4")
             fit = os.path.join(scene_dir, f"whole_{n}.mp4")
             key = hashlib.sha1(
-                f"whole|{mode}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(part_source or '')}|{chain_sig}".encode()
+                f"whole|{mode}|{prompt}|{request_len:.2f}|{seed}|{os.path.basename(part_source or '')}|{chain_sig}|{ref_sig}".encode()
             ).hexdigest()
             key_file = raw + ".key"
             stored = open(key_file).read().strip() if os.path.exists(key_file) else None
 
-            def render(length: float, shift: int = 0, _prompt=prompt, _seed0=seed, _src=part_source, _raw=raw):
+            def render(length: float, shift: int = 0, _prompt=prompt, _seed0=seed, _src=part_source, _raw=raw,
+                       _wb=win_base, _ws=win_steps):
                 seed_now = _seed0 + shift
-                if t2v and _src is None:
+                if refmode:
+                    ctx.call(self.video.generate_clip, _src, _raw, (_wb or _prompt), length, seed_now, False, resolution=resolution,
+                             reference_images=ref_files, reference_has_place=ref_place, window_beats=_ws or None)
+                elif t2v and _src is None:
                     ctx.call(self.video.generate_text_clip, _prompt, _raw, length, seed_now, True, resolution=resolution)
                 else:
                     ctx.call(self.video.generate_clip, _src, _raw, _prompt, length, seed_now, True, resolution=resolution)
 
+            cut_file = raw + ".cut"
+            if not (may_reuse and _nonempty(raw) and stored == key) and os.path.exists(cut_file):
+                os.remove(cut_file)          # a new clip: the old cut point means nothing
             if may_reuse and _nonempty(raw) and stored == key:
                 reused += 1
                 logger.info("Scene %s clip %d: finished earlier - reusing it (%s).", scene.scene_number, n + 1,
@@ -582,13 +637,16 @@ class SceneRenderer:
                                    "lower VIDEO_T2V_RESOLUTION or WHOLE_SCENE_MAX_SECONDS.", scene.scene_number, request_len, got)
                 # Was the last line finished? If not: generate again, longer; then give it a clip of its own; then
                 # (last resort) say it with the pipeline's own voice. A line is never left cut off.
-                if settings.SPEECH_COMPLETE_CHECK and any(sg.text for sg in part):
+                if refmode and any(sg.text for sg in part):
+                    # Silent clip: the pipeline's voice says every line whole, so no line can be cut off.
+                    self._voice_over(ctx, raw, part, beats, request_len, cast)
+                elif settings.SPEECH_COMPLETE_CHECK and any(sg.text for sg in part):
                     complete = self._finish_the_line(ctx, raw, request_len, render, n, "Scene part", allow_regen=not slow)
                     if not complete and slow:
                         logger.warning("Scene %s clip %d: its last word may be clipped, but the clip took %d min to render, "
                                        "so it is kept (SPEECH_RETRY_MAX_RENDER_SECONDS=%d) instead of being rendered again.",
                                        scene.scene_number, n + 1, int(took // 60), int(settings.SPEECH_RETRY_MAX_RENDER_SECONDS))
-                    if not complete and not slow and strict:
+                    if not complete and not slow and strict and not (settings.SPEECH_TAIL_PATCH and len(part) > 1 and not is_tail):
                         logger.warning("Scene %s clip %d: the last line may be clipped. Strict whole-scene mode keeps ONE "
                                        "clip per scene instead of splitting it (WHOLE_SCENE_STRICT=false allows a split).",
                                        scene.scene_number, n + 1)
@@ -602,14 +660,33 @@ class SceneRenderer:
                                 if os.path.exists(f):
                                     os.remove(f)
                             continue
-                    if not complete and settings.SPEECH_FALLBACK_TTS and len(part) == 1:
+                    if not complete and strict and settings.SPEECH_TAIL_PATCH and len(part) > 1 and not is_tail:
+                        cut_t = self.ff.last_speech_start(raw, margin_db=float(settings.SPEECH_TAIL_MARGIN_DB))
+                        if cut_t:
+                            with open(cut_file, "w") as fh:
+                                fh.write(f"{max(0.5, cut_t - 0.25):.3f}")
+                            logger.warning("Scene %s clip %d: the last line was cut off. The clip is cut back to the pause before it "
+                                           "(%.1f s) and that line is made again in a short clip that carries on.",
+                                           scene.scene_number, n + 1, cut_t)
+                        else:
+                            logger.warning("Scene %s clip %d: the last line may be clipped and there is no clear pause before it "
+                                           "to cut back to.", scene.scene_number, n + 1)
+                    if not complete and settings.SPEECH_FALLBACK_TTS and len(part) == 1 and not os.path.exists(cut_file):
                         self._dub_with_tts(ctx, raw, part[0], cast)
                 with open(key_file, "w") as fh:
                     fh.write(key)
             if n == 0 and t2v and not continuing and not _nonempty(wide_path):
                 ctx.call(self.ff.extract_frame, raw, wide_path)
                 ctx.set_scene_image(wide_path)
-            ctx.call(self.ff.normalize_clip, raw, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE,
+            src_clip = raw
+            if os.path.exists(cut_file) and not is_tail and len(part) > 1:
+                # Keep everything up to the pause before the unfinished line; the line itself comes in the next clip.
+                src_clip = raw + ".cut.mp4"
+                ctx.call(self.ff.trim_clip, raw, float(open(cut_file).read().strip()), src_clip)
+                tail_part = part[-1:]
+                tails.add(id(tail_part))
+                queue.appendleft(tail_part)
+            ctx.call(self.ff.normalize_clip, src_clip, fit, W, H, FPS, settings.OUTPUT_SHARPEN, settings.VIDEO_INTERPOLATE,
                      settings.CLIP_TRIM_HEAD_SECONDS, settings.CLIP_TRIM_TAIL_SECONDS)
             fitted.append(fit)
             chain_sig = key
@@ -671,6 +748,12 @@ class SceneRenderer:
         prev_sig = f"{os.path.getsize(prev_clip)}:{int(os.path.getmtime(prev_clip))}" if prev_clip else ""
         fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds, prev_sig, resolution, style_mode)
         pic_fp = self._picture_fingerprint(scene, characters, style, mode, prev_sig, resolution, approved)
+        if settings.VIDEO_REFERENCES:
+            # The bible pictures are part of what the clip is made from: a redrawn character or place renders the scene again.
+            from app.services import bible_assets
+            _rf, _rp = bible_assets.references_for(project_id, self._characters_on_screen(scene, characters), getattr(scene, "place_id", None))
+            _sig = ":".join(f"{os.path.basename(f)}-{os.path.getsize(f)}" for f in list(_rf) + ([_rp] if _rp else []))
+            fp = hashlib.sha1((fp + "|refs|" + _sig).encode()).hexdigest()
         if approved:
             fp = hashlib.sha1((fp + pic_fp).encode()).hexdigest()   # a new approved picture makes every earlier result stale
         may_reuse = self._prepare_dir(scene_dir, fp, pic_fp)

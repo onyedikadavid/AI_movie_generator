@@ -30,6 +30,7 @@ def main():
     try:
         settings.STORAGE_DIR = tmp
         settings.BIBLE_PICTURES = True
+        settings.BIBLE_COMPOSE = False      # the older IP-Adapter way is checked first; the cut-out way below
         mike = NS(id="c1", name="Michael", description="a short boy", appearance_prompt="short boy, blonde hair", core_look="short boy, blonde hair, freckles",
                   outfit="a red shirt", gender="male", age_group="child")
         obi = NS(id="c2", name="Obinna", description="a tall man", appearance_prompt="tall man", core_look=None, outfit=None, gender="male", age_group="adult")
@@ -85,6 +86,48 @@ def main():
         prompt = ba.character_prompt(mike, "Cinematic", prompt="short boy with golden curls")
         assert "golden curls" in prompt and "freckles" not in prompt
         print("OK 4: the user's words replace the look; the scenes that show the character are found")
+        # ---- v2.34: the scene picture is the EMPTY place + the bible characters cut out of their own pictures
+        settings.BIBLE_COMPOSE = True
+
+        class Img2(Img):
+            def __init__(self, can=True):
+                super().__init__(); self.can, self.cuts, self.composed = can, [], []
+
+            def cutout(self, src, dst):
+                if not self.can:
+                    return False
+                self.cuts.append(os.path.basename(src)); Image.new("RGBA", (50, 100), (1, 2, 3, 255)).save(dst); return True
+
+            def compose_scene(self, bg, people, out, prompt="", negative="", refine=0.0, seed=None, width=None, height=None):
+                if not self.can:
+                    return False
+                self.composed.append((os.path.basename(bg), [os.path.basename(p) for p, _ in people], [round(h, 2) for _, h in people], prompt))
+                Image.new("RGB", (64, 64)).save(out); return True
+
+        ba.draw_character(Img(), mike, "Cinematic", "p1"); ba.draw_character(Img(), obi, "Cinematic", "p1"); ba.draw_place(Img(), hut, "Cinematic", "p1")
+        scene.characters_present = ["Michael"]
+        scene.dialogue_turns = [{"speaker": "Michael", "text": "hi"}]
+        i3 = Img2()
+        out = scene_images.draw(i3, scene, [mike, obi], "Cinematic", "p1")
+        bg, names, heights, kp = i3.composed[-1]
+        assert bg == "place_l1.png", bg                                   # the empty place, shared by every scene set there
+        assert names == ["character_c1_cut.png"], names                   # only Michael, from his own bible picture
+        assert heights == [0.44 * 1.0], heights                           # a child stands shorter than a grown-up
+        assert not any("scene" in c["prompt"] and "Michael" in c["prompt"] and "wearing" in c["prompt"] for c in i3.calls), "nobody is drawn inside the scene"
+        assert os.path.getsize(out) > 0
+        print("OK 6: scene picture = the empty place + Michael cut out of his bible picture (no one drawn inside the scene)")
+        scene.place_id = None
+        i4 = Img2()
+        scene_images.draw(i4, scene, [mike, obi], "Cinematic", "p1")
+        assert i4.calls and "no people" in i4.calls[0]["prompt"], "a scene without a known place gets its own EMPTY place"
+        assert i4.composed[-1][0] == "environment_scene1.png"
+        scene_images.draw(i4, scene, [mike, obi], "Cinematic", "p1", prompt="a stone battlefield at dawn")
+        assert "battlefield" in i4.calls[-1]["prompt"] and "no people" in i4.calls[-1]["prompt"]
+        print("OK 7: a different place per scene; the user's words draw an empty place for that scene")
+        old = Img2(can=False)
+        scene_images.draw(old, scene, [mike, obi], "Cinematic", "p1")
+        assert old.calls[-1].get("references"), "an older image notebook: fall back to the IP-Adapter way"
+        print("OK 8: an older notebook still works (falls back)")
         print("ALL PASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

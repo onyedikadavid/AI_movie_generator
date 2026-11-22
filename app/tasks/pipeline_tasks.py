@@ -526,7 +526,7 @@ def _asset_body(db, project: Project, ctl: RunControl) -> None:
             db.commit()
 
         prev_clip = None
-        if getattr(scene, "continues_previous", False) and i > 0:
+        if getattr(scene, "continues_previous", False) and i > 0 and not settings.WHOLE_ONLY:   # v2.34: every scene starts from its own picture
             prev_clip = os.path.join(project_root, f"scene_{scenes[i - 1].scene_number}", "scene_final.mp4")
         sctx = _SceneCtx(db, project, scene, ctl, i, total)
         try:

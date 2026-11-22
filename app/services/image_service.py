@@ -139,3 +139,60 @@ class ImageGenerationService:
         image.save(tmp)
         os.replace(tmp, output_path)
         return output_path
+
+    # ------------------------------------------------------------------ cut-outs and composing (SDXL notebook v3)
+    @staticmethod
+    def _route(route: str):
+        url = resolve_url(KEY_IMAGE_API_URL, settings.IMAGE_API_URL)
+        if not url:
+            return None
+        return url.rsplit("/v1/", 1)[0] + route if "/v1/" in url else url.rstrip("/") + route
+
+    def _post_png(self, route: str, data: dict, files: list, output_path: str, what: str) -> bool:
+        """True = the PNG was saved. False = this image server is an older notebook that does not have the route."""
+        url = self._route(route)
+        if not url:
+            return False
+        last = None
+        for attempt in (1, 2, 3):
+            try:
+                with httpx.Client(timeout=httpx.Timeout(900.0, connect=30.0), headers=GPU_HEADERS) as client:
+                    response = client.post(url, data=data, files=files)
+            except (httpx.ConnectError, *TRANSIENT) as e:
+                last = e
+                time.sleep(3 * attempt)
+                continue
+            if response.status_code in (404, 405):
+                return False
+            if response.status_code in TRANSIENT_STATUS and attempt < 3:
+                time.sleep(4 * attempt)
+                continue
+            if response.status_code != 200:
+                raise RuntimeError(explain(response, what))
+            if not response.content.startswith(b"\x89PNG"):
+                raise RuntimeError(explain(response, what + " (did not return a PNG)"))
+            atomic_write(output_path, response.content)
+            return True
+        raise RuntimeError(f"{what}: the image server could not be reached ({last!r}).")
+
+    def cutout(self, source_path: str, output_path: str) -> bool:
+        """The person in `source_path` without the background (transparent PNG), made by the image notebook."""
+        with open(source_path, "rb") as fh:
+            files = [("image", (os.path.basename(source_path), fh.read(), "image/png"))]
+        return self._post_png("/v1/cutout", {}, files, output_path, "Cutting the character out")
+
+    def compose_scene(self, background: str, people: list, output_path: str, prompt: str = "", negative: str = "",
+                      refine: float = 0.0, seed: int = None, width: int = None, height: int = None) -> bool:
+        """The empty place with the bible characters (`people` = [(cut-out png, height as a fraction of the picture)]) standing
+        in it, left to right, then a light redraw so they take the light of the place."""
+        files = [("background", (os.path.basename(background), open(background, "rb").read(), "image/png"))]
+        heights = []
+        for path, frac in people:
+            files.append(("people", (os.path.basename(path), open(path, "rb").read(), "image/png")))
+            heights.append(f"{float(frac):.3f}")
+        data = {"prompt": prompt, "negative_prompt": negative, "refine_strength": f"{float(refine):.3f}",
+                "heights": ",".join(heights), "width": str(int(width or settings.IMAGE_WIDTH)),
+                "height": str(int(height or settings.IMAGE_HEIGHT))}
+        if seed is not None:
+            data["seed"] = str(int(seed))
+        return self._post_png("/v1/compose-scene", data, files, output_path, "Placing the characters in the scene")

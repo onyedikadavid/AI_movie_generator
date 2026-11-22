@@ -56,10 +56,56 @@ def _publish(project_id: str, scene_number: int, path: str) -> str:
     return publish_file(path, f"projects/{project_id}/images/scene_{scene_number}_{uuid.uuid4().hex[:8]}.png")
 
 
+def _compose(image_service, scene, on_screen, style, project_id, prompt, variant) -> Optional[str]:
+    """The scene picture = the scene's EMPTY place + the bible characters cut out and placed in it. Nobody is drawn inside
+    the place, so the people in the picture ARE the bible pictures. None = this image notebook cannot compose (old one)."""
+    from app.services import bible_assets as ba
+    dest = approved_path(project_id, scene.scene_number)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    place = ba.place_path(project_id, getattr(scene, "place_id", None) or "none")
+    words = (prompt or "").strip()
+    if words:       # the user described this scene's place: draw it empty, just for this scene
+        env = ba.draw_environment(image_service, words, style, project_id, f"scene{scene.scene_number}", variant or 1)
+    elif _nonempty(ba.environment_path(project_id, f"scene{scene.scene_number}")):
+        env = ba.environment_path(project_id, f"scene{scene.scene_number}")     # a place this scene was given of its own
+    elif getattr(scene, "place_id", None) and _nonempty(place):
+        env = place                    # the same place as the other scenes set there: the SAME picture
+    else:
+        env = ba.draw_environment(
+            image_service, getattr(scene, "place_desc", "") or scene.visual_description or scene.location or "", style,
+            project_id, f"scene{scene.scene_number}")
+    speakers = [str(t.get("speaker")).strip().lower() for t in (getattr(scene, "dialogue_turns", None) or []) if isinstance(t, dict)]
+    ordered = sorted(list(on_screen), key=lambda c: (0 if c.name.strip().lower() in speakers else 1,
+                                                     speakers.index(c.name.strip().lower()) if c.name.strip().lower() in speakers else 0))
+    people = []
+    for c in ordered[: max(1, int(settings.BIBLE_REF_MAX))]:
+        cut = ba.ensure_cutout(image_service, project_id, c)
+        if cut is None and _nonempty(ba.character_path(project_id, c.id)):
+            return None                # the notebook cannot cut people out: use the older way
+        if cut:
+            people.append((cut, ba.height_fraction(c)))
+    tmp = dest + ".part.png"
+    if not people:
+        shutil.copyfile(env, tmp)
+    else:
+        base = (prompt or "").strip() or scene.image_prompt or scene.visual_description
+        kp = pb.keyframe_prompt(base, on_screen, style, getattr(scene, "place_desc", ""))
+        seed = _seed(project_id, getattr(scene, "place_key", "") or scene.scene_number, "wide") + 7919 * int(variant)
+        if not image_service.compose_scene(env, people, tmp, kp, pb.image_negative(style),
+                                           float(settings.BIBLE_COMPOSE_REFINE), seed):
+            return None
+    os.replace(tmp, dest)
+    return dest
+
+
 def draw(image_service, scene, scene_chars, style: str, project_id: str, prompt: Optional[str] = None, variant: int = 0) -> str:
     """Draws the scene's opening picture and stores it as the scene's approved picture. `prompt` (the user's own words)
     replaces the scene's picture description; the cast's looks, the place and the style are still added around it."""
     on_screen = SceneRenderer._characters_on_screen(scene, scene_chars)
+    if settings.BIBLE_PICTURES and settings.BIBLE_COMPOSE:
+        composed = _compose(image_service, scene, on_screen, style, project_id, prompt, variant)
+        if composed:
+            return composed
     base = (prompt or "").strip() or scene.image_prompt or scene.visual_description
     kp = pb.keyframe_prompt(base, on_screen, style, getattr(scene, "place_desc", ""))
     seed = _seed(project_id, getattr(scene, "place_key", "") or scene.scene_number, "wide") + 7919 * int(variant)

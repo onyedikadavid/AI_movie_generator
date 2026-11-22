@@ -35,6 +35,14 @@ def character_path(project_id: str, character_id: str) -> str:
     return os.path.join(bible_dir(project_id), f"character_{character_id}.png")
 
 
+def cutout_path(project_id: str, character_id: str) -> str:
+    return os.path.join(bible_dir(project_id), f"character_{character_id}_cut.png")
+
+
+def environment_path(project_id: str, key) -> str:
+    return os.path.join(bible_dir(project_id), f"environment_{key}.png")
+
+
 def place_path(project_id: str, location_id: str) -> str:
     return os.path.join(bible_dir(project_id), f"place_{location_id}.png")
 
@@ -103,6 +111,47 @@ def draw_place(image_service, loc, style: str, project_id: str, prompt: Optional
     return dest
 
 
+def height_fraction(char) -> float:
+    """How tall the person stands in a scene picture, as a share of the picture height (children are shorter)."""
+    desc = " ".join(str(getattr(char, a, "") or "") for a in ("description", "appearance_prompt", "core_look")).lower()
+    age = (getattr(char, "age_group", None) or "").lower()
+    if any(w in desc for w in ("baby", "infant", "newborn", "month-old", "toddler")):
+        return 0.30
+    base = {"child": 0.44, "teen": 0.58, "elder": 0.60}.get(age, 0.66)
+    return base * (0.95 if (getattr(char, "gender", None) or "") == "female" else 1.0)
+
+
+def ensure_cutout(image_service, project_id: str, char, force: bool = False) -> Optional[str]:
+    """The character's picture without its background, made once and kept. None = the image notebook cannot do it
+    (an older notebook): the caller then falls back to the older way of drawing a scene."""
+    src, dst = character_path(project_id, char.id), cutout_path(project_id, char.id)
+    if not _nonempty(src):
+        return None
+    if force and os.path.exists(dst):
+        os.remove(dst)
+    if _nonempty(dst):
+        return dst
+    tmp = dst + ".part.png"
+    ok = image_service.cutout(src, tmp)
+    if not ok:
+        return None
+    os.replace(tmp, dst)
+    return dst
+
+
+def draw_environment(image_service, text: str, style: str, project_id: str, key, variant: int = 0) -> str:
+    """An EMPTY place for one scene (no people), from the scene's own words."""
+    dest = environment_path(project_id, key)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part.png"
+    fake = type("E", (), {"name": "the scene", "description": text})()
+    image_service.generate_image(place_prompt(fake, style), tmp,
+                                 _negative(style, "people, person, crowd, man, woman, child, character, face"),
+                                 PLACE_W, PLACE_H, _seed(project_id, "environment", key) + 7919 * int(variant))
+    os.replace(tmp, dest)
+    return dest
+
+
 def references_for(project_id: str, on_screen, place_id: Optional[str] = None, speakers=None) -> tuple[List[str], Optional[str]]:
     """The pictures a scene picture must be built from: (the people who are in it, the place it is set in).
     One image can follow only a few faces at once, so when more people are in the scene the ones who SPEAK come first;
@@ -161,12 +210,16 @@ def draw_missing(db, project, image_service, report=None, checkpoint=None) -> in
             checkpoint()
         path = character_path(project.id, item.id) if kind == "character" else place_path(project.id, item.id)
         if _nonempty(path) and item.reference_image_path:
+            if kind == "character" and settings.BIBLE_COMPOSE:
+                ensure_cutout(image_service, project.id, item)
             continue
         if report:
             report(i, len(todo), kind, item)
         if not _nonempty(path):
             (draw_character if kind == "character" else draw_place)(image_service, item, style, project.id)
             drawn += 1
+        if kind == "character" and settings.BIBLE_COMPOSE:
+            ensure_cutout(image_service, project.id, item)
         item.reference_image_path = _publish(project.id, kind, item.id, path)
         db.commit()
     return drawn
@@ -180,6 +233,8 @@ def regenerate_character(db, project, char, image_service, prompt: Optional[str]
         char.core_look = prompt.strip()
         char.appearance_prompt = prompt.strip()
     draw_character(image_service, char, style, project.id, prompt=None, variant=int(time.time()) % 100000)
+    if settings.BIBLE_COMPOSE:
+        ensure_cutout(image_service, project.id, char, force=True)
     char.reference_image_path = _publish(project.id, "character", char.id, character_path(project.id, char.id))
     db.commit()
     return scenes_with_character(scenes, chars, char)

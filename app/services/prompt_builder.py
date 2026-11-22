@@ -803,6 +803,34 @@ def eyeline_phrase(speaker: str, speech: str, on_screen: Sequence, beats: Sequen
     return f"turned toward {to}, eyes on {to}" if to else "eyes on the listener just off-frame, not on the camera"
 
 
+def beat_seconds(beats: Sequence[dict], clip_seconds: float):
+    """When each beat starts, in seconds, in a clip of `clip_seconds`. Longer actions/lines get more time; the last beat
+    starts early enough to finish before the end, and the last ~12 % of the clip is left quiet. None for a tiny clip
+    (an internal threshold for the short "finish the line" clips - every real scene is 2-10 minutes)."""
+    if not clip_seconds or clip_seconds < 20:
+        return None
+    weights = []
+    for b in beats:
+        words = len(str(b.get("speech") or "").split())
+        acts = len(str(b.get("action") or "").split())
+        weights.append(max(4.0, words + 0.6 * acts))
+    usable = clip_seconds * 0.88 - 1.0
+    total = sum(weights) or 1.0
+    out, acc = [], 0.0
+    for w in weights:
+        out.append(1.0 + usable * acc / total)
+        acc += w
+    return out
+
+
+def _beat_times(beats: Sequence[dict], clip_seconds: float):
+    """The same start times as "m:ss" labels for the prompt."""
+    secs = beat_seconds(beats, clip_seconds)
+    if secs is None:
+        return None
+    return [f"{int(t) // 60}:{int(t) % 60:02d}" for t in secs]
+
+
 def whole_scene_prompt(
     beats: Sequence[dict],
     on_screen: Sequence,
@@ -812,11 +840,30 @@ def whole_scene_prompt(
     scene_motion: Optional[str] = None,
     sound_design: Optional[str] = None,
     start_image: bool = False,
+    clip_seconds: float = 0.0,
+    silent: bool = False,
+    parts_out: Optional[dict] = None,
 ) -> str:
     """ONE prompt for a whole scene (or a long part of one). Beats are in order; each is a dict with
     kind ("dialogue"|"narration"), speaker, expression, action, speech, voice_desc.
     LTX-2.x follows a flowing, chronological description: the place and cast first, then what happens in order,
     with each spoken line in quotes next to who says it. Action is written as action, speech only in quotes."""
+    stamps0 = _beat_times(beats, clip_seconds) if (getattr(settings, "TIMED_BEATS", True) and len(beats) > 1) else None
+    secs0 = beat_seconds(beats, clip_seconds) if len(beats) > 1 else None
+    if silent:
+        # A reference-image model makes no sound: the lines are spoken later by the pipeline's voice. The picture only has to
+        # show the person talking (calm mouth movement) and doing the action, at the same times the voice will use.
+        quiet = []
+        for b in beats:
+            b = dict(b)
+            if b.get("kind") == "narration":
+                b["speech"], b["action"] = "", ""
+            elif b.get("speech"):
+                act = (b.get("action") or "").strip().rstrip(".")
+                b["action"] = (act + ", " if act else "") + "talking calmly, the lips moving naturally as they speak"
+                b["speech"] = ""
+            quiet.append(b)
+        beats = quiet
     place = clip_words(location, 30)
     # A scene with nobody speaking has room for a longer description (a "straight to video" idea is the whole prompt).
     setting = clip_words(visual_description, 40 if beats else 90)
@@ -828,12 +875,16 @@ def whole_scene_prompt(
         cast_bits.append(f"{c.name}, {look}" if look else c.name)
     lead = "Continuing the same shot" if start_image else (f"A film scene in {place}" if place else "A film scene")
     steps = []
+    step_secs = []
     order = ["First", "Then", "Next", "After that", "Finally"]
     spoken = 0
     scene_ctx = f"{place.split(':')[0]} {setting} {motion}"
     cov = conversation_coverage(beats, on_screen, f"{setting} {motion}")
+    stamps = stamps0
     for i, b in enumerate(beats):
         word = order[min(i, len(order) - 1)] if len(beats) > 1 else ""
+        if stamps:
+            word = f"At {stamps[i]}"
         speech = b.get("speech") or ""
         if b.get("kind") == "narration":
             line = speech_clause(b.get("speaker") or "Narrator", speech, b.get("voice_desc", ""), "", off_screen=True) if speech else ""
@@ -853,6 +904,9 @@ def whole_scene_prompt(
             spoken += 1
         if line:
             steps.append(f"{word + ': ' if word else ''}{line}".strip())
+            step_secs.append(secs0[i] if secs0 else 1.0 + 6.0 * i)
+            if parts_out is not None:
+                parts_out.setdefault("steps", []).append((step_secs[-1], line.strip()))
     bits = [lead, setting, ("Characters: " + "; ".join(cast_bits)) if cast_bits else ""]
     talkers = {b.get("speaker") for b in beats if b.get("kind") != "narration" and b.get("speech")}
     scene_sit = detect_situation(scene_ctx, " ".join(f"{b.get('action') or ''} {b.get('speech') or ''}" for b in beats))
@@ -897,6 +951,11 @@ def whole_scene_prompt(
         bits.append("The lines are spread across the take with calm pauses between them, each said slowly and completely; "
                     "the last spoken line is finished well before the end, then the scene holds quietly for a moment")
     cue = clip_words(sound_design, 22) or "natural ambient sound of the location"
+    if silent:
+        if parts_out is not None:
+            _ids = {id(x) for x in steps}
+            parts_out["base"] = ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip() and id(b) not in _ids)
+        return ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip()).replace('". ', '" ') + "."
     bits.append(f"Audio: every spoken line is clearly audible, in the order given, and lip-synced, with {cue} quietly "
                 "underneath, no background music" if spoken else f"Audio: {cue}, no spoken dialogue, no background music")
     return ". ".join(b.strip().rstrip(".") for b in bits if b and b.strip()).replace('". ', '" ') + "."

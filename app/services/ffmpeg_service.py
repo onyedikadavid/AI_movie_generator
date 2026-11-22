@@ -329,6 +329,33 @@ class FFmpegService:
             return False, overall, tail
         return (tail >= overall - float(margin_db)), overall, tail
 
+    def last_speech_start(self, media_path: str, margin_db: float = 14.0, min_gap: float = 0.35) -> Optional[float]:
+        """Where the clip's LAST burst of speech begins (seconds), found from the pause before it. None when the clip has
+        no clear pause (one unbroken burst, or no usable sound). Used to cut a clip back to just before a cut-off line."""
+        if not self.has_audio(media_path):
+            return None
+        overall = self._mean_volume(media_path)
+        if overall is None or overall < -45.0:
+            return None
+        total = self.get_duration(media_path)
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats", "-i", media_path, "-vn", "-af",
+                 f"silencedetect=noise={overall - float(margin_db):.1f}dB:d={float(min_gap):.2f}", "-f", "null", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError:
+            return None
+        ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", proc.stderr or "")]
+        ends = [e for e in ends if 1.0 < e < total - 0.4]
+        return ends[-1] if ends else None
+
+    def trim_clip(self, src_path: str, seconds: float, dst_path: str) -> str:
+        """The first `seconds` of a clip (picture and sound), re-encoded so the cut is exact."""
+        _require_ffmpeg()
+        _run(["ffmpeg", "-y", "-i", src_path, "-t", f"{max(0.5, seconds):.3f}", "-c:v", "libx264", "-preset", "fast", "-crf", "14",
+              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst_path])
+        return dst_path
+
     def dub_clip(self, src_path: str, wav_path: str, dst_path: str, lead: float = 0.25, tail: float = 0.6) -> str:
         """Replaces a clip's sound with a recorded voice line (kept whole). If the voice is longer than the picture, the
         last frame is held so the line is never cut. Used only when the video model keeps cutting a line off."""
@@ -345,6 +372,29 @@ class FFmpegService:
             "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst_path,
         ])
+        return dst_path
+
+    def overlay_voices(self, src_path: str, lines, dst_path: str, tail: float = 0.8) -> str:
+        """Puts spoken lines (list of (audio file, start second)) on a silent clip. Each line plays whole; if the last one
+        ends after the picture, the last frame is held so nothing is cut."""
+        _require_ffmpeg()
+        vd = max(self.get_duration(src_path), 0.1)
+        end = max([vd] + [st + self.get_duration(w) + tail for w, st in lines])
+        hold = max(0.0, end - vd) + 0.05
+        cmd = ["ffmpeg", "-y", "-i", src_path]
+        for w, _ in lines:
+            cmd += ["-i", w]
+        parts = [f"[0:v]tpad=stop_mode=clone:stop_duration={hold:.3f}[v]"]
+        labels = []
+        for i, (_, st) in enumerate(lines, start=1):
+            ms = int(max(0.0, st) * 1000)
+            parts.append(f"[{i}:a]adelay={ms}|{ms},apad[a{i}]")
+            labels.append(f"[a{i}]")
+        parts.append("".join(labels) + f"amix=inputs={len(lines)}:normalize=0:duration=longest[a]")
+        cmd += ["-filter_complex", ";".join(parts), "-map", "[v]", "-map", "[a]", "-t", f"{end:.3f}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst_path]
+        _run(cmd)
         return dst_path
 
     def cut_audio(self, src_path: str, start: float, duration: float, out_wav: str) -> str:

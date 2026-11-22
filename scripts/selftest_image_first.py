@@ -33,6 +33,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="imgfirst_")
     try:
         settings.STORAGE_DIR = tmp
+        settings.BIBLE_COMPOSE = False     # this test is about the picture-first flow, not the cut-out composing (see selftest_bible_assets)
         settings.AUDIO_MODE = "model"; settings.VIDEO_MAX_CLIP_SECONDS = 600.0; settings.SPEECH_COMPLETE_CHECK = False
         sc = NS(scene_number=2, image_prompt="Two men at a workbench", visual_description="a workshop", place_desc="a timber workshop")
         img = FakeImage()
