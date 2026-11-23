@@ -121,9 +121,53 @@ def height_fraction(char) -> float:
     return base * (0.95 if (getattr(char, "gender", None) or "") == "female" else 1.0)
 
 
+def local_cutout(src: str, dst: str) -> bool:
+    """A background-removal that needs nothing from the image notebook: the character pictures are drawn on a plain studio
+    background, so the background is the region that touches the picture's border and has (about) the border colour. Cruder than
+    the notebook's rembg (a thin halo can remain), but it keeps a run going when the notebook cannot do it."""
+    try:
+        import numpy as np
+        from PIL import Image, ImageFilter
+        img = Image.open(src).convert("RGB")
+        w, h = img.size
+        small = img.resize((max(48, w // 4), max(48, h // 4)), Image.BILINEAR)
+        a = np.asarray(small).astype(np.float32)
+        edge = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]])
+        bg = np.median(edge, axis=0)
+        spread = float(np.sqrt(((edge - bg) ** 2).sum(1)).mean())
+        thr = 30.0 + 2.0 * spread
+        like = np.sqrt(((a - bg) ** 2).sum(2)) < thr
+        reach = np.zeros_like(like)
+        reach[0, :], reach[-1, :], reach[:, 0], reach[:, -1] = like[0, :], like[-1, :], like[:, 0], like[:, -1]
+        for _ in range(a.shape[0] + a.shape[1]):                       # flood fill from the border through background-like pixels
+            grown = reach.copy()
+            grown[1:, :] |= reach[:-1, :]
+            grown[:-1, :] |= reach[1:, :]
+            grown[:, 1:] |= reach[:, :-1]
+            grown[:, :-1] |= reach[:, 1:]
+            grown &= like
+            if (grown == reach).all():
+                break
+            reach = grown
+        person = Image.fromarray(((~reach) * 255).astype("uint8"))
+        person = person.filter(ImageFilter.MedianFilter(5)).resize((w, h), Image.BILINEAR)
+        person = person.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(1.2))      # trim the halo, soften the edge
+        box = person.point(lambda v: 255 if v > 16 else 0).getbbox()
+        if not box or (box[2] - box[0]) * (box[3] - box[1]) < 0.02 * w * h:
+            return False
+        out = img.convert("RGBA")
+        out.putalpha(person)
+        out = out.crop(box)
+        out.save(dst, format="PNG")
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("The built-in cut-out failed (%s).", e)
+        return False
+
+
 def ensure_cutout(image_service, project_id: str, char, force: bool = False) -> Optional[str]:
-    """The character's picture without its background, made once and kept. None = the image notebook cannot do it
-    (an older notebook): the caller then falls back to the older way of drawing a scene."""
+    """The character's picture without its background, made once and kept. The image notebook (rembg) does it; if it cannot
+    (an older notebook, or it dropped the connection) the built-in cut-out is used so the run keeps going. None = no cut-out."""
     src, dst = character_path(project_id, char.id), cutout_path(project_id, char.id)
     if not _nonempty(src):
         return None
@@ -132,7 +176,15 @@ def ensure_cutout(image_service, project_id: str, char, force: bool = False) -> 
     if _nonempty(dst):
         return dst
     tmp = dst + ".part.png"
-    ok = image_service.cutout(src, tmp)
+    ok = False
+    try:
+        ok = bool(image_service.cutout(src, tmp))
+    except Exception as e:  # noqa: BLE001 - never lose the run over a cut-out
+        if type(e).__name__ == "RunStopped":            # the user pressed Stop / Pause: that must still stop the run
+            raise
+        logger.warning("The image notebook could not cut %s out (%s) - using the built-in cut-out instead.", getattr(char, "name", "?"), str(e)[:120])
+    if not ok:
+        ok = local_cutout(src, tmp)
     if not ok:
         return None
     os.replace(tmp, dst)

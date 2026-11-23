@@ -1,3 +1,8 @@
+## v2.35.4 - a cut-out can no longer stop the run
+
+- "Cutting the character out: the image server could not be reached (WinError 10054)" used to stop the whole run. Now, when the image notebook cannot cut a character out (dropped connection, an older notebook, rembg missing), the backend uses its own cut-out and carries on. It works on the plain studio background the character pictures are drawn on; rembg in the notebook is cleaner at the edges, so it is still tried first. A Stop / Pause still stops the run at once.
+- SDXL notebook v3 now loads its cut-out model when it starts (so a problem shows in the notebook output, not in the middle of a request), answers with a clear error instead of dropping the connection, and reports `"cutout": true/false` on `/health`.
+
 ## v2.35.3 - fix: "'_Img' object has no attribute 'cutout'"
 
 - Drawing the bible pictures stopped after the first character: the helper that runs image-server calls (so they can be paused / stopped) only knew `generate_image`, not the new `cutout` and `compose_scene` calls. It now forwards every method by name, so this cannot happen again for a future call. (It also affected the scene pictures, which use `compose_scene`.)
