@@ -25,8 +25,13 @@ class SilentRefVideo:
     def __init__(self):
         self.calls = []
 
+    wants = False
+
     def server_max_seconds(self):
         return 600.0
+
+    def server_wants_references(self):
+        return SilentRefVideo.wants
 
     def generate_clip(self, image, path, prompt, duration, seed=None, want_audio=False, resolution=None, audio_path=None,
                       reference_images=None, reference_has_place=False, window_beats=None):
@@ -42,7 +47,8 @@ def main():
     tmp = tempfile.mkdtemp(prefix="refs_")
     try:
         settings.STORAGE_DIR = tmp
-        settings.VIDEO_REFERENCES = True
+        settings.VIDEO_REFERENCES = False
+        SilentRefVideo.wants = True           # the notebook says so on /health: no need to set VIDEO_REFERENCES in .env
         settings.WHOLE_ONLY = True
         settings.WHOLE_SCENE_STRICT = True
         settings.VIDEO_MAX_CLIP_SECONDS = 600.0

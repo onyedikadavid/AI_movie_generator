@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
+from app.core.config import settings  # noqa: E402
+
 NARRATOR_NAME = "Narrator"
 
 # ---------------------------------------------------------------------------
@@ -63,6 +65,44 @@ _POOLS: Dict[str, Dict[str, List[str]]] = {
 # The narrator gets a voice that no character is ever given.
 _NARRATOR_VOICE = {"ng": "en-GB-RyanNeural", "us": "en-US-ChristopherNeural", "gb": "en-US-ChristopherNeural"}
 _RESERVED = set(_NARRATOR_VOICE.values())
+
+# v2.35: Microsoft's newer MULTILINGUAL neural voices (more natural, more varied delivery than Christopher / Guy / Jenny). They are
+# put first in the pools and one of them narrates. If a voice name is ever refused, the engine falls back to Guy / Jenny.
+_MULTILINGUAL = {
+    "male": ["en-US-AndrewMultilingualNeural", "en-US-BrianMultilingualNeural"],
+    "female": ["en-US-AvaMultilingualNeural", "en-US-EmmaMultilingualNeural"],
+}
+_MULTI_NARRATOR = "en-US-AndrewMultilingualNeural"
+
+# Kokoro (local, TTS_ENGINE=kokoro): American (a*) and British (b*) voices. Kokoro has no children's or Nigerian voices.
+_KOKORO_POOL = {
+    "male": ["am_michael", "bm_george", "am_adam", "bm_lewis", "am_fenrir", "bm_daniel", "am_eric", "am_liam", "am_puck", "am_onyx"],
+    "female": ["af_heart", "af_bella", "bf_emma", "af_nicole", "af_sarah", "bf_isabella", "af_sky", "bf_alice", "af_nova", "af_jessica"],
+}
+_KOKORO_NARRATOR = "bm_fable"
+_KOKORO_RE = re.compile(r"^[ab][fm]_[a-z]+$")
+
+
+def tts_engine() -> str:
+    return (getattr(settings, "TTS_ENGINE", "edge") or "edge").strip().lower()
+
+
+def is_kokoro_voice(voice: str) -> bool:
+    return bool(_KOKORO_RE.match((voice or "").strip()))
+
+
+def voice_fits_engine(voice: str) -> bool:
+    """A stored voice id belongs to ONE engine (edge names like en-US-AvaMultilingualNeural, Kokoro names like af_heart)."""
+    v = (voice or "").strip()
+    return is_kokoro_voice(v) if tts_engine() == "kokoro" else (bool(v) and not is_kokoro_voice(v))
+
+
+def default_narrator_voice(region: str) -> str:
+    if tts_engine() == "kokoro":
+        return _KOKORO_NARRATOR
+    if getattr(settings, "TTS_EDGE_MULTILINGUAL", True):
+        return _MULTI_NARRATOR
+    return _NARRATOR_VOICE.get(region, _NARRATOR_VOICE["us"])
 
 # A kid-sounding female voice, used for young girls when available.
 _CHILD_FEMALE_VOICE = "en-US-AnaNeural"
@@ -205,8 +245,14 @@ def _stable_gender_guess(name: str) -> str:
 # Casting
 # ---------------------------------------------------------------------------
 def _pool(region: str, gender: str) -> List[str]:
-    reserved = _RESERVED
-    return [v for v in _POOLS[region][gender] if v not in reserved]
+    if tts_engine() == "kokoro":
+        return [v for v in _KOKORO_POOL[gender] if v != _KOKORO_NARRATOR]
+    base = list(_POOLS[region][gender])
+    if getattr(settings, "TTS_EDGE_MULTILINGUAL", True):
+        multi = _MULTILINGUAL[gender]
+        base = (base[:4] + multi + base[4:]) if region == "ng" else (multi + base)   # Nigerian stories keep the Nigerian accents first
+    reserved = _RESERVED | {default_narrator_voice(region)}
+    return [v for v in base if v not in reserved]
 
 
 def cast_characters(characters: Sequence, region: str, narrator_voice: str = "") -> List[CastMember]:
@@ -222,10 +268,10 @@ def cast_characters(characters: Sequence, region: str, narrator_voice: str = "")
     region = region if region in _POOLS else "us"
 
     # Voices already taken: the narrator, plus any character that already has one.
-    taken = {narrator_voice or _NARRATOR_VOICE[region]}
+    taken = {narrator_voice if (narrator_voice and voice_fits_engine(narrator_voice)) else default_narrator_voice(region)}
     for c in characters:
         vid = (getattr(c, "voice_id", None) or "").strip()
-        if vid:
+        if vid and voice_fits_engine(vid):
             taken.add(vid)
 
     cast: List[CastMember] = []
@@ -242,9 +288,11 @@ def cast_characters(characters: Sequence, region: str, narrator_voice: str = "")
         age = normalize_age_group(getattr(c, "age_group", None)) or infer_age_group(name, desc, look)
 
         voice = (getattr(c, "voice_id", None) or "").strip()
+        if voice and not voice_fits_engine(voice):
+            voice = ""          # a voice from the OTHER engine (edge name with Kokoro on, or the reverse): pick one that fits
         if not voice:
             candidates = _pool(region, gender)
-            if gender == "female" and age == "child" and _CHILD_FEMALE_VOICE not in taken:
+            if tts_engine() != "kokoro" and gender == "female" and age == "child" and _CHILD_FEMALE_VOICE not in taken:
                 voice = _CHILD_FEMALE_VOICE
             else:
                 voice = next((v for v in candidates if v not in taken), "")
@@ -314,7 +362,9 @@ def profile_for(member: CastMember, expression: str = "", action: str = "", line
 
 def narrator_profile(region: str, override: str = "", expression: str = "") -> VoiceProfile:
     region = region if region in _POOLS else "us"
-    voice = (override or "").strip() or _NARRATOR_VOICE[region]
+    voice = (override or "").strip()
+    if not voice or not voice_fits_engine(voice):
+        voice = default_narrator_voice(region)
     e_rate, e_pitch, e_vol = emotion_prosody(expression)
     # A slightly slower, steadier pace reads as "narrator" rather than "character".
     return VoiceProfile(
@@ -591,7 +641,9 @@ class VoiceCast:
 
     def __init__(self, characters: Sequence, region: str = "auto", narrator_voice: str = "", texts: Iterable[Optional[str]] = ()):
         self.region = detect_region(list(texts), region)
-        self.narrator_voice = (narrator_voice or "").strip() or _NARRATOR_VOICE[self.region]
+        self.narrator_voice = (narrator_voice or "").strip()
+        if not self.narrator_voice or not voice_fits_engine(self.narrator_voice):
+            self.narrator_voice = default_narrator_voice(self.region)
         self.members: List[CastMember] = cast_characters(list(characters), self.region, self.narrator_voice)
         self._extras: Dict[str, CastMember] = {}
 
@@ -600,7 +652,8 @@ class VoiceCast:
         changed = False
         for ch, m in zip(characters, self.members):
             for attr, val in (("gender", m.gender), ("age_group", m.age_group), ("voice_id", m.voice_id)):
-                if not getattr(ch, attr, None):
+                cur = getattr(ch, attr, None)
+                if not cur or (attr == "voice_id" and not voice_fits_engine(cur)):
                     setattr(ch, attr, val)
                     changed = True
         return changed

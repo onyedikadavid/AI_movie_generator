@@ -42,3 +42,7 @@ edge-tts>=6.1.12
 # --- Optional: upload generated media to S3-compatible storage (e.g. Cloudflare R2) ---
  psycopg[binary]>=3.1.0
 cloudinary>=1.41.0
+
+# Local, natural voice on this PC's CPU (TTS_ENGINE=kokoro). Python 3.10-3.13. The model files (~330 MB) download on first use.
+kokoro-onnx>=0.4.0
+numpy>=1.26

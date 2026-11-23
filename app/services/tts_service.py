@@ -15,6 +15,8 @@ the old robotic voice is exactly the problem this module exists to solve.
 """
 import asyncio
 import hashlib
+import re
+import threading
 import logging
 import os
 import shutil
@@ -23,7 +25,7 @@ import time
 from typing import List, Set
 
 from app.core.config import settings
-from app.services.voice_service import FALLBACK_VOICE, VoiceProfile, clean_for_tts
+from app.services.voice_service import FALLBACK_VOICE, VoiceProfile, clean_for_tts, is_kokoro_voice
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,25 @@ class TTSService:
 
         engine = (settings.TTS_ENGINE or "edge").strip().lower()
         errors: List[str] = []
+
+        if engine == "kokoro":
+            try:
+                self._kokoro(spoken, profile, output_path)
+                self.engines_used.add("kokoro")
+                return output_path
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"kokoro: {e}")
+                if not settings.TTS_ALLOW_FALLBACK:
+                    raise TTSError(
+                        f"Couldn't make the Kokoro voice for {profile.label or 'a line'} ({e}). Install it on the worker PC with "
+                        "'pip install -U kokoro-onnx' (Python 3.10-3.13) and make sure the PC can download the model files once "
+                        f"(about 330 MB, into {self._kokoro_dir()}). Everything finished so far is kept - press Resume. "
+                        "To use the edge voices instead, set TTS_ENGINE=edge."
+                    ) from e
+                logger.warning("Kokoro failed (%s) - falling back to edge-tts (TTS_ALLOW_FALLBACK is on).", e)
+                profile = VoiceProfile(voice=FALLBACK_VOICE.get(profile.gender, "en-US-GuyNeural"), gender=profile.gender,
+                                       rate=profile.rate, pitch=profile.pitch, volume=profile.volume, label=profile.label)
+                engine = "edge"
 
         if engine == "edge":
             try:
@@ -160,6 +181,90 @@ class TTSService:
                     if attempt < 3:
                         time.sleep(1.5 * attempt)
         raise last_error
+
+    # ------------------------------------------------------------------ Kokoro (local, CPU)
+    _kokoro_model = None
+    _kokoro_lock = threading.Lock()
+
+    @staticmethod
+    def _kokoro_dir() -> str:
+        return settings.KOKORO_DIR or os.path.join(settings.STORAGE_DIR, "models", "kokoro")
+
+    def _kokoro_files(self):
+        """Paths of the model + voices files, downloaded once (a half-downloaded file is never used)."""
+        d = self._kokoro_dir()
+        os.makedirs(d, exist_ok=True)
+        out = []
+        for name in (settings.KOKORO_MODEL_FILE, settings.KOKORO_VOICES_FILE):
+            path = os.path.join(d, name)
+            if not (os.path.exists(path) and os.path.getsize(path) > 1_000_000):
+                import httpx
+                bases = [settings.KOKORO_BASE_URL.rstrip("/"), settings.KOKORO_BASE_URL.rstrip("/").replace("model-files-v1.1", "model-files-v1.0")]
+                last = None
+                for base in dict.fromkeys(bases):
+                    try:
+                        logger.info("Downloading the Kokoro file %s (first use only) ...", name)
+                        with httpx.stream("GET", f"{base}/{name}", follow_redirects=True, timeout=httpx.Timeout(600.0, connect=30.0)) as r:
+                            r.raise_for_status()
+                            with open(path + ".part", "wb") as fh:
+                                for chunk in r.iter_bytes(1 << 20):
+                                    fh.write(chunk)
+                        os.replace(path + ".part", path)
+                        last = None
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        last = e
+                if last is not None:
+                    raise TTSError(f"could not download {name}: {last}")
+            out.append(path)
+        return out
+
+    def _kokoro_engine(self):
+        with TTSService._kokoro_lock:
+            if TTSService._kokoro_model is None:
+                try:
+                    from kokoro_onnx import Kokoro
+                except ImportError as e:
+                    raise TTSError("the 'kokoro-onnx' package is not installed") from e
+                model, voices = self._kokoro_files()
+                TTSService._kokoro_model = Kokoro(model, voices)
+            return TTSService._kokoro_model
+
+    def _kokoro(self, text: str, profile: VoiceProfile, output_path: str) -> None:
+        import wave
+        import numpy as np
+        voice = profile.voice if is_kokoro_voice(profile.voice) else ("bm_george" if profile.gender == "male" else "af_heart")
+        lang = "en-gb" if voice.startswith("b") else "en-us"
+        speed = max(0.6, min(1.4, float(settings.KOKORO_SPEED) * (1.0 + profile.rate / 100.0)))
+        k = self._kokoro_engine()
+        # Short pieces (a sentence at a time) keep the delivery steady; a long line in one go can run out of the model's window.
+        pieces = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()] or [text]
+        parts, sr = [], 24000
+        for piece in pieces:
+            with TTSService._kokoro_lock:                      # the ONNX session is not thread-safe
+                samples, sr = k.create(piece, voice=voice, speed=speed, lang=lang)
+            parts.append(np.asarray(samples, dtype=np.float32))
+            parts.append(np.zeros(int(sr * 0.18), dtype=np.float32))
+        audio = np.concatenate(parts[:-1] if len(parts) > 1 else parts)
+        wav = f"{output_path}.kokoro.wav"
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+        with wave.open(wav, "wb") as fh:
+            fh.setnchannels(1)
+            fh.setsampwidth(2)
+            fh.setframerate(int(sr))
+            fh.writeframes(pcm.tobytes())
+        if not _ok(wav):
+            raise TTSError("Kokoro returned an empty audio file")
+        # Pitch / volume from the character's age and mood (Kokoro has no such controls of its own).
+        filters = []
+        if abs(profile.pitch) >= 2:
+            f = max(0.88, min(1.12, 1.0 + profile.pitch / 150.0))
+            filters.append(f"asetrate={int(sr * f)},aresample={int(sr)},atempo={1.0 / f:.4f}")
+        if profile.volume:
+            filters.append(f"volume={max(0.3, 1.0 + profile.volume / 100.0):.2f}")
+        cmd = ["ffmpeg", "-y", "-i", wav] + (["-af", ",".join(filters)] if filters else []) + ["-codec:a", "libmp3lame", "-q:a", "2", output_path]
+        _run(cmd)
+        os.remove(wav)
 
     def _piper(self, text: str, profile: VoiceProfile, output_path: str) -> None:
         model = settings.PIPER_MODEL_MALE if profile.gender == "male" else settings.PIPER_MODEL_FEMALE

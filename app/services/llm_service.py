@@ -138,6 +138,79 @@ class LLMService:
             problems.append("no characters were listed")
         return problems
 
+    # ------------------------------------------------------------------ rescue a script the model got half wrong (v2.35.2)
+    @staticmethod
+    def _story_chunks(story: str, n: int) -> list:
+        paras = [p.strip() for p in re.split(r"\n\s*\n|\n", story or "") if p.strip()]
+        if not paras:
+            return []
+        n = max(1, min(int(n or 3), len(paras)))
+        size = -(-len(paras) // n)
+        return ["\n".join(paras[i:i + size]) for i in range(0, len(paras), size)]
+
+    @staticmethod
+    def _speaker_names(story: str, data: dict) -> list:
+        names = []
+        for sc in (data or {}).get("scenes") or []:
+            if isinstance(sc, dict):
+                for n in sc.get("characters_present") or []:
+                    if isinstance(n, str) and n.strip():
+                        names.append(n.strip())
+        for m in re.finditer(r"(?m)^\s*(?:\*\*)?([A-Z][A-Za-z'\-]{1,24}(?: [A-Z][A-Za-z'\-]{1,24})?)(?:\*\*)?\s*(?:\([^)]*\))?\s*:", story or ""):
+            names.append(m.group(1).strip())
+        seen, out = set(), []
+        for n in names:
+            if n.lower() not in seen and n.lower() not in ("narrator", "scene", "int", "ext", "note", "title"):
+                seen.add(n.lower())
+                out.append(n)
+        return out
+
+    async def _rescue_structure(self, data: dict, story_text: str, prompt: str, scene_count, genre_hint, tone_hint, visual_style_hint) -> dict:
+        """The model sometimes answers with only a list of scenes (screenplay-style keys, no title, no characters). Instead of
+        failing the whole run, fill in what is missing: scene fields from the story, the title/genre/tone/style from the
+        hints, and the characters from the scenes / the people who speak in the story (described by one small extra call)."""
+        data = dict(data or {})
+        scenes = [sc for sc in (data.get("scenes") or []) if isinstance(sc, dict)]
+        if not scenes and story_text:
+            scenes = [{"visual_description": c, "location": ""} for c in self._story_chunks(story_text, scene_count or 3)]
+        for i, sc in enumerate(scenes, 1):
+            sc["scene_number"] = i
+            heading = sc.get("scene") if isinstance(sc.get("scene"), str) else ""
+            if not sc.get("location") and heading:
+                sc["location"] = heading
+            if not sc.get("visual_description"):
+                sc["visual_description"] = str(sc.get("description") or sc.get("action") or sc.get("story_beat") or heading or "The scene plays out.")
+        data["scenes"] = scenes
+        first = next((ln.strip() for ln in (story_text or prompt or "").splitlines() if ln.strip()), "My story")
+        data["title"] = (data.get("title") or "").strip() or first[:60].rstrip(" .,:;")
+        data["genre"] = (data.get("genre") or genre_hint or "Drama")
+        data["tone"] = (data.get("tone") or tone_hint or "Warm")
+        data["visual_style"] = (data.get("visual_style") or visual_style_hint or "Cinematic, natural light")
+        chars = [c for c in (data.get("characters") or []) if isinstance(c, dict) and c.get("name")]
+        if not chars:
+            names = self._speaker_names(story_text or prompt, data)
+            if names:
+                described = []
+                try:
+                    ask = ("List these characters from the story as JSON: {\"characters\": [{\"name\": \"...\", \"description\": \"role and personality\", "
+                           "\"appearance_prompt\": \"face, hair, build, clothes\", \"gender\": \"male|female\", \"age_group\": \"child|teen|adult|elder\"}]}. "
+                           "Use exactly these names: " + ", ".join(names) + ". Respond ONLY with raw JSON.\n\nSTORY:\n" + (story_text or prompt)[:6000])
+                    described = [c for c in (self._parse_json(await self._generate(ask)).get("characters") or []) if isinstance(c, dict) and c.get("name")]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Could not describe the characters (%s) - using simple entries.", e)
+                have = {str(c["name"]).strip().lower() for c in described}
+                for n in names:
+                    if n.lower() not in have:
+                        described.append({"name": n, "description": f"{n}, a character in the story", "appearance_prompt": f"{n}, a person in everyday clothes"})
+                chars = described
+        for c in chars:
+            c.setdefault("description", f"{c['name']}, a character in the story")
+            c.setdefault("appearance_prompt", c["description"])
+        data["characters"] = chars
+        if chars or data.get("scenes"):
+            logger.info("Script filled in: %d scene(s), %d character(s), title %r.", len(scenes), len(chars), data["title"])
+        return data
+
     @staticmethod
     def _turns_for(secs) -> int:
         """How many spoken turns a scene of `secs` seconds gets: 2 min = 8 ... 10 min = 24. Talk fills well under half of the
@@ -627,6 +700,7 @@ class LLMService:
             if isinstance(sc, dict):
                 sc["scene_number"] = i
 
+        parsed_data = await self._rescue_structure(parsed_data, story_text, prompt, scene_count, genre_hint, tone_hint, visual_style_hint)
         parsed_data = await self._complete_scenes(parsed_data, genre_hint, tone_hint, visual_style_hint, secs, compact=compact)
 
         parsed_data["story"] = story_text or None

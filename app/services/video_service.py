@@ -71,6 +71,7 @@ class VideoGenerationService:
             base = url.split("/v1/")[0].rstrip("/")
             resp = self._send("get", base + "/health", timeout=httpx.Timeout(20.0, connect=10.0), attempts=1)
             info = resp.json()
+            VideoGenerationService._wants_refs = (time.time(), bool(info.get("references")))
             frames, fps = int(info.get("max_frames") or 0), int(info.get("fps") or 24)
             if frames > 8:                                   # LTX notebook: reports frames
                 val = (frames - 1) / float(fps)
@@ -80,6 +81,14 @@ class VideoGenerationService:
             logger.info("Could not read the video server's clip limit (%s).", e)
         VideoGenerationService._limit_cache = (time.time(), val)
         return val
+
+    _wants_refs = (0.0, False)
+
+    def server_wants_references(self) -> bool:
+        """True when the notebook on the other end is a REFERENCE-picture model (the Wan VACE notebook says so on /health).
+        Then the bible pictures are sent with every clip whatever VIDEO_REFERENCES says."""
+        self.server_max_seconds()                       # refreshes the cached /health answer (at most once a minute)
+        return bool(VideoGenerationService._wants_refs[1])
 
     def _post(self, data: dict, files=None, image_bytes: bytes = None) -> bytes:
         """Ask the video server for one clip; returns the MP4 bytes."""
@@ -179,8 +188,10 @@ class VideoGenerationService:
                 raise RuntimeError(f"The video server failed this clip: {info.get('error')}" + (f" | {trace}" if trace else ""))
             if time.time() - last_log > 60:
                 last_log = time.time()
-                logger.info("Video job %s: %s (%ds so far%s)", job_id, status, int(time.time() - started),
-                            f", #{info['queue_position']} in the server's queue" if info.get("queue_position") else "")
+                logger.info("Video job %s: %s (%ds so far%s)%s", job_id, status, int(time.time() - started),
+                            f", #{info['queue_position']} in the server's queue" if info.get("queue_position") else "",
+                            (f" - server: {info['progress']}" + (f" ({info['windows']} windows in this clip)" if info.get("windows") else ""))
+                            if info.get("progress") else "")
 
     def generate_clip(
         self,

@@ -112,7 +112,16 @@ class Settings(BaseSettings):
     # False (default) = ONLY the characters speak: no narrator voice at all. A character who is alone in a scene
     # gets spoken lines of their own (written by the script writer). True = also use a separate narrator voice.
     NARRATOR_ENABLED: bool = False
+    # "edge" (Microsoft neural voices, online) | "kokoro" (local Kokoro-82M on this PC's CPU: pip install kokoro-onnx; the model
+    # files, about 330 MB, are downloaded once into KOKORO_DIR) | piper | gtts
     TTS_ENGINE: str = "edge"
+    # v2.35: edge voices use Microsoft's newer MULTILINGUAL neural voices (Andrew / Brian / Ava / Emma) first, and one narrates.
+    TTS_EDGE_MULTILINGUAL: bool = True
+    KOKORO_DIR: str = ""                 # empty = <STORAGE_DIR>/models/kokoro
+    KOKORO_SPEED: float = 1.0            # overall speaking speed (1.0 = normal)
+    KOKORO_MODEL_FILE: str = "kokoro-v1.0.onnx"
+    KOKORO_VOICES_FILE: str = "voices-v1.0.bin"
+    KOKORO_BASE_URL: str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1"
     # auto = pick Nigerian-accented voices when the story is Nigerian, else US/UK.
     # Or force one of: ng | us | gb
     TTS_REGION: str = "auto"

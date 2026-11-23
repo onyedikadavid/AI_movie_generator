@@ -1,3 +1,15 @@
+## v2.35.2 - script rescue, reference-server auto-detect, notebook progress
+
+- **Script breakdown no longer fails** when the writer model answers with only a list of scenes (screenplay-style keys, no title, no characters: "2 validation errors for ScriptDecompositionSchema"). The missing title / genre / tone / style come from your hints, the scenes are completed from the story, and the characters are taken from the scenes and the people who speak in the story, then described by one small extra call (simple entries if that call fails). If the model returned no scenes at all, your story is cut into scenes.
+- **The Wan VACE notebook is detected automatically** (`/health` says `references: true`), so `VIDEO_REFERENCES=true` is no longer needed with it. Before, the old code sent a plain request and the server answered HTTP 400.
+- **Notebook progress:** download heartbeat every 30 s with model GB on disk, a window/step line for every denoising step, `progress` on `/health` and on the job status, and the backend logs the server's progress once a minute.
+
+## v2.35.1 - voices: Kokoro (local) and the newer Microsoft multilingual voices
+
+- **`TTS_ENGINE=kokoro`**: Kokoro-82M runs on the PC that runs the worker (CPU, no notebook). `pip install -U kokoro-onnx` (Python 3.10-3.13); the two model files (~330 MB) download once into `storage/models/kokoro`. Each character gets a stable Kokoro voice (American a*, British b*); the narrator is `bm_fable`. Age and mood change speed, pitch and volume. Kokoro has no children's voices and no Nigerian accent. If it fails the run stops with a clear message and Resume continues (or set `TTS_ALLOW_FALLBACK=true` to use edge for that line).
+- **edge-tts** now puts Microsoft's newer **multilingual** neural voices first (`en-US-AndrewMultilingualNeural`, `BrianMultilingualNeural`, `AvaMultilingualNeural`, `EmmaMultilingualNeural`) and Andrew narrates, instead of Christopher / Guy / Jenny (`TTS_EDGE_MULTILINGUAL=false` brings the old order back). Nigerian stories keep the Nigerian-accent voices first. If Microsoft refuses a voice name, the line falls back to Guy / Jenny and a warning is recorded.
+- Voices already stored on characters belong to one engine: when you switch engine, a stored voice from the other engine is replaced. Characters that already have an edge voice keep it while the engine stays `edge`.
+
 ## v2.35.0 - the video model gets the bible pictures (reference images)
 
 - **Why:** LTX / Ovi / MultiTalk only see ONE first picture and a text prompt, so they cannot "pick Michael from the character bible" - after the first seconds they invent faces again. A **reference-image model (Wan VACE)** is handed the bible pictures with the request and keeps them in view for the whole clip.

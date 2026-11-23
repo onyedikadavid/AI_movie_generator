@@ -440,6 +440,15 @@ class SceneRenderer:
         logger.warning("The video model kept cutting off \"%s\" - the line is now spoken by the pipeline's own voice so "
                        "it is heard in full.", seg.text[:60])
 
+    def _use_references(self) -> bool:
+        """Bible pictures go WITH each clip when VIDEO_REFERENCES is on, or when the video server says it is a reference model."""
+        if settings.VIDEO_REFERENCES:
+            return True
+        try:
+            return bool(self.video.server_wants_references())
+        except Exception:  # noqa: BLE001 - an older server / a test double: no
+            return False
+
     def _voice_over(self, ctx, raw: str, part, beats, request_len: float, cast) -> None:
         """A reference-image model (Wan VACE) makes a SILENT clip. Each line is spoken whole by the pipeline's voice at the
         time the prompt gave for its beat (so the action and the words line up), and put on the clip."""
@@ -509,7 +518,7 @@ class SceneRenderer:
                     " | ".join(f"clip {i + 1}: {self._describe(pt)}" for i, pt in enumerate(parts)))
         t2v = mode == "t2v"
         ref_files, ref_place = [], False
-        if settings.VIDEO_REFERENCES:
+        if self._use_references():
             ref_files, ref_place = self._reference_pictures(project_id, scene, on_screen, segments)
             if ref_files:
                 logger.info("Scene %s: the video model gets %d bible picture(s) as references for the whole clip (%s).",
@@ -748,7 +757,7 @@ class SceneRenderer:
         prev_sig = f"{os.path.getsize(prev_clip)}:{int(os.path.getmtime(prev_clip))}" if prev_clip else ""
         fp = self._fingerprint(scene, characters, style, cast, mode, narrator, scene_seconds, prev_sig, resolution, style_mode)
         pic_fp = self._picture_fingerprint(scene, characters, style, mode, prev_sig, resolution, approved)
-        if settings.VIDEO_REFERENCES:
+        if self._use_references():
             # The bible pictures are part of what the clip is made from: a redrawn character or place renders the scene again.
             from app.services import bible_assets
             _rf, _rp = bible_assets.references_for(project_id, self._characters_on_screen(scene, characters), getattr(scene, "place_id", None))
