@@ -1,3 +1,7 @@
+## v2.35.3 - fix: "'_Img' object has no attribute 'cutout'"
+
+- Drawing the bible pictures stopped after the first character: the helper that runs image-server calls (so they can be paused / stopped) only knew `generate_image`, not the new `cutout` and `compose_scene` calls. It now forwards every method by name, so this cannot happen again for a future call. (It also affected the scene pictures, which use `compose_scene`.)
+
 ## v2.35.2 - script rescue, reference-server auto-detect, notebook progress
 
 - **Script breakdown no longer fails** when the writer model answers with only a list of scenes (screenplay-style keys, no title, no characters: "2 validation errors for ScriptDecompositionSchema"). The missing title / genre / tone / style come from your hints, the scenes are completed from the story, and the characters are taken from the scenes and the people who speak in the story, then described by one small extra call (simple entries if that call fails). If the model returned no scenes at all, your story is cut into scenes.

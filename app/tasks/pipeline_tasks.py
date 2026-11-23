@@ -619,8 +619,13 @@ def _image_body(db, project: Project, ctl: RunControl) -> None:
 
     # Each picture is a long GPU/HTTP call: _call releases the database connection while it runs.
     class _Img:
-        def generate_image(self, *a, **kw):
-            return _call(db, ctl, img.generate_image, *a, **kw)
+        """Every image-server method (generate_image, cutout, compose_scene, ...) goes through _call, so a long GPU request can
+        be paused / stopped and does not hold the database connection. Forwarding by name means a new method cannot be missed."""
+        def __getattr__(self, name):
+            target = getattr(img, name)
+            if not callable(target):
+                return target
+            return lambda *a, **kw: _call(db, ctl, target, *a, **kw)
 
     if settings.BIBLE_PICTURES and (project.generation_mode or "script") != "direct":
         from app.services import bible_assets
