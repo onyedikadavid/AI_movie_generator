@@ -165,6 +165,41 @@ def local_cutout(src: str, dst: str) -> bool:
         return False
 
 
+def local_compose(background: str, people: list, dst: str, width: int = None, height: int = None) -> bool:
+    """The scene picture without the image notebook: the empty place with the cut-out characters standing in it (one ground
+    line, left to right, soft shadow) - the same layout the notebook makes, only without its light redraw."""
+    try:
+        from PIL import Image, ImageDraw, ImageFilter
+        from app.core.config import settings as _s
+        W, H = int(width or _s.IMAGE_WIDTH), int(height or _s.IMAGE_HEIGHT)
+        canvas = Image.open(background).convert("RGB").resize((W, H), Image.LANCZOS).convert("RGBA")
+        n, feet_y = len(people), int(H * 0.92)
+        for i, (path, frac) in enumerate(people):
+            c = Image.open(path).convert("RGBA")
+            th = max(16, int(H * float(frac)))
+            tw = max(1, int(c.width * th / c.height))
+            if tw > W:
+                th, tw = int(th * W / tw), W
+            c = c.resize((tw, th), Image.LANCZOS)
+            x = min(max(0, int(W * (i + 1) / (n + 1)) - tw // 2), W - tw)
+            y = max(0, feet_y - th)
+            shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ImageDraw.Draw(shadow).ellipse([x + int(tw * 0.08), feet_y - int(th * 0.03), x + int(tw * 0.92), feet_y + int(th * 0.03)], fill=(0, 0, 0, 120))
+            canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(max(2, int(th * 0.02)))))
+            layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            layer.alpha_composite(c, dest=(x, y))
+            canvas = Image.alpha_composite(canvas, layer)
+        canvas.convert("RGB").save(dst, format="PNG")
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Built-in scene composite failed: %s", e)
+        return False
+
+
+_NOTEBOOK_COMPOSE_DOWN_UNTIL = 0.0
+_NOTEBOOK_CUTOUT_DOWN_UNTIL = 0.0   # after a failure the notebook is not asked again for a while (each try can take ~30 s)
+
+
 def ensure_cutout(image_service, project_id: str, char, force: bool = False) -> Optional[str]:
     """The character's picture without its background, made once and kept. The image notebook (rembg) does it; if it cannot
     (an older notebook, or it dropped the connection) the built-in cut-out is used so the run keeps going. None = no cut-out."""
@@ -177,11 +212,14 @@ def ensure_cutout(image_service, project_id: str, char, force: bool = False) -> 
         return dst
     tmp = dst + ".part.png"
     ok = False
+    global _NOTEBOOK_CUTOUT_DOWN_UNTIL
     try:
-        ok = bool(image_service.cutout(src, tmp))
+        if time.time() >= _NOTEBOOK_CUTOUT_DOWN_UNTIL:
+            ok = bool(image_service.cutout(src, tmp))
     except Exception as e:  # noqa: BLE001 - never lose the run over a cut-out
         if type(e).__name__ == "RunStopped":            # the user pressed Stop / Pause: that must still stop the run
             raise
+        _NOTEBOOK_CUTOUT_DOWN_UNTIL = time.time() + 600
         logger.warning("The image notebook could not cut %s out (%s) - using the built-in cut-out instead.", getattr(char, "name", "?"), str(e)[:120])
     if not ok:
         ok = local_cutout(src, tmp)

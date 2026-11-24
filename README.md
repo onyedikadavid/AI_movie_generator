@@ -1,3 +1,9 @@
+## v2.35.5 - no surprise SDXL download, no more dropped-connection stops, no "FORMAT / TONE" characters
+
+- **The backend no longer starts downloading SDXL onto your PC.** When the Upstash lookup of the image-server address timed out (a handshake timeout), the address came back empty and the backend switched to "draw on this machine": it loaded torch and began downloading Stable Diffusion XL (~15 GB, 19 files). Now the lookup is retried (3 tries) and the last address that worked is remembered; if there is still no address the run stops with a clear message ("start the image notebook and press Resume"). Drawing on this PC is only done when you set `IMAGE_LOCAL_FALLBACK=true` in `.env`.
+- **"Placing the characters in the scene ... WinError 10054" no longer stops the run.** If the image notebook drops the connection while placing the characters, the backend puts the cut-out characters into the empty place picture itself (same layout and shadows; only the notebook's light redraw is missing) and carries on. After a failure the notebook is skipped for 5 minutes (cut-outs: 10 minutes) instead of waiting ~30 s per character.
+- **Script labels are not characters.** FORMAT, TONE, EMOTION, SOUND CUE, CAMERA CUE, MUSIC, NARRATOR, SCENE ... (and similar headings) are filtered out of the characters and out of each scene's cast. Projects already made keep their junk entries: use Start over (or delete those characters).
+
 ## v2.35.4 - a cut-out can no longer stop the run
 
 - "Cutting the character out: the image server could not be reached (WinError 10054)" used to stop the whole run. Now, when the image notebook cannot cut a character out (dropped connection, an older notebook, rembg missing), the backend uses its own cut-out and carries on. It works on the plain studio background the character pictures are drawn on; rembg in the notebook is cleaner at the edges, so it is still tried first. A Stop / Pause still stops the run at once.

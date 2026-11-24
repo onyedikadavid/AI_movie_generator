@@ -72,6 +72,13 @@ class ImageGenerationService:
         # the very next image without restarting this backend.
         image_api_url = resolve_url(KEY_IMAGE_API_URL, settings.IMAGE_API_URL)
 
+        if not image_api_url and not settings.IMAGE_LOCAL_FALLBACK:
+            raise RuntimeError(
+                "The image server address could not be found (the lookup in Upstash failed or the notebook has not published "
+                "one yet). Start / restart the image notebook and press Resume - nothing is drawn on this PC. "
+                "(To really draw on this PC, set IMAGE_LOCAL_FALLBACK=true in .env; it needs a GPU and a large download.)"
+            )
+
         if image_api_url:
             data = {
                 "prompt": prompt,

@@ -304,6 +304,8 @@ def _save_script(db, pid: str, script_schema) -> None:
     ))
 
     for ch in script_schema.characters:
+        if LLMService._is_label(ch.name):
+            continue
         db.add(Character(
             project_id=pid, name=ch.name, description=ch.description, appearance_prompt=ch.appearance_prompt,
             gender=normalize_gender(getattr(ch, "gender", None)),
@@ -374,6 +376,8 @@ def _continue_body(db, project: Project, ctl: RunControl) -> None:
     ctl.checkpoint()
 
     for ch in result["new_characters"]:
+        if LLMService._is_label(ch.get("name")):
+            continue
         db.add(Character(
             project_id=pid, name=str(ch["name"]).strip(), description=ch.get("description") or ch.get("appearance_prompt") or "",
             appearance_prompt=ch.get("appearance_prompt") or ch.get("description") or "",

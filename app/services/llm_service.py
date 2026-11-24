@@ -148,6 +148,24 @@ class LLMService:
         size = -(-len(paras) // n)
         return ["\n".join(paras[i:i + size]) for i in range(0, len(paras), size)]
 
+    _LABEL_WORDS = {
+        "narrator", "scene", "int", "ext", "note", "title", "format", "tone", "emotion", "mood", "sound", "sound cue", "sfx",
+        "camera", "camera cue", "cue", "music", "action", "setting", "location", "time", "genre", "style", "visual", "visuals",
+        "audio", "voiceover", "voice over", "vo", "fade", "cut", "transition", "shot", "angle", "lighting", "theme", "summary",
+        "act", "chapter", "part", "episode", "duration", "length", "pov", "background", "foreground", "description", "dialogue",
+        "hook", "logline", "ending", "opening", "intro", "outro", "caption", "text", "on screen", "super", "insert",
+    }
+
+    @classmethod
+    def _is_label(cls, name) -> bool:
+        """FORMAT:, TONE:, SOUND CUE: ... are headings of the script, not people."""
+        n = re.sub(r"[^a-z ]", " ", str(name or "").lower()).strip()
+        n = re.sub(r"\s+", " ", n)
+        if not n or n in cls._LABEL_WORDS:
+            return True
+        words = n.split()
+        return len(words) > 1 and all(w in cls._LABEL_WORDS for w in words)
+
     @staticmethod
     def _speaker_names(story: str, data: dict) -> list:
         names = []
@@ -160,7 +178,7 @@ class LLMService:
             names.append(m.group(1).strip())
         seen, out = set(), []
         for n in names:
-            if n.lower() not in seen and n.lower() not in ("narrator", "scene", "int", "ext", "note", "title"):
+            if n.lower() not in seen and not LLMService._is_label(n):
                 seen.add(n.lower())
                 out.append(n)
         return out
@@ -186,7 +204,7 @@ class LLMService:
         data["genre"] = (data.get("genre") or genre_hint or "Drama")
         data["tone"] = (data.get("tone") or tone_hint or "Warm")
         data["visual_style"] = (data.get("visual_style") or visual_style_hint or "Cinematic, natural light")
-        chars = [c for c in (data.get("characters") or []) if isinstance(c, dict) and c.get("name")]
+        chars = [c for c in (data.get("characters") or []) if isinstance(c, dict) and c.get("name") and not self._is_label(c.get("name"))]
         if not chars:
             names = self._speaker_names(story_text or prompt, data)
             if names:
@@ -701,6 +719,10 @@ class LLMService:
                 sc["scene_number"] = i
 
         parsed_data = await self._rescue_structure(parsed_data, story_text, prompt, scene_count, genre_hint, tone_hint, visual_style_hint)
+        parsed_data["characters"] = [c for c in (parsed_data.get("characters") or []) if not (isinstance(c, dict) and self._is_label(c.get("name")))]
+        for sc in parsed_data.get("scenes") or []:
+            if isinstance(sc, dict) and isinstance(sc.get("characters_present"), list):
+                sc["characters_present"] = [n for n in sc["characters_present"] if not self._is_label(n)]
         parsed_data = await self._complete_scenes(parsed_data, genre_hint, tone_hint, visual_style_hint, secs, compact=compact)
 
         parsed_data["story"] = story_text or None

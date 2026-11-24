@@ -126,8 +126,9 @@ def main():
         print("OK 7: a different place per scene; the user's words draw an empty place for that scene")
         old = Img2(can=False)
         scene_images.draw(old, scene, [mike, obi], "Cinematic", "p1")
-        assert old.calls[-1].get("references"), "an older image notebook: fall back to the IP-Adapter way"
-        print("OK 8: an older notebook still works (falls back)")
+        # v2.35.5: an older notebook no longer needs the IP-Adapter way - the built-in cut-out + composite make the picture
+        assert os.path.getsize(scene_images.approved_path("p1", scene.scene_number)) > 0
+        print("OK 8: an older notebook still works (built-in cut-out and composite)")
         print("ALL PASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

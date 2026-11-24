@@ -69,6 +69,7 @@ def main():
             assert 0.25 < w / 448 < 0.6 and 0.8 < h / 576 < 1.0, cut.size                    # cropped to the person, not the whole picture
             print(f"OK: {label} -> built-in cut-out {cut.size}")
         os.remove(bible_assets.cutout_path("p1", "c1"))
+        bible_assets._NOTEBOOK_CUTOUT_DOWN_UNTIL = 0.0          # (v2.35.5: a failed notebook is skipped for 10 minutes)
         try:
             bible_assets.ensure_cutout(Stopper(), "p1", char)
             raise AssertionError("a stop must stop")

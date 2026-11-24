@@ -1,4 +1,5 @@
 import logging
+import time
 import httpx
 from app.core.config import settings
 
@@ -9,6 +10,9 @@ logger = logging.getLogger(__name__)
 KEY_OLLAMA_URL = "dynamic:ollama_url"
 KEY_IMAGE_API_URL = "dynamic:image_api_url"
 KEY_WAN_API_URL = "dynamic:wan_api_url"
+
+
+_LAST_GOOD: dict = {}   # key -> the last URL Upstash gave us, so one failed lookup does not lose it
 
 
 def resolve_url(key: str, fallback: str) -> str:
@@ -31,25 +35,36 @@ def resolve_url(key: str, fallback: str) -> str:
     if not settings.UPSTASH_REDIS_REST_URL or not settings.UPSTASH_REDIS_REST_TOKEN:
         return fallback
 
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            response = client.get(
-                f"{settings.UPSTASH_REDIS_REST_URL}/get/{key}",
-                headers={"Authorization": f"Bearer {settings.UPSTASH_REDIS_REST_TOKEN}"},
-            )
-        if response.status_code == 200:
-            value = response.json().get("result")
-            if value and _looks_like_url(value):
-                return value
-            if value:
-                logger.warning(
-                    f"Dynamic config value for '{key}' doesn't look like a valid URL "
-                    f"({value!r}) - using static fallback instead. This usually means "
-                    f"something published a malformed value (e.g. an old notebook run "
-                    f"before a bugfix) - re-run the notebook's publish cell to overwrite it."
+    last_err = None
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                response = client.get(
+                    f"{settings.UPSTASH_REDIS_REST_URL}/get/{key}",
+                    headers={"Authorization": f"Bearer {settings.UPSTASH_REDIS_REST_TOKEN}"},
                 )
-    except Exception as e:
-        logger.info(f"Dynamic config lookup for '{key}' failed, using static fallback: {e}")
+            if response.status_code == 200:
+                value = response.json().get("result")
+                if value and _looks_like_url(value):
+                    _LAST_GOOD[key] = value
+                    return value
+                if value:
+                    logger.warning(
+                        f"Dynamic config value for '{key}' doesn't look like a valid URL "
+                        f"({value!r}) - using static fallback instead. This usually means "
+                        f"something published a malformed value (e.g. an old notebook run "
+                        f"before a bugfix) - re-run the notebook's publish cell to overwrite it."
+                    )
+                break                      # answered, just no usable value: retrying will not change that
+            last_err = f"HTTP {response.status_code}"
+        except Exception as e:
+            last_err = e
+        time.sleep(0.5 * (attempt + 1))
+    else:
+        if _LAST_GOOD.get(key):
+            logger.warning("Dynamic config lookup for '%s' failed (%s) - using the last URL that worked.", key, last_err)
+            return _LAST_GOOD[key]
+        logger.info(f"Dynamic config lookup for '{key}' failed, using static fallback: {last_err}")
 
     return fallback
 

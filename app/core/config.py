@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # original behavior) - useful if you do have a local GPU and don't mind
     # the download.
     IMAGE_API_URL: str = os.getenv("IMAGE_API_URL", "")
+    # Only when true may the backend load SDXL on THIS machine (a big download + a real GPU) because no image server URL
+    # was found. Default false: a failed lookup then stops with a clear message instead of starting a 15 GB download.
+    IMAGE_LOCAL_FALLBACK: bool = os.getenv("IMAGE_LOCAL_FALLBACK", "false").lower() in ("1", "true", "yes")
     WAN_API_URL: str = os.getenv("WAN_API_URL", "http://localhost:8188/v1/generate")
 
     # Optional: instead of hand-editing OLLAMA_URL/IMAGE_API_URL/WAN_API_URL

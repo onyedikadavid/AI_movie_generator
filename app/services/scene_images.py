@@ -91,8 +91,20 @@ def _compose(image_service, scene, on_screen, style, project_id, prompt, variant
         base = (prompt or "").strip() or scene.image_prompt or scene.visual_description
         kp = pb.keyframe_prompt(base, on_screen, style, getattr(scene, "place_desc", ""))
         seed = _seed(project_id, getattr(scene, "place_key", "") or scene.scene_number, "wide") + 7919 * int(variant)
-        if not image_service.compose_scene(env, people, tmp, kp, pb.image_negative(style),
-                                           float(settings.BIBLE_COMPOSE_REFINE), seed):
+        ok = False
+        if time.time() >= ba._NOTEBOOK_COMPOSE_DOWN_UNTIL:
+            try:
+                ok = bool(image_service.compose_scene(env, people, tmp, kp, pb.image_negative(style),
+                                                      float(settings.BIBLE_COMPOSE_REFINE), seed))
+            except Exception as e:  # noqa: BLE001 - never lose the run over the composite
+                if type(e).__name__ == "RunStopped":
+                    raise
+                ba._NOTEBOOK_COMPOSE_DOWN_UNTIL = time.time() + 300
+                logger.warning("The image notebook could not place the characters (%s) - placing them with the built-in composite "
+                               "(no light redraw).", str(e)[:120])
+        if not ok:
+            ok = ba.local_compose(env, people, tmp)
+        if not ok:
             return None
     os.replace(tmp, dest)
     return dest
