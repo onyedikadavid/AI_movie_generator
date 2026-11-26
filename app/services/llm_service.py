@@ -153,7 +153,7 @@ class LLMService:
         "camera", "camera cue", "cue", "music", "action", "setting", "location", "time", "genre", "style", "visual", "visuals",
         "audio", "voiceover", "voice over", "vo", "fade", "cut", "transition", "shot", "angle", "lighting", "theme", "summary",
         "act", "chapter", "part", "episode", "duration", "length", "pov", "background", "foreground", "description", "dialogue",
-        "hook", "logline", "ending", "opening", "intro", "outro", "caption", "text", "on screen", "super", "insert",
+        "focus", "visual cue", "lens", "mood board", "hook", "logline", "ending", "opening", "intro", "outro", "caption", "text", "on screen", "super", "insert",
     }
 
     @classmethod
@@ -161,7 +161,7 @@ class LLMService:
         """FORMAT:, TONE:, SOUND CUE: ... are headings of the script, not people."""
         n = re.sub(r"[^a-z ]", " ", str(name or "").lower()).strip()
         n = re.sub(r"\s+", " ", n)
-        if not n or n in cls._LABEL_WORDS:
+        if not n or n in cls._LABEL_WORDS or n.endswith(" cue"):
             return True
         words = n.split()
         return len(words) > 1 and all(w in cls._LABEL_WORDS for w in words)

@@ -55,3 +55,6 @@ cutp=os.path.join(d,"p.png"); Image.new("RGBA",(60,120),(200,50,50,255)).save(cu
 out=os.path.join(d,"o.png")
 assert ba.local_compose(env,[(cutp,0.6)],out,300,200) and Image.open(out).size==(300,200)
 print("v2.35.5 selftest OK")
+for bad in ("VISUAL CUE","FOCUS","Music Cue"):
+    assert LLMService._is_label(bad), bad
+print("labels ok")

@@ -93,7 +93,7 @@ celery_app.conf.update(
     # whole worker process. These make it actually recover instead of crashing.
     broker_connection_retry_on_startup=True,
     broker_connection_retry=True,
-    broker_connection_max_retries=0,  # retry forever rather than giving up
+    broker_connection_max_retries=None,  # None = retry forever (0 means "no retries" in kombu and ended the worker on the first timeout)
     broker_transport_options={
         "visibility_timeout": 60 * 60 * 24,  # 24h, see note above
         "socket_keepalive": True,

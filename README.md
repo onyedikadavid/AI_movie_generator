@@ -1,3 +1,12 @@
+## v2.35.7 - stopping a video job really stops it; junk "characters" removed from existing projects
+
+- The VACE notebook now answers `DELETE /v1/jobs/{id}`: a queued job is dropped, a running one is interrupted. Before, pressing Stop / Start over left the old job running on the GPU (the backend got "405") and the new job waited behind it for hours. **Use the new notebook** (`wan_vace_reference_server_kaggle_v1.ipynb`).
+- At the start of every run, script headings that an older version saved as characters (FORMAT, TONE, EMOTION, SOUND CUE, CAMERA CUE, VISUAL CUE, FOCUS ...) are deleted from the project, so no Start over is needed. Any name ending in "cue" counts as a heading.
+
+## v2.35.6 - the worker survives network drops
+
+- The worker stopped at start-up with "Unrecoverable error: OperationalError('Timeout connecting to server')" when the connection to Upstash timed out. `broker_connection_max_retries` is now `None` (retry forever; the old `0` meant no retries). `run_worker.ps1` also restarts the worker automatically if it ever exits. Start it with `.\run_worker.ps1` instead of the long celery command.
+
 ## v2.35.5 - no surprise SDXL download, no more dropped-connection stops, no "FORMAT / TONE" characters
 
 - **The backend no longer starts downloading SDXL onto your PC.** When the Upstash lookup of the image-server address timed out (a handshake timeout), the address came back empty and the backend switched to "draw on this machine": it loaded torch and began downloading Stable Diffusion XL (~15 GB, 19 files). Now the lookup is retried (3 tries) and the last address that worked is remembered; if there is still no address the run stops with a clear message ("start the image notebook and press Resume"). Drawing on this PC is only done when you set `IMAGE_LOCAL_FALLBACK=true` in `.env`.

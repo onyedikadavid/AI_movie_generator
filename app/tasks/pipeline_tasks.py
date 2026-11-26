@@ -76,6 +76,22 @@ def _wait_for_slot(db, project_id: str, token: str) -> bool:
         time.sleep(4)
 
 
+def _drop_label_characters(db, project_id: str) -> None:
+    """Script headings (FORMAT, TONE, SOUND CUE ...) that an older version saved as 'characters' are removed, so they get no
+    bible picture, no voice and no place in the video prompts."""
+    try:
+        rows = db.execute(select(Character).where(Character.project_id == project_id)).scalars().all()
+        junk = [c for c in rows if LLMService._is_label(c.name)]
+        for c in junk:
+            db.delete(c)
+        if junk:
+            db.commit()
+            logger.info("Removed %d script heading(s) that were saved as characters: %s", len(junk), ", ".join(c.name for c in junk))
+    except Exception as e:  # noqa: BLE001 - never stop a run over this
+        db.rollback()
+        logger.warning("Could not clean up the character list (%s).", str(e)[:100])
+
+
 def _execute(project_id: str, token, first_status: ProjectStatus, body) -> None:
     db = SessionLocal()
     ctl = None
@@ -106,6 +122,7 @@ def _execute(project_id: str, token, first_status: ProjectStatus, body) -> None:
         ctl.start()
         db.expire_all()
         project = db.get(Project, project_id)
+        _drop_label_characters(db, project_id)
 
         try:
             ctl.checkpoint()  # the user may have hit Pause/Delete within the first second
